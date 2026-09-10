@@ -52,11 +52,6 @@ _YTDLP_OPTIONS: Final[dict[str, object]] = {
 }
 _AUDIO_OUTPUT_TEMPLATE: Final[str] = "audio.%(ext)s"
 _WHISPER_TEMP_PREFIX: Final[str] = "textify-whisper-"
-_WHISPER_MODEL: Final[str] = "large-v3-turbo"
-_WHISPER_REVISION: Final[str] = "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf"
-_WHISPER_DEVICE: Final[str] = "cuda"
-_WHISPER_DEVICE_INDEX: Final[int] = 0
-_WHISPER_COMPUTE_TYPE: Final[str] = "float16"
 
 
 class _CaptionProviderFailure(Exception):
@@ -506,7 +501,7 @@ class FasterWhisperTranscriber:
 def load_whisper_transcriber(
     settings: TranscriptionConfig,
 ) -> FasterWhisperTranscriber:
-    """Load the fixed CUDA model and wrap it in the provider adapter.
+    """Load the configured Faster-Whisper model and wrap it in the provider adapter.
 
     Args:
         settings: Environment-backed inference tuning and token settings.
@@ -525,14 +520,14 @@ def load_whisper_transcriber(
         raise RuntimeError("CUDA is unavailable for Faster-Whisper.")
 
     model_options: dict[str, str | int] = {
-        "compute_type": _WHISPER_COMPUTE_TYPE,
-        "device": _WHISPER_DEVICE,
-        "device_index": _WHISPER_DEVICE_INDEX,
-        "revision": _WHISPER_REVISION,
+        "compute_type": settings.whisper_compute_type,
+        "device": settings.whisper_device,
+        "device_index": settings.whisper_device_index,
+        "revision": settings.whisper_revision,
     }
     if settings.hf_token is not None:
         model_options["use_auth_token"] = settings.hf_token.get_secret_value()
-    model = WhisperModel(_WHISPER_MODEL, **model_options)
+    model = WhisperModel(settings.whisper_model, **model_options)
     return FasterWhisperTranscriber(model, settings)
 
 

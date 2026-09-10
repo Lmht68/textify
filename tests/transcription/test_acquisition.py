@@ -4,6 +4,9 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+from pytest import MonkeyPatch
+
+from textify.transcription import acquisition
 from textify.transcription.acquisition import FasterWhisperTranscriber
 from textify.transcription.config import TranscriptionConfig
 from textify.transcription.types import TranscriptMethod
@@ -80,6 +83,11 @@ class FakeWhisperModel:
 def isolated_transcription_config() -> TranscriptionConfig:
     """Return a test configuration independent of local environment files."""
     return TranscriptionConfig(
+        whisper_model="large-v3-turbo",
+        whisper_revision="0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf",
+        whisper_device="cuda",
+        whisper_device_index=0,
+        whisper_compute_type="float16",
         max_duration_seconds=1800,
         temporary_media_root=Path("/tmp/textify-test"),
         beam_size=1,
@@ -90,6 +98,50 @@ def isolated_transcription_config() -> TranscriptionConfig:
         initial_prompt="test prompt",
         hf_token=None,
     )
+
+
+def test_load_whisper_transcriber_uses_model_environment_settings(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Configured model settings are forwarded to Faster-Whisper."""
+    construction_arguments: list[tuple[str, dict[str, str | int]]] = []
+
+    def record_model(
+        model_name: str,
+        **model_options: str | int,
+    ) -> object:
+        construction_arguments.append((model_name, model_options))
+        return object()
+
+    monkeypatch.setattr(
+        "textify.transcription.acquisition.ctranslate2.get_cuda_device_count",
+        lambda: 1,
+    )
+    monkeypatch.setattr(acquisition, "WhisperModel", record_model)
+    settings = isolated_transcription_config().model_copy(
+        update={
+            "whisper_model": "small.en",
+            "whisper_revision": "release-2026-09",
+            "whisper_device": "cpu",
+            "whisper_device_index": 2,
+            "whisper_compute_type": "int8",
+        }
+    )
+
+    adapter = acquisition.load_whisper_transcriber(settings)
+
+    assert isinstance(adapter, FasterWhisperTranscriber)
+    assert construction_arguments == [
+        (
+            "small.en",
+            {
+                "compute_type": "int8",
+                "device": "cpu",
+                "device_index": 2,
+                "revision": "release-2026-09",
+            },
+        )
+    ]
 
 
 def test_faster_whisper_adapter_normalizes_timed_external_segments(

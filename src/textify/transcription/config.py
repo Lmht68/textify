@@ -16,6 +16,14 @@ class TranscriptionConfig(BaseSettings):
         populate_by_name=True,
     )
 
+    whisper_model: str = Field(default="large-v3-turbo", min_length=1)
+    whisper_revision: str = Field(
+        default="0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf",
+        min_length=1,
+    )
+    whisper_device: str = Field(default="cuda", min_length=1)
+    whisper_device_index: int = Field(default=0, ge=0)
+    whisper_compute_type: str = Field(default="float16", min_length=1)
     max_duration_seconds: int = Field(default=1800, gt=0)
     temporary_media_root: Path = Path("/tmp/textify")
     beam_size: int = Field(default=1, gt=0)
