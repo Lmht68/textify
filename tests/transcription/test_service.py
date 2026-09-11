@@ -1,6 +1,6 @@
 """Tests for the application-facing TranscriptService lifecycle."""
 
-import asyncio
+import threading
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -61,11 +61,19 @@ class RecordingMetadataExtractor:
         self._prepared_audio = prepared_audio
         self._failure = failure
 
-    def extract(self, canonical_url: str) -> ExtractedMetadata:
+    def extract(
+        self,
+        canonical_url: str,
+        *,
+        deadline: float,
+        cancellation_event: threading.Event,
+    ) -> ExtractedMetadata:
         """Record and return the configured provider result.
 
         Args:
             canonical_url: Validated provider URL.
+            deadline: Monotonic absolute metadata deadline.
+            cancellation_event: Cooperative request-cancellation signal.
 
         Returns:
             Deterministic metadata result.
@@ -73,6 +81,7 @@ class RecordingMetadataExtractor:
         Raises:
             Exception: Configured provider failure.
         """
+        del deadline, cancellation_event
         self.calls.append(canonical_url)
         if self._failure is not None:
             raise self._failure
@@ -92,12 +101,21 @@ class RecordingAudioDownloader:
         self.request_directories: list[Path] = []
         self._failure = failure
 
-    def download(self, source_url: str, destination: Path) -> Path:
+    def download(
+        self,
+        source_url: str,
+        destination: Path,
+        *,
+        deadline: float,
+        cancellation_event: threading.Event,
+    ) -> Path:
         """Create a request-owned fake audio file.
 
         Args:
             source_url: Original submitted TikTok URL.
             destination: Request-scoped destination directory.
+            deadline: Monotonic absolute audio-download deadline.
+            cancellation_event: Cooperative request-cancellation signal.
 
         Returns:
             Created request-owned audio file.
@@ -105,6 +123,7 @@ class RecordingAudioDownloader:
         Raises:
             Exception: Configured provider failure.
         """
+        del deadline, cancellation_event
         self.calls.append(source_url)
         self.request_directories.append(destination)
         if self._failure is not None:
@@ -198,6 +217,11 @@ def build_service(
         temperature=0.0,
         condition_on_previous_text=True,
         transcription_concurrency=1,
+        max_pending_transcriptions=2,
+        metadata_timeout_seconds=30.0,
+        audio_download_timeout_seconds=300.0,
+        transcription_queue_timeout_seconds=300.0,
+        transcription_timeout_seconds=1800.0,
         initial_prompt="test prompt",
         hf_token=None,
     )
@@ -207,7 +231,7 @@ def build_service(
         audio_downloader=audio_downloader,
         whisper_transcriber=transcriber,
     )
-    return TranscriptService(adapters, config, asyncio.Semaphore(1))
+    return TranscriptService(adapters, config)
 
 
 @pytest.mark.asyncio

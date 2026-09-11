@@ -5,6 +5,7 @@ import re
 import shutil
 import socket
 import tempfile
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -27,7 +28,11 @@ from textify.transcription.exceptions import (
     UnsupportedPlatformError,
 )
 from textify.transcription.types import Platform
-from textify.transcription.util import extract_info_with_retries
+from textify.transcription.util import (
+    build_yt_dlp_progress_hook,
+    extract_info_with_retries,
+    raise_if_cancelled_or_expired,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -249,11 +254,19 @@ class ExtractedMetadata:
 class MetadataExtractor(Protocol):
     """Retrieve raw metadata and optional prepared audio for one provider URL."""
 
-    def extract(self, canonical_url: str) -> ExtractedMetadata:
+    def extract(
+        self,
+        canonical_url: str,
+        *,
+        deadline: float,
+        cancellation_event: threading.Event,
+    ) -> ExtractedMetadata:
         """Return provider metadata and optional inspection-stage audio.
 
         Args:
             canonical_url: Minimal provider URL produced by URL inspection.
+            deadline: Monotonic absolute deadline for metadata retrieval.
+            cancellation_event: Signal set when request work must stop.
 
         Returns:
             ExtractedMetadata: Raw provider metadata and prepared audio when needed.
@@ -274,15 +287,24 @@ class YtDlpMetadataExtractor:
         self._max_duration_seconds = max_duration_seconds
         self._temp_media_dir = temp_media_dir
 
-    def extract(self, canonical_url: str) -> ExtractedMetadata:
+    def extract(
+        self,
+        canonical_url: str,
+        *,
+        deadline: float,
+        cancellation_event: threading.Event,
+    ) -> ExtractedMetadata:
         """Extract metadata and download audio when the provider omits duration.
 
         Args:
             canonical_url: Minimal provider URL produced by URL inspection.
+            deadline: Monotonic absolute deadline for metadata retrieval.
+            cancellation_event: Signal set when request work must stop.
 
         Returns:
             ExtractedMetadata: Raw yt-dlp metadata and optional prepared audio.
 
+        Raises:
             MetadataRetrievalFailedError: If yt-dlp returns a non-mapping value.
             _MetadataDurationLimitExceeded: If fallback inspection exceeds the limit.
         """
@@ -291,16 +313,36 @@ class YtDlpMetadataExtractor:
                 youtube_dl.extract_info,
                 canonical_url,
                 download=False,
+                deadline=deadline,
+                cancellation_event=cancellation_event,
             )
 
         if not isinstance(raw_metadata, Mapping):
             raise _metadata_provider_error("non_mapping_result")
         metadata = cast(Mapping[str, object], raw_metadata)
+        raise_if_cancelled_or_expired(
+            deadline=deadline,
+            cancellation_event=cancellation_event,
+        )
         if metadata.get("duration") is not None:
             return ExtractedMetadata(metadata)
-        return self._download_audio_for_duration(canonical_url)
+        return self._download_audio_for_duration(
+            canonical_url,
+            deadline=deadline,
+            cancellation_event=cancellation_event,
+        )
 
-    def _download_audio_for_duration(self, canonical_url: str) -> ExtractedMetadata:
+    def _download_audio_for_duration(
+        self,
+        canonical_url: str,
+        *,
+        deadline: float,
+        cancellation_event: threading.Event,
+    ) -> ExtractedMetadata:
+        raise_if_cancelled_or_expired(
+            deadline=deadline,
+            cancellation_event=cancellation_event,
+        )
         self._temp_media_dir.mkdir(parents=True, exist_ok=True)
         request_directory = Path(
             tempfile.mkdtemp(
@@ -327,12 +369,20 @@ class YtDlpMetadataExtractor:
                 **_AUDIO_FALLBACK_YTDLP_OPTIONS,
                 "outtmpl": str(request_directory / _AUDIO_OUTPUT_TEMPLATE),
                 "match_filter": _duration_filter,
+                "progress_hooks": [
+                    build_yt_dlp_progress_hook(
+                        deadline=deadline,
+                        cancellation_event=cancellation_event,
+                    )
+                ],
             }
             with yt_dlp.YoutubeDL(options) as youtube_dl:
                 raw_metadata = extract_info_with_retries(
                     youtube_dl.extract_info,
                     canonical_url,
                     download=True,
+                    deadline=deadline,
+                    cancellation_event=cancellation_event,
                 )
                 if not isinstance(raw_metadata, Mapping) or "entries" in raw_metadata:
                     raise _metadata_provider_error("invalid_duration_download_result")
@@ -343,7 +393,15 @@ class YtDlpMetadataExtractor:
             audio_path = Path(prepared_path).resolve()
             if audio_path.parent != request_directory or not audio_path.is_file():
                 raise _metadata_provider_error("duration_audio_file_missing")
+            raise_if_cancelled_or_expired(
+                deadline=deadline,
+                cancellation_event=cancellation_event,
+            )
             audio_duration = _probe_audio_duration(audio_path)
+            raise_if_cancelled_or_expired(
+                deadline=deadline,
+                cancellation_event=cancellation_event,
+            )
             if audio_duration > self._max_duration_seconds:
                 raise _MetadataDurationLimitExceeded
             metadata = dict(cast(Mapping[str, object], raw_metadata))

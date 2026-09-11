@@ -1,16 +1,23 @@
 """Tests for provider adapters and bounded yt-dlp retries."""
 
+import threading
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
 from pytest import MonkeyPatch
+from yt_dlp.utils import DownloadCancelled
 
 from textify.transcription import acquisition
 from textify.transcription.acquisition import FasterWhisperTranscriber
 from textify.transcription.config import TranscriptionConfig
 from textify.transcription.types import TranscriptMethod
-from textify.transcription.util import extract_info_with_retries
+from textify.transcription.util import (
+    build_yt_dlp_progress_hook,
+    extract_info_with_retries,
+)
 
 
 @dataclass(frozen=True)
@@ -95,6 +102,11 @@ def isolated_transcription_config() -> TranscriptionConfig:
         temperature=0.0,
         condition_on_previous_text=True,
         transcription_concurrency=1,
+        max_pending_transcriptions=2,
+        metadata_timeout_seconds=30.0,
+        audio_download_timeout_seconds=300.0,
+        transcription_queue_timeout_seconds=300.0,
+        transcription_timeout_seconds=1800.0,
         initial_prompt="test prompt",
         hf_token=None,
     )
@@ -213,7 +225,76 @@ def test_yt_dlp_retries_exactly_ten_attempts() -> None:
         extract,
         "https://www.tiktok.com/@creator/video/1234567890123456789",
         download=False,
+        deadline=time.monotonic() + 1.0,
+        cancellation_event=threading.Event(),
     )
 
     assert result.endswith("1234567890123456789")
     assert attempts == 10
+
+
+def test_yt_dlp_expired_deadline_prevents_the_first_attempt() -> None:
+    """An elapsed operation deadline rejects work before invoking yt-dlp."""
+    attempts = 0
+
+    def extract(source_url: str, *, download: bool) -> str:
+        """Record an invocation that the expired deadline must prevent."""
+        nonlocal attempts
+        del download
+        attempts += 1
+        return source_url
+
+    with pytest.raises(TimeoutError, match="deadline expired"):
+        extract_info_with_retries(
+            extract,
+            "https://www.tiktok.com/@creator/video/1234567890123456789",
+            download=False,
+            deadline=time.monotonic() - 1.0,
+            cancellation_event=threading.Event(),
+        )
+
+    assert attempts == 0
+
+
+def test_yt_dlp_cancellation_between_retries_prevents_the_next_attempt() -> None:
+    """A cancellation signal set by one failure stops the next retry."""
+    attempts = 0
+    cancellation_event = threading.Event()
+
+    def extract(source_url: str, *, download: bool) -> str:
+        """Fail once after setting the cooperative cancellation signal."""
+        nonlocal attempts
+        del source_url, download
+        attempts += 1
+        cancellation_event.set()
+        raise RuntimeError("retryable failure")
+
+    with pytest.raises(DownloadCancelled, match="operation cancelled"):
+        extract_info_with_retries(
+            extract,
+            "https://www.tiktok.com/@creator/video/1234567890123456789",
+            download=False,
+            deadline=time.monotonic() + 1.0,
+            cancellation_event=cancellation_event,
+        )
+
+    assert attempts == 1
+
+
+def test_yt_dlp_progress_hook_enforces_deadline_and_cancellation() -> None:
+    """Transfer callbacks reject expired and explicitly cancelled operations."""
+    expired_hook = build_yt_dlp_progress_hook(
+        deadline=time.monotonic() - 1.0,
+        cancellation_event=threading.Event(),
+    )
+    with pytest.raises(TimeoutError, match="deadline expired"):
+        expired_hook({"status": "downloading"})
+
+    cancellation_event = threading.Event()
+    cancelled_hook = build_yt_dlp_progress_hook(
+        deadline=time.monotonic() + 1.0,
+        cancellation_event=cancellation_event,
+    )
+    cancellation_event.set()
+    with pytest.raises(DownloadCancelled, match="operation cancelled"):
+        cancelled_hook({"status": "downloading"})

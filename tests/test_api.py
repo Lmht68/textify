@@ -1,10 +1,18 @@
 """ASGI tests for the public Textify transcript API."""
 
-from collections.abc import Sequence
+import asyncio
+import json
+import tempfile
+import threading
+import time
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from httpx import ASGITransport, AsyncClient
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient, Response
+from starlette.types import Message, Scope
 
 from textify.config import AppConfig, Environment
 from textify.main import create_app
@@ -18,6 +26,7 @@ from textify.transcription.exceptions import (
     MetadataRetrievalFailedError,
     MetadataTimeoutError,
     NoUsableTranscriptError,
+    TranscriptionCapacityExceededError,
     TranscriptionError,
     TranscriptionFailedError,
     TranscriptionTimeoutError,
@@ -26,7 +35,7 @@ from textify.transcription.exceptions import (
     UnsupportedPlatformError,
     VideoTooLongError,
 )
-from textify.transcription.inspection import ExtractedMetadata
+from textify.transcription.inspection import ExtractedMetadata, PreparedAudio
 from textify.transcription.service import TranscriptionAdapters
 from textify.transcription.types import (
     Segment,
@@ -38,6 +47,20 @@ from textify.transcription.types import (
 DIRECT_TIKTOK_URL = "https://www.tiktok.com/@creator/video/1234567890123456789"
 SHORT_TIKTOK_URL = "https://vm.tiktok.com/abcdefgh"
 YOUTUBE_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+
+def _controlled_tiktok_metadata() -> dict[str, object]:
+    """Return valid raw TikTok metadata for controlled lifecycle providers."""
+    return {
+        "id": "1234567890123456789",
+        "extractor_key": "TikTok",
+        "webpage_url": DIRECT_TIKTOK_URL,
+        "title": "Title",
+        "description": "Description",
+        "channel": "Creator",
+        "duration": 12,
+        "formats": ({"vcodec": "h264"},),
+    }
 
 
 class ApiCaptionProvider:
@@ -63,15 +86,24 @@ class ApiMetadataExtractor:
         """Initialize call recording."""
         self.calls: list[str] = []
 
-    def extract(self, canonical_url: str) -> ExtractedMetadata:
+    def extract(
+        self,
+        canonical_url: str,
+        *,
+        deadline: float,
+        cancellation_event: threading.Event,
+    ) -> ExtractedMetadata:
         """Return valid TikTok metadata for one provider URL.
 
         Args:
             canonical_url: Validated TikTok provider URL.
+            deadline: Monotonic absolute metadata deadline.
+            cancellation_event: Cooperative request-cancellation signal.
 
         Returns:
             External-shaped metadata accepted by the provider boundary.
         """
+        del deadline, cancellation_event
         self.calls.append(canonical_url)
         return ExtractedMetadata(
             {
@@ -95,16 +127,26 @@ class ApiAudioDownloader:
         self.calls: list[str] = []
         self.request_directories: list[Path] = []
 
-    def download(self, source_url: str, destination: Path) -> Path:
+    def download(
+        self,
+        source_url: str,
+        destination: Path,
+        *,
+        deadline: float,
+        cancellation_event: threading.Event,
+    ) -> Path:
         """Create a deterministic request-owned audio file.
 
         Args:
             source_url: Original submitted TikTok URL.
             destination: Request-scoped temporary directory.
+            deadline: Monotonic absolute audio-download deadline.
+            cancellation_event: Cooperative request-cancellation signal.
 
         Returns:
             Created audio path inside ``destination``.
         """
+        del deadline, cancellation_event
         self.calls.append(source_url)
         self.request_directories.append(destination)
         audio_path = destination / "audio.webm"
@@ -158,6 +200,156 @@ class CountingAdaptersFactory:
             caption_provider=ApiCaptionProvider(),
             audio_downloader=audio_downloader,
             whisper_transcriber=ApiTranscriber(),
+        )
+
+
+@dataclass
+class ControlledAdapterState:
+    """Coordinate deterministic provider stages across concurrent ASGI requests."""
+
+    metadata_waits_for_cancellation: bool = False
+    metadata_prepares_audio_after_cancellation: bool = False
+    download_waits_for_cancellation: bool = False
+    native_waits_for_release: bool = False
+    metadata_delay_seconds: float = 0.0
+    download_delay_seconds: float = 0.0
+    metadata_calls: list[str] = field(default_factory=list)
+    metadata_deadlines: list[float] = field(default_factory=list)
+    download_calls: list[str] = field(default_factory=list)
+    download_deadlines: list[float] = field(default_factory=list)
+    native_calls: list[Path] = field(default_factory=list)
+    request_directories: list[Path] = field(default_factory=list)
+    prepared_directories: list[Path] = field(default_factory=list)
+    call_order: list[str] = field(default_factory=list)
+    metadata_entered: threading.Event = field(default_factory=threading.Event)
+    download_entered: threading.Event = field(default_factory=threading.Event)
+    download_second_entered: threading.Event = field(default_factory=threading.Event)
+    native_entered: threading.Event = field(default_factory=threading.Event)
+    native_release: threading.Event = field(default_factory=threading.Event)
+
+
+class ControlledMetadataExtractor:
+    """Provide observable metadata behavior for lifecycle ASGI tests."""
+
+    def __init__(
+        self,
+        state: ControlledAdapterState,
+        temporary_media_root: Path,
+    ) -> None:
+        """Initialize shared state and temporary media ownership."""
+        self._state = state
+        self._temporary_media_root = temporary_media_root
+
+    def extract(
+        self,
+        canonical_url: str,
+        *,
+        deadline: float,
+        cancellation_event: threading.Event,
+    ) -> ExtractedMetadata:
+        """Return metadata after the configured synchronous test behavior."""
+        self._state.metadata_calls.append(canonical_url)
+        self._state.metadata_deadlines.append(deadline)
+        self._state.call_order.append("metadata")
+        self._state.metadata_entered.set()
+        if self._state.metadata_delay_seconds:
+            threading.Event().wait(self._state.metadata_delay_seconds)
+        if self._state.metadata_waits_for_cancellation:
+            while not cancellation_event.wait(0.002):
+                self._state.metadata_deadlines.append(deadline)
+            if self._state.metadata_prepares_audio_after_cancellation:
+                return self._prepare_late_audio()
+        return ExtractedMetadata(_controlled_tiktok_metadata())
+
+    def _prepare_late_audio(self) -> ExtractedMetadata:
+        """Create prepared media whose cleanup remains with the service."""
+        self._temporary_media_root.mkdir(parents=True, exist_ok=True)
+        request_directory = Path(
+            tempfile.mkdtemp(
+                prefix="textify-controlled-inspection-",
+                dir=str(self._temporary_media_root),
+            )
+        )
+        audio_path = request_directory / "audio.webm"
+        audio_path.write_bytes(b"media")
+        self._state.prepared_directories.append(request_directory)
+        return ExtractedMetadata(
+            _controlled_tiktok_metadata(),
+            PreparedAudio(audio_path, request_directory),
+        )
+
+
+class ControlledAudioDownloader:
+    """Provide observable normal-download behavior for lifecycle ASGI tests."""
+
+    def __init__(self, state: ControlledAdapterState) -> None:
+        """Initialize shared request-stage state."""
+        self._state = state
+
+    def download(
+        self,
+        source_url: str,
+        destination: Path,
+        *,
+        deadline: float,
+        cancellation_event: threading.Event,
+    ) -> Path:
+        """Create media and apply the configured synchronous test behavior."""
+        self._state.download_calls.append(source_url)
+        self._state.download_deadlines.append(deadline)
+        self._state.request_directories.append(destination)
+        self._state.call_order.append("download")
+        audio_path = destination / "audio.webm"
+        audio_path.write_bytes(b"media")
+        self._state.download_entered.set()
+        if len(self._state.download_calls) == 2:
+            self._state.download_second_entered.set()
+        if self._state.download_delay_seconds:
+            threading.Event().wait(self._state.download_delay_seconds)
+        if self._state.download_waits_for_cancellation:
+            while not cancellation_event.wait(0.002):
+                self._state.download_deadlines.append(deadline)
+        return audio_path
+
+
+class ControlledTranscriber:
+    """Provide observable native behavior for lifecycle ASGI tests."""
+
+    def __init__(self, state: ControlledAdapterState) -> None:
+        """Initialize shared native-stage state."""
+        self._state = state
+
+    def transcribe(self, audio_path: Path) -> Transcript:
+        """Return a transcript after any configured non-cancellable wait."""
+        assert audio_path.is_file()
+        self._state.native_calls.append(audio_path)
+        self._state.call_order.append("native")
+        self._state.native_entered.set()
+        if self._state.native_waits_for_release:
+            self._state.native_release.wait()
+        segment = Segment(0.0, 1.0, "One")
+        return Transcript(TranscriptMethod.FASTER_WHISPER, "en", (segment,), "One")
+
+
+class ControlledAdaptersFactory:
+    """Build one observable provider bundle for lifecycle ASGI tests."""
+
+    def __init__(self, state: ControlledAdapterState) -> None:
+        """Initialize the state observed by tests."""
+        self._state = state
+        self.calls = 0
+
+    def __call__(self, config: TranscriptionConfig) -> TranscriptionAdapters:
+        """Build the deterministic controlled provider bundle."""
+        self.calls += 1
+        return TranscriptionAdapters(
+            metadata_extractor=ControlledMetadataExtractor(
+                self._state,
+                config.temporary_media_root,
+            ),
+            caption_provider=ApiCaptionProvider(),
+            audio_downloader=ControlledAudioDownloader(self._state),
+            whisper_transcriber=ControlledTranscriber(self._state),
         )
 
 
@@ -232,9 +424,86 @@ def transcription_config(temporary_media_root: Path) -> TranscriptionConfig:
         temperature=0.0,
         condition_on_previous_text=True,
         transcription_concurrency=1,
+        max_pending_transcriptions=2,
+        metadata_timeout_seconds=30.0,
+        audio_download_timeout_seconds=300.0,
+        transcription_queue_timeout_seconds=300.0,
+        transcription_timeout_seconds=1800.0,
         initial_prompt="test prompt",
         hf_token=None,
     )
+
+
+async def _wait_for_thread_event(event: threading.Event) -> None:
+    """Await one synchronous provider-stage signal without blocking the loop."""
+    assert await asyncio.to_thread(event.wait, 1.0)
+
+
+async def _wait_for_condition(condition: Callable[[], bool]) -> None:
+    """Await an observable provider-state condition with a bounded guard."""
+    for _ in range(200):
+        if condition():
+            return
+        await asyncio.sleep(0.005)
+    pytest.fail("controlled provider condition was not reached")
+
+
+async def _await_request(task: asyncio.Task[Response]) -> Response:
+    """Await a request task without cancelling it when the test guard expires."""
+    return await asyncio.wait_for(asyncio.shield(task), 1.0)
+
+
+async def _assert_request_pending(task: asyncio.Task[Response]) -> None:
+    """Prove a request remains pending without cancelling its lifecycle."""
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(task), 0.05)
+    assert not task.done()
+
+
+async def _start_disconnect_request(
+    application: FastAPI,
+    stage_entry: threading.Event,
+) -> tuple[asyncio.Task[None], list[Message]]:
+    """Start one synthetic ASGI request that disconnects after a controlled stage."""
+    request_body = json.dumps({"url": DIRECT_TIKTOK_URL}).encode()
+    body_delivered = False
+    sent_messages: list[Message] = []
+
+    async def receive() -> Message:
+        nonlocal body_delivered
+        if not body_delivered:
+            body_delivered = True
+            return {
+                "type": "http.request",
+                "body": request_body,
+                "more_body": False,
+            }
+        await _wait_for_thread_event(stage_entry)
+        return {"type": "http.disconnect"}
+
+    async def send(message: Message) -> None:
+        sent_messages.append(message)
+
+    scope: Scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "server": ("test", 80),
+        "scheme": "http",
+        "method": "POST",
+        "root_path": "",
+        "path": "/api/transcripts",
+        "raw_path": b"/api/transcripts",
+        "query_string": b"",
+        "headers": [
+            (b"host", b"test"),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(request_body)).encode()),
+        ],
+        "client": ("test", 50000),
+    }
+    app_task = asyncio.create_task(application(scope, receive, send))
+    return app_task, sent_messages
 
 
 @pytest.mark.asyncio
@@ -319,6 +588,7 @@ async def test_api_maps_all_baseline_domain_errors(tmp_path: Path) -> None:
         (MetadataTimeoutError(), 504, "metadata_timeout"),
         (AudioDownloadTimeoutError(), 504, "audio_download_timeout"),
         (TranscriptionTimeoutError(), 504, "transcription_timeout"),
+        (TranscriptionCapacityExceededError(), 503, "transcription_capacity_exceeded"),
     )
     application = create_app(
         app_config(),
@@ -355,3 +625,325 @@ async def test_api_fails_startup_before_readiness_when_adapter_factory_fails(
             pass
 
     assert application.state.ready is False
+
+
+@pytest.mark.asyncio
+async def test_api_rejects_work_beyond_active_and_pending_capacity_before_download(
+    tmp_path: Path,
+) -> None:
+    """Reject a third request before it can invoke metadata or create media."""
+    state = ControlledAdapterState(native_waits_for_release=True)
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path).model_copy(
+            update={
+                "transcription_concurrency": 1,
+                "max_pending_transcriptions": 1,
+                "transcription_queue_timeout_seconds": 1.0,
+            }
+        ),
+        ControlledAdaptersFactory(state),
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            first_request = asyncio.create_task(
+                client.post("/api/transcripts", json={"url": DIRECT_TIKTOK_URL})
+            )
+            await _wait_for_thread_event(state.native_entered)
+
+            second_request = asyncio.create_task(
+                client.post("/api/transcripts", json={"url": DIRECT_TIKTOK_URL})
+            )
+            await _wait_for_thread_event(state.download_second_entered)
+
+            overload_response = await client.post(
+                "/api/transcripts",
+                json={"url": DIRECT_TIKTOK_URL},
+            )
+            assert overload_response.status_code == 503
+            assert (
+                overload_response.json()["error"]["code"]
+                == "transcription_capacity_exceeded"
+            )
+            assert len(state.metadata_calls) == 2
+            assert len(state.request_directories) == 2
+
+            state.native_release.set()
+            first_response = await _await_request(first_request)
+            second_response = await _await_request(second_request)
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert all(not directory.exists() for directory in state.request_directories)
+
+
+@pytest.mark.asyncio
+async def test_api_expires_the_inference_queue_and_cleans_waiting_media(
+    tmp_path: Path,
+) -> None:
+    """Expire queue waiting without allowing a second native call to start."""
+    state = ControlledAdapterState(native_waits_for_release=True)
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path).model_copy(
+            update={
+                "transcription_concurrency": 1,
+                "transcription_queue_timeout_seconds": 0.05,
+            }
+        ),
+        ControlledAdaptersFactory(state),
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            first_request = asyncio.create_task(
+                client.post("/api/transcripts", json={"url": DIRECT_TIKTOK_URL})
+            )
+            await _wait_for_thread_event(state.native_entered)
+
+            second_request = asyncio.create_task(
+                client.post("/api/transcripts", json={"url": DIRECT_TIKTOK_URL})
+            )
+            await _wait_for_thread_event(state.download_second_entered)
+            second_response = await _await_request(second_request)
+
+            assert second_response.status_code == 503
+            assert (
+                second_response.json()["error"]["code"]
+                == "transcription_capacity_exceeded"
+            )
+            assert len(state.native_calls) == 1
+            assert not state.request_directories[1].exists()
+
+            state.native_release.set()
+            first_response = await _await_request(first_request)
+
+    assert first_response.status_code == 200
+    assert not state.request_directories[0].exists()
+
+
+@pytest.mark.asyncio
+async def test_api_expires_metadata_deadline_and_cleans_late_prepared_media(
+    tmp_path: Path,
+) -> None:
+    """Bound metadata retries and reclaim duration-fallback media after timeout."""
+    state = ControlledAdapterState(
+        metadata_waits_for_cancellation=True,
+        metadata_prepares_audio_after_cancellation=True,
+    )
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path).model_copy(
+            update={"metadata_timeout_seconds": 0.05}
+        ),
+        ControlledAdaptersFactory(state),
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            request = asyncio.create_task(
+                client.post("/api/transcripts", json={"url": DIRECT_TIKTOK_URL})
+            )
+            await _wait_for_thread_event(state.metadata_entered)
+            response = await _await_request(request)
+
+    assert response.status_code == 504
+    assert response.json()["error"]["code"] == "metadata_timeout"
+    assert len(state.metadata_deadlines) > 1
+    assert len(set(state.metadata_deadlines)) == 1
+    assert state.call_order == ["metadata"]
+    assert state.download_calls == []
+    assert state.native_calls == []
+    assert all(not directory.exists() for directory in state.prepared_directories)
+
+
+@pytest.mark.asyncio
+async def test_api_expires_download_deadline_and_cleans_request_media(
+    tmp_path: Path,
+) -> None:
+    """Bound normal-download retries and remove their request-owned media."""
+    state = ControlledAdapterState(download_waits_for_cancellation=True)
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path).model_copy(
+            update={"audio_download_timeout_seconds": 0.05}
+        ),
+        ControlledAdaptersFactory(state),
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            request = asyncio.create_task(
+                client.post("/api/transcripts", json={"url": DIRECT_TIKTOK_URL})
+            )
+            await _wait_for_thread_event(state.download_entered)
+            response = await _await_request(request)
+
+    assert response.status_code == 504
+    assert response.json()["error"]["code"] == "audio_download_timeout"
+    assert len(state.download_deadlines) > 1
+    assert len(set(state.download_deadlines)) == 1
+    assert state.call_order == ["metadata", "download"]
+    assert state.native_calls == []
+    assert all(not directory.exists() for directory in state.request_directories)
+
+
+@pytest.mark.asyncio
+async def test_api_reports_native_response_deadline_after_retained_worker_finishes(
+    tmp_path: Path,
+) -> None:
+    """Retain native permit and media until a timed-out native worker returns."""
+    state = ControlledAdapterState(native_waits_for_release=True)
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path).model_copy(
+            update={"transcription_timeout_seconds": 0.05}
+        ),
+        ControlledAdaptersFactory(state),
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            timed_request = asyncio.create_task(
+                client.post("/api/transcripts", json={"url": DIRECT_TIKTOK_URL})
+            )
+            await _wait_for_thread_event(state.native_entered)
+            await _assert_request_pending(timed_request)
+            assert state.request_directories[0].exists()
+
+            state.native_release.set()
+            timed_response = await _await_request(timed_request)
+            reusable_response = await client.post(
+                "/api/transcripts",
+                json={"url": DIRECT_TIKTOK_URL},
+            )
+
+    assert timed_response.status_code == 504
+    assert timed_response.json()["error"]["code"] == "transcription_timeout"
+    assert reusable_response.status_code == 200
+    assert len(state.native_calls) == 2
+    assert all(not directory.exists() for directory in state.request_directories)
+
+
+@pytest.mark.asyncio
+async def test_api_applies_each_stage_deadline_independently(tmp_path: Path) -> None:
+    """Allow adjacent stages that each finish below their own deadline."""
+    state = ControlledAdapterState(
+        metadata_delay_seconds=0.04,
+        download_delay_seconds=0.04,
+    )
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path).model_copy(
+            update={
+                "metadata_timeout_seconds": 0.06,
+                "audio_download_timeout_seconds": 0.06,
+            }
+        ),
+        ControlledAdaptersFactory(state),
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            started_at = time.monotonic()
+            response = await client.post(
+                "/api/transcripts",
+                json={"url": DIRECT_TIKTOK_URL},
+            )
+            elapsed = time.monotonic() - started_at
+
+    assert response.status_code == 200
+    assert elapsed > 0.06
+    assert state.call_order == ["metadata", "download", "native"]
+    assert all(not directory.exists() for directory in state.request_directories)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ("metadata", "download", "queue"))
+async def test_api_disconnect_cancels_interruptible_pre_native_work(
+    tmp_path: Path,
+    stage: str,
+) -> None:
+    """Cancel metadata, download, or queue work without exposing a response."""
+    if stage == "metadata":
+        state = ControlledAdapterState(
+            metadata_waits_for_cancellation=True,
+            metadata_prepares_audio_after_cancellation=True,
+        )
+        config = transcription_config(tmp_path)
+        stage_entry = state.metadata_entered
+    elif stage == "download":
+        state = ControlledAdapterState(download_waits_for_cancellation=True)
+        config = transcription_config(tmp_path)
+        stage_entry = state.download_entered
+    else:
+        state = ControlledAdapterState(native_waits_for_release=True)
+        config = transcription_config(tmp_path).model_copy(
+            update={"transcription_concurrency": 1}
+        )
+        stage_entry = state.download_second_entered
+
+    application = create_app(
+        app_config(),
+        config,
+        ControlledAdaptersFactory(state),
+    )
+
+    async with application.router.lifespan_context(application):
+        if stage == "queue":
+            transport = ASGITransport(app=application)
+            async with AsyncClient(
+                transport=transport,
+                base_url="http://test",
+            ) as client:
+                active_request = asyncio.create_task(
+                    client.post(
+                        "/api/transcripts",
+                        json={"url": DIRECT_TIKTOK_URL},
+                    )
+                )
+                await _wait_for_thread_event(state.native_entered)
+                disconnect_task, sent_messages = await _start_disconnect_request(
+                    application,
+                    stage_entry,
+                )
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(asyncio.shield(disconnect_task), 1.0)
+
+                assert sent_messages == []
+                assert len(state.native_calls) == 1
+                assert not state.request_directories[1].exists()
+
+                state.native_release.set()
+                active_response = await _await_request(active_request)
+                assert active_response.status_code == 200
+        else:
+            disconnect_task, sent_messages = await _start_disconnect_request(
+                application,
+                stage_entry,
+            )
+            await _wait_for_thread_event(stage_entry)
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(disconnect_task), 1.0)
+
+            assert sent_messages == []
+            assert state.native_calls == []
+            if stage == "metadata":
+                assert state.download_calls == []
+                assert all(
+                    not directory.exists() for directory in state.prepared_directories
+                )
+            else:
+                assert all(
+                    not directory.exists() for directory in state.request_directories
+                )
+
+    if stage == "queue":
+        assert all(not directory.exists() for directory in state.request_directories)

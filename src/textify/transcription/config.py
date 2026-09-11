@@ -31,9 +31,26 @@ class TranscriptionConfig(BaseSettings):
     temperature: float = Field(default=0.0, ge=0.0, le=1.0)
     condition_on_previous_text: bool = True
     transcription_concurrency: int = Field(default=1, gt=0)
-    initial_prompt: str = (
-        "This transcript may mention movies, TV shows, directors, actors, songs, "
-        "albums, artists, bands, books, and authors. Transcribe proper names "
-        "accurately."
+    max_pending_transcriptions: int = Field(default=2, ge=0)
+    metadata_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        allow_inf_nan=False,
     )
+    audio_download_timeout_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        allow_inf_nan=False,
+    )
+    transcription_queue_timeout_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        allow_inf_nan=False,
+    )
+    transcription_timeout_seconds: float = Field(
+        default=1800.0,
+        gt=0,
+        allow_inf_nan=False,
+    )
+    initial_prompt: str = ("")
     hf_token: SecretStr | None = None

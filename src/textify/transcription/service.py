@@ -1,6 +1,8 @@
 """Application-facing orchestration for one Textify transcript request."""
 
 import asyncio
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -12,6 +14,7 @@ from textify.transcription.config import TranscriptionConfig
 from textify.transcription.exceptions import (
     MetadataRetrievalFailedError,
     MetadataTimeoutError,
+    TranscriptionCapacityExceededError,
     TranscriptionError,
     UnsupportedContentError,
     UnsupportedPlatformError,
@@ -68,6 +71,42 @@ def build_transcription_adapters(
     )
 
 
+async def _finish_cancelled_metadata(
+    worker: asyncio.Task[inspection.ExtractedMetadata],
+) -> None:
+    """Consume cancelled metadata work and clean unadopted prepared audio."""
+    expected_failures = (
+        inspection._MetadataDurationLimitExceeded,
+        TranscriptionError,
+        RequestException,
+        YoutubeDLError,
+        Timeout,
+        TimeoutError,
+        AttributeError,
+        KeyError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    )
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            continue
+        except expected_failures:
+            return
+    try:
+        extracted_metadata = worker.result()
+    except expected_failures:
+        return
+    if (
+        isinstance(extracted_metadata, inspection.ExtractedMetadata)
+        and extracted_metadata.prepared_audio is not None
+    ):
+        extracted_metadata.prepared_audio.cleanup()
+
+
 class TranscriptService:
     """Transcribe one submitted TikTok URL through the complete lifecycle."""
 
@@ -75,18 +114,36 @@ class TranscriptService:
         self,
         adapters: TranscriptionAdapters,
         settings: TranscriptionConfig,
-        inference_semaphore: asyncio.Semaphore,
     ) -> None:
-        """Initialize the service with process-lifetime dependencies.
+        """Initialize process-lifetime request admission and provider resources.
 
         Args:
             adapters: Complete bundle of provider boundaries.
             settings: Validated transcription configuration.
-            inference_semaphore: Gate acquired only while native inference runs.
         """
-        self._adapters = adapters
+        self._metadata_extractor = adapters.metadata_extractor
         self._settings = settings
-        self._inference_semaphore = inference_semaphore
+        self._admission_limit = (
+            settings.transcription_concurrency + settings.max_pending_transcriptions
+        )
+        self._admitted_transcriptions = 0
+        self._whisper_acquirer = acquisition.WhisperAcquirer(
+            adapters.audio_downloader,
+            adapters.whisper_transcriber,
+            settings,
+        )
+
+    def _admit(self) -> None:
+        """Reserve request capacity before provider work can create media."""
+        if self._admitted_transcriptions >= self._admission_limit:
+            raise TranscriptionCapacityExceededError()
+        self._admitted_transcriptions += 1
+
+    def _release_admission(self) -> None:
+        """Release one prior request-capacity reservation."""
+        if self._admitted_transcriptions == 0:
+            raise RuntimeError("Transcription admission counter underflow.")
+        self._admitted_transcriptions -= 1
 
     async def transcribe(self, submitted_url: str) -> TranscriptionResult:
         """Retrieve one normalized TikTok Source and Transcript.
@@ -98,15 +155,20 @@ class TranscriptService:
             Canonical source metadata paired with a normalized timed transcript.
 
         Raises:
-            TranscriptionError: If URL, provider, media, or transcription fails.
+            TranscriptionError: If URL, provider, capacity, media, or work fails.
         """
         submitted = inspection.classify_submitted_url(submitted_url)
         if submitted.platform is not Platform.TIKTOK:
             raise UnsupportedPlatformError()
 
+        self._admit()
+        cancellation_event = threading.Event()
         prepared_audio: inspection.PreparedAudio | None = None
         try:
-            extracted_metadata = await self._extract_metadata(submitted.provider_url)
+            extracted_metadata = await self._extract_metadata(
+                submitted.provider_url,
+                cancellation_event,
+            )
             prepared_audio = extracted_metadata.prepared_audio
             normalized_metadata = inspection.normalize_processed_metadata(
                 extracted_metadata.metadata,
@@ -124,13 +186,10 @@ class TranscriptService:
             if source.duration_seconds > self._settings.max_duration_seconds:
                 raise VideoTooLongError()
 
-            transcript = await acquisition.acquire_whisper(
+            transcript = await self._whisper_acquirer.acquire(
                 submitted_url,
-                self._adapters.audio_downloader,
-                self._adapters.whisper_transcriber,
-                self._settings.temporary_media_root,
                 prepared_audio,
-                self._inference_semaphore,
+                cancellation_event,
             )
             return TranscriptionResult(source, transcript)
         except TranscriptionError:
@@ -138,17 +197,21 @@ class TranscriptService:
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
             raise MetadataRetrievalFailedError() from exc
         finally:
+            cancellation_event.set()
             if prepared_audio is not None:
                 prepared_audio.cleanup()
+            self._release_admission()
 
     async def _extract_metadata(
         self,
         provider_url: str,
+        cancellation_event: threading.Event,
     ) -> inspection.ExtractedMetadata:
-        """Call the metadata provider outside the event loop.
+        """Retrieve metadata within its full provider-operation deadline.
 
         Args:
             provider_url: Validated minimal provider URL.
+            cancellation_event: Signal set when request work must stop.
 
         Returns:
             Raw metadata and any duration-probe audio.
@@ -156,16 +219,32 @@ class TranscriptService:
         Raises:
             TranscriptionError: If the metadata stage cannot succeed safely.
         """
-        try:
-            extracted_metadata = await asyncio.to_thread(
-                self._adapters.metadata_extractor.extract,
+        deadline = time.monotonic() + self._settings.metadata_timeout_seconds
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                self._metadata_extractor.extract,
                 provider_url,
-            )
+                deadline=deadline,
+                cancellation_event=cancellation_event,
+            ),
+            name="metadata-extraction",
+        )
+        try:
+            async with asyncio.timeout(self._settings.metadata_timeout_seconds):
+                extracted_metadata = await asyncio.shield(worker)
+        except TimeoutError as exc:
+            cancellation_event.set()
+            await _finish_cancelled_metadata(worker)
+            raise MetadataTimeoutError() from exc
+        except asyncio.CancelledError:
+            cancellation_event.set()
+            await _finish_cancelled_metadata(worker)
+            raise
         except inspection._MetadataDurationLimitExceeded as exc:
             raise VideoTooLongError() from exc
         except TranscriptionError:
             raise
-        except (Timeout, TimeoutError) as exc:
+        except Timeout as exc:
             raise MetadataTimeoutError() from exc
         except RequestException as exc:
             if inspection._is_timeout_exception(exc):

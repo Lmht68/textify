@@ -107,6 +107,14 @@ class TranscriptionFailedError(TranscriptionError):
     message = "The source could not be transcribed."
 
 
+class TranscriptionCapacityExceededError(TranscriptionError):
+    """Indicate exhausted admission or native inference queue capacity."""
+
+    status_code = 503
+    code = "transcription_capacity_exceeded"
+    message = "Transcription capacity is currently unavailable."
+
+
 class MetadataTimeoutError(TranscriptionError):
     """Indicate metadata retrieval timing out."""
 

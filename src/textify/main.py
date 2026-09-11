@@ -1,6 +1,5 @@
 """Runnable FastAPI composition root for Textify."""
 
-import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
@@ -84,7 +83,6 @@ def create_app(
         application.state.transcript_service = TranscriptService(
             adapters,
             resolved_transcription_config,
-            asyncio.Semaphore(resolved_transcription_config.transcription_concurrency),
         )
         application.state.ready = True
         try:

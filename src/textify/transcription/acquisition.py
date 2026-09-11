@@ -3,6 +3,8 @@
 import asyncio
 import logging
 import tempfile
+import threading
+import time
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from decimal import Decimal
 from numbers import Real
@@ -18,12 +20,13 @@ from youtube_transcript_api import (
     CouldNotRetrieveTranscript,
     YouTubeTranscriptApi,
 )
-from yt_dlp.utils import DownloadError, YoutubeDLError
+from yt_dlp.utils import DownloadCancelled, DownloadError, YoutubeDLError
 
 from textify.transcription.config import TranscriptionConfig
 from textify.transcription.exceptions import (
     AudioDownloadFailedError,
     AudioDownloadTimeoutError,
+    TranscriptionCapacityExceededError,
     TranscriptionFailedError,
     TranscriptionTimeoutError,
 )
@@ -38,7 +41,10 @@ from textify.transcription.types import (
     TranscriptMethod,
     normalize_transcript,
 )
-from textify.transcription.util import extract_info_with_retries
+from textify.transcription.util import (
+    build_yt_dlp_progress_hook,
+    extract_info_with_retries,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -160,12 +166,21 @@ class CaptionProvider(Protocol):
 class AudioDownloader(Protocol):
     """Download one Source's native best-audio representation."""
 
-    def download(self, source_url: str, destination: Path) -> Path:
+    def download(
+        self,
+        source_url: str,
+        destination: Path,
+        *,
+        deadline: float,
+        cancellation_event: threading.Event,
+    ) -> Path:
         """Download audio into the provided request directory.
 
         Args:
             source_url: Validated provider URL to download.
             destination: Existing private request directory.
+            deadline: Monotonic absolute deadline for audio download.
+            cancellation_event: Signal set when request work must stop.
 
         Returns:
             Completed audio file path owned by ``destination``.
@@ -365,12 +380,21 @@ class _WhisperModel(Protocol):
 class YtDlpAudioDownloader:
     """Download native best audio into a private request directory."""
 
-    def download(self, source_url: str, destination: Path) -> Path:
+    def download(
+        self,
+        source_url: str,
+        destination: Path,
+        *,
+        deadline: float,
+        cancellation_event: threading.Event,
+    ) -> Path:
         """Download one Source's native best-audio representation.
 
         Args:
             source_url: Validated provider URL to download.
             destination: Existing private request directory.
+            deadline: Monotonic absolute deadline for audio download.
+            cancellation_event: Signal set when request work must stop.
 
         Returns:
             Validated completed audio file inside ``destination``.
@@ -383,6 +407,12 @@ class YtDlpAudioDownloader:
         options = {
             **_YTDLP_OPTIONS,
             "outtmpl": str(request_directory / _AUDIO_OUTPUT_TEMPLATE),
+            "progress_hooks": [
+                build_yt_dlp_progress_hook(
+                    deadline=deadline,
+                    cancellation_event=cancellation_event,
+                )
+            ],
         }
         try:
             with yt_dlp.YoutubeDL(options) as youtube_dl:
@@ -390,6 +420,8 @@ class YtDlpAudioDownloader:
                     youtube_dl.extract_info,
                     source_url,
                     download=True,
+                    deadline=deadline,
+                    cancellation_event=cancellation_event,
                 )
                 if not isinstance(raw_info, Mapping) or "entries" in raw_info:
                     _log_acquisition_error(
@@ -572,11 +604,16 @@ async def _finish_cancelled_download(worker: asyncio.Task[Path]) -> None:
         except (
             _AudioDownloadProviderFailure,
             _AudioDownloadProviderTimeout,
+            DownloadCancelled,
         ):
             return
     try:
         worker.result()
-    except (_AudioDownloadProviderFailure, _AudioDownloadProviderTimeout):
+    except (
+        _AudioDownloadProviderFailure,
+        _AudioDownloadProviderTimeout,
+        DownloadCancelled,
+    ):
         return
     except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
         logger.error("audio download failed after request cancellation")
@@ -696,145 +733,209 @@ def acquire_transcript(
     return None
 
 
-async def acquire_whisper(
-    source_url: str,
-    audio_downloader: AudioDownloader,
-    transcriber: WhisperTranscriber,
-    temporary_media_root: Path,
-    prepared_audio: PreparedAudio | None,
-    semaphore: asyncio.Semaphore,
-) -> Transcript:
-    """Download source audio, then infer under the native concurrency gate.
+class WhisperAcquirer:
+    """Own bounded audio acquisition and native transcription resources."""
 
-    Args:
-        source_url: Original submitted TikTok URL for yt-dlp.
-        audio_downloader: Synchronous native-audio adapter.
-        transcriber: Preloaded synchronous Faster-Whisper adapter.
-        temporary_media_root: Root for request-scoped temporary media.
-        prepared_audio: Audio downloaded while recovering a missing duration.
-        semaphore: Application-lifetime gate acquired only for native inference.
+    def __init__(
+        self,
+        audio_downloader: AudioDownloader,
+        transcriber: WhisperTranscriber,
+        settings: TranscriptionConfig,
+    ) -> None:
+        """Initialize process-lifetime audio and native transcription resources.
 
-    Returns:
-        Normalized Transcript, including successful silent media.
-
-    Raises:
-        AudioDownloadFailedError: If the audio download is unusable.
-        AudioDownloadTimeoutError: If the audio download times out.
-        TranscriptionFailedError: If native inference is unusable.
-        TranscriptionTimeoutError: If native inference times out.
-    """
-    request_directory: Path | None = None
-    try:
-        audio_path, request_directory = await _prepare_audio(
-            source_url,
-            audio_downloader,
-            temporary_media_root,
-            prepared_audio,
+        Args:
+            audio_downloader: Synchronous native-audio provider boundary.
+            transcriber: Preloaded synchronous Faster-Whisper boundary.
+            settings: Validated acquisition capacity and deadline configuration.
+        """
+        self._audio_downloader = audio_downloader
+        self._transcriber = transcriber
+        self._temporary_media_root = settings.temporary_media_root
+        self._audio_download_timeout_seconds = settings.audio_download_timeout_seconds
+        self._transcription_queue_timeout_seconds = (
+            settings.transcription_queue_timeout_seconds
         )
-        inference_permit_acquired = False
+        self._transcription_timeout_seconds = settings.transcription_timeout_seconds
+        self._inference_semaphore = asyncio.Semaphore(
+            settings.transcription_concurrency
+        )
+
+    async def acquire(
+        self,
+        source_url: str,
+        prepared_audio: PreparedAudio | None,
+        cancellation_event: threading.Event,
+    ) -> Transcript:
+        """Acquire source audio and transcribe it under the native permit.
+
+        Args:
+            source_url: Original submitted TikTok URL for yt-dlp.
+            prepared_audio: Audio downloaded while recovering a missing duration.
+            cancellation_event: Signal set when request work must stop.
+
+        Returns:
+            Normalized Transcript, including successful silent media.
+
+        Raises:
+            AudioDownloadFailedError: If the audio download is unusable.
+            AudioDownloadTimeoutError: If the audio download times out.
+            TranscriptionCapacityExceededError: If native queue capacity expires.
+            TranscriptionFailedError: If native inference is unusable.
+            TranscriptionTimeoutError: If native inference does not respond in time.
+        """
+        request_directory: Path | None = None
         try:
-            await semaphore.acquire()
-            inference_permit_acquired = True
-            worker = asyncio.create_task(
-                asyncio.to_thread(_transcribe_audio, audio_path, transcriber)
+            audio_path, request_directory = await self._prepare_audio(
+                source_url,
+                prepared_audio,
+                cancellation_event,
             )
+            inference_permit_acquired = False
             try:
-                return await asyncio.shield(worker)
-            except asyncio.CancelledError:
-                await _finish_cancelled_worker(worker)
-                raise
-        except _TranscriptionProviderTimeout as exc:
-            raise TranscriptionTimeoutError() from exc
-        except _TranscriptionProviderFailure as exc:
-            raise TranscriptionFailedError() from exc
+                try:
+                    async with asyncio.timeout(
+                        self._transcription_queue_timeout_seconds
+                    ):
+                        await self._inference_semaphore.acquire()
+                except TimeoutError as exc:
+                    raise TranscriptionCapacityExceededError() from exc
+                inference_permit_acquired = True
+                worker = asyncio.create_task(
+                    asyncio.to_thread(
+                        _transcribe_audio,
+                        audio_path,
+                        self._transcriber,
+                    ),
+                    name="native-transcription",
+                )
+                try:
+                    async with asyncio.timeout(self._transcription_timeout_seconds):
+                        return await asyncio.shield(worker)
+                except TimeoutError as exc:
+                    cancellation_event.set()
+                    await _finish_cancelled_worker(worker)
+                    raise TranscriptionTimeoutError() from exc
+                except asyncio.CancelledError:
+                    cancellation_event.set()
+                    await _finish_cancelled_worker(worker)
+                    raise
+            except _TranscriptionProviderTimeout as exc:
+                raise TranscriptionTimeoutError() from exc
+            except _TranscriptionProviderFailure as exc:
+                raise TranscriptionFailedError() from exc
+            finally:
+                if inference_permit_acquired:
+                    self._inference_semaphore.release()
+        except _AudioDownloadProviderTimeout as exc:
+            raise AudioDownloadTimeoutError() from exc
+        except _AudioDownloadProviderFailure as exc:
+            raise AudioDownloadFailedError() from exc
         finally:
-            if inference_permit_acquired:
-                semaphore.release()
-    except _AudioDownloadProviderTimeout as exc:
-        raise AudioDownloadTimeoutError() from exc
-    except _AudioDownloadProviderFailure as exc:
-        raise AudioDownloadFailedError() from exc
-    finally:
-        if request_directory is not None:
-            _cleanup_request_directory(request_directory)
+            if request_directory is not None:
+                _cleanup_request_directory(request_directory)
 
-
-async def _prepare_audio(
-    source_url: str,
-    audio_downloader: AudioDownloader,
-    temporary_media_root: Path,
-    prepared_audio: PreparedAudio | None,
-) -> tuple[Path, Path | None]:
-    """Return validated audio and any request directory this call owns."""
-    if prepared_audio is not None:
-        audio_path = await asyncio.to_thread(
-            _validate_audio_path,
-            prepared_audio.path,
-            prepared_audio.request_directory,
-        )
-        return audio_path, None
-
-    try:
-        temporary_media_root.mkdir(parents=True, exist_ok=True)
-        request_directory = Path(
-            tempfile.mkdtemp(
-                prefix=_WHISPER_TEMP_PREFIX,
-                dir=str(temporary_media_root),
+    async def _prepare_audio(
+        self,
+        source_url: str,
+        prepared_audio: PreparedAudio | None,
+        cancellation_event: threading.Event,
+    ) -> tuple[Path, Path | None]:
+        """Return validated audio and any request directory this call owns."""
+        if prepared_audio is not None:
+            audio_path = await asyncio.to_thread(
+                _validate_audio_path,
+                prepared_audio.path,
+                prepared_audio.request_directory,
             )
-        ).resolve()
-    except OSError as exc:
-        _log_acquisition_error("audio download provider error", "temporary_root_failed")
-        raise _AudioDownloadProviderFailure from exc
+            return audio_path, None
 
-    worker = asyncio.create_task(
-        asyncio.to_thread(
-            _download_audio,
-            source_url,
-            audio_downloader,
-            request_directory,
+        try:
+            self._temporary_media_root.mkdir(parents=True, exist_ok=True)
+            request_directory = Path(
+                tempfile.mkdtemp(
+                    prefix=_WHISPER_TEMP_PREFIX,
+                    dir=str(self._temporary_media_root),
+                )
+            ).resolve()
+        except OSError as exc:
+            _log_acquisition_error(
+                "audio download provider error",
+                "temporary_root_failed",
+            )
+            raise _AudioDownloadProviderFailure from exc
+
+        deadline = time.monotonic() + self._audio_download_timeout_seconds
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                self._download_audio,
+                source_url,
+                request_directory,
+                deadline=deadline,
+                cancellation_event=cancellation_event,
+            ),
+            name="audio-download",
         )
-    )
-    completed = False
-    try:
-        audio_path = await asyncio.shield(worker)
-        completed = True
-        return audio_path, request_directory
-    except asyncio.CancelledError:
-        await _finish_cancelled_download(worker)
-        raise
-    finally:
-        if not completed:
-            _cleanup_request_directory(request_directory)
+        completed = False
+        try:
+            async with asyncio.timeout(self._audio_download_timeout_seconds):
+                audio_path = await asyncio.shield(worker)
+            completed = True
+            return audio_path, request_directory
+        except TimeoutError as exc:
+            cancellation_event.set()
+            await _finish_cancelled_download(worker)
+            raise _AudioDownloadProviderTimeout from exc
+        except asyncio.CancelledError:
+            cancellation_event.set()
+            await _finish_cancelled_download(worker)
+            raise
+        finally:
+            if not completed:
+                _cleanup_request_directory(request_directory)
 
-
-def _download_audio(
-    source_url: str,
-    audio_downloader: AudioDownloader,
-    request_directory: Path,
-) -> Path:
-    """Download and validate one audio file inside its request directory."""
-    try:
-        downloaded_path = audio_downloader.download(source_url, request_directory)
-        return _validate_audio_path(downloaded_path, request_directory)
-    except _AudioDownloadProviderTimeout:
-        raise
-    except _AudioDownloadProviderFailure:
-        raise
-    except (Timeout, TimeoutError) as exc:
-        _log_acquisition_error(
-            "audio download provider timeout", "audio_download_timeout"
-        )
-        raise _AudioDownloadProviderTimeout from exc
-    except (
-        AttributeError,
-        KeyError,
-        OSError,
-        RuntimeError,
-        TypeError,
-        ValueError,
-    ) as exc:
-        _log_acquisition_error("audio download provider error", "audio_download_failed")
-        raise _AudioDownloadProviderFailure from exc
+    def _download_audio(
+        self,
+        source_url: str,
+        request_directory: Path,
+        *,
+        deadline: float,
+        cancellation_event: threading.Event,
+    ) -> Path:
+        """Download and validate one audio file inside its request directory."""
+        try:
+            downloaded_path = self._audio_downloader.download(
+                source_url,
+                request_directory,
+                deadline=deadline,
+                cancellation_event=cancellation_event,
+            )
+            return _validate_audio_path(downloaded_path, request_directory)
+        except _AudioDownloadProviderTimeout:
+            raise
+        except _AudioDownloadProviderFailure:
+            raise
+        except DownloadCancelled as exc:
+            raise _AudioDownloadProviderFailure from exc
+        except (Timeout, TimeoutError) as exc:
+            _log_acquisition_error(
+                "audio download provider timeout",
+                "audio_download_timeout",
+            )
+            raise _AudioDownloadProviderTimeout from exc
+        except (
+            AttributeError,
+            KeyError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            _log_acquisition_error(
+                "audio download provider error",
+                "audio_download_failed",
+            )
+            raise _AudioDownloadProviderFailure from exc
 
 
 def _transcribe_audio(
