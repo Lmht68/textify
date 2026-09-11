@@ -1,7 +1,9 @@
 """Runnable FastAPI composition root for Textify."""
 
-from collections.abc import AsyncGenerator
+import shutil
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -49,10 +51,46 @@ async def request_validation_error_handler(
     )
 
 
+def _available_temporary_media_bytes(root: Path) -> int:
+    """Return currently available space in the temporary-media filesystem."""
+    try:
+        return shutil.disk_usage(root).free
+    except OSError as exc:
+        raise RuntimeError(
+            "Unable to determine temporary media root capacity."
+        ) from exc
+
+
+def _validate_temporary_media_capacity(
+    settings: TranscriptionConfig,
+    *,
+    available_bytes: Callable[[Path], int],
+) -> None:
+    """Reject startup when temporary media cannot hold the configured quota."""
+    required_bytes = (
+        settings.max_pending_transcriptions + settings.transcription_concurrency + 1
+    ) * settings.max_media_bytes
+    try:
+        available_media_bytes = available_bytes(settings.temporary_media_root)
+    except OSError as exc:
+        raise RuntimeError(
+            "Unable to determine temporary media root capacity."
+        ) from exc
+    if available_media_bytes < required_bytes:
+        raise RuntimeError(
+            "Temporary media root requires "
+            f"{required_bytes} available bytes; "
+            f"{available_media_bytes} are available."
+        )
+
+
 def create_app(
     app_config: AppConfig | None = None,
     transcription_config: TranscriptionConfig | None = None,
     adapters_factory: TranscriptionAdaptersFactory = build_transcription_adapters,
+    available_temporary_media_bytes: Callable[
+        [Path], int
+    ] = _available_temporary_media_bytes,
 ) -> FastAPI:
     """Create the configured Textify FastAPI application.
 
@@ -60,6 +98,7 @@ def create_app(
         app_config: Optional application configuration for composition or tests.
         transcription_config: Optional transcription configuration for composition or tests.
         adapters_factory: Factory that creates the complete provider adapter bundle.
+        available_temporary_media_bytes: Reader for current writable media capacity.
 
     Returns:
         Unstarted FastAPI application with startup-owned model lifecycle.
@@ -79,16 +118,22 @@ def create_app(
             parents=True,
             exist_ok=True,
         )
+        _validate_temporary_media_capacity(
+            resolved_transcription_config,
+            available_bytes=available_temporary_media_bytes,
+        )
         adapters = adapters_factory(resolved_transcription_config)
-        application.state.transcript_service = TranscriptService(
+        service = TranscriptService(
             adapters,
             resolved_transcription_config,
         )
+        application.state.transcript_service = service
         application.state.ready = True
         try:
             yield
         finally:
             application.state.ready = False
+            await service.shutdown()
 
     application = FastAPI(
         title="Textify",

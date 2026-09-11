@@ -17,6 +17,7 @@ from textify.transcription.exceptions import (
     TranscriptionCapacityExceededError,
     TranscriptionError,
     UnsupportedContentError,
+    UnsupportedMediaError,
     UnsupportedPlatformError,
     VideoTooLongError,
 )
@@ -25,6 +26,7 @@ from textify.transcription.types import (
     Source,
     TranscriptionResult,
 )
+from textify.transcription.util import MediaByteLimitExceeded
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,10 +65,11 @@ def build_transcription_adapters(
     return TranscriptionAdapters(
         metadata_extractor=inspection.YtDlpMetadataExtractor(
             settings.max_duration_seconds,
+            settings.max_media_bytes,
             settings.temporary_media_root,
         ),
         caption_provider=acquisition.YouTubeCaptionProvider(),
-        audio_downloader=acquisition.YtDlpAudioDownloader(),
+        audio_downloader=acquisition.YtDlpAudioDownloader(settings.max_media_bytes),
         whisper_transcriber=acquisition.load_whisper_transcriber(settings),
     )
 
@@ -164,12 +167,17 @@ class TranscriptService:
         self._admit()
         cancellation_event = threading.Event()
         prepared_audio: inspection.PreparedAudio | None = None
+        ownership: acquisition.TranscriptionOwnership | None = None
         try:
             extracted_metadata = await self._extract_metadata(
                 submitted.provider_url,
                 cancellation_event,
             )
             prepared_audio = extracted_metadata.prepared_audio
+            inspection._raise_if_selected_media_exceeds_limit(
+                extracted_metadata.metadata,
+                self._settings.max_media_bytes,
+            )
             normalized_metadata = inspection.normalize_processed_metadata(
                 extracted_metadata.metadata,
                 submitted,
@@ -186,21 +194,32 @@ class TranscriptService:
             if source.duration_seconds > self._settings.max_duration_seconds:
                 raise VideoTooLongError()
 
-            transcript = await self._whisper_acquirer.acquire(
-                submitted_url,
+            ownership = acquisition.TranscriptionOwnership(
                 prepared_audio,
                 cancellation_event,
+                self._release_admission,
             )
+            prepared_audio = None
+            transcript = await self._whisper_acquirer.acquire(submitted_url, ownership)
             return TranscriptionResult(source, transcript)
+        except MediaByteLimitExceeded as exc:
+            raise UnsupportedMediaError() from exc
         except TranscriptionError:
             raise
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
             raise MetadataRetrievalFailedError() from exc
         finally:
-            cancellation_event.set()
-            if prepared_audio is not None:
-                prepared_audio.cleanup()
-            self._release_admission()
+            if ownership is None:
+                cancellation_event.set()
+                if prepared_audio is not None:
+                    prepared_audio.cleanup()
+                self._release_admission()
+            else:
+                ownership.finish_request()
+
+    async def shutdown(self) -> None:
+        """Wait for retained native inference and its request-media cleanup."""
+        await self._whisper_acquirer.shutdown()
 
     async def _extract_metadata(
         self,
@@ -250,6 +269,8 @@ class TranscriptService:
             if inspection._is_timeout_exception(exc):
                 raise MetadataTimeoutError() from exc
             raise MetadataRetrievalFailedError() from exc
+        except MediaByteLimitExceeded as exc:
+            raise UnsupportedMediaError() from exc
         except YoutubeDLError as exc:
             if inspection._is_timeout_exception(exc):
                 raise MetadataTimeoutError() from exc

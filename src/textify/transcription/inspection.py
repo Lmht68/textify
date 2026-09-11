@@ -29,6 +29,7 @@ from textify.transcription.exceptions import (
 )
 from textify.transcription.types import Platform
 from textify.transcription.util import (
+    MediaByteLimitExceeded,
     build_yt_dlp_progress_hook,
     extract_info_with_retries,
     raise_if_cancelled_or_expired,
@@ -156,6 +157,7 @@ _METADATA_YTDLP_OPTIONS: Final[dict[str, object]] = {
     "no_warnings": True,
     "noplaylist": True,
     "quiet": True,
+    "format": "bestaudio/best",
 }
 
 _AUDIO_OUTPUT_TEMPLATE: Final[str] = "audio.%(ext)s"
@@ -223,6 +225,55 @@ def _unsupported_platform_error(reason: str) -> UnsupportedPlatformError:
     return UnsupportedPlatformError()
 
 
+def _raise_if_selected_media_exceeds_limit(
+    metadata: Mapping[str, object],
+    max_media_bytes: int,
+) -> None:
+    """Reject selected media whose declared size exceeds the byte limit."""
+    selected_size = metadata.get("filesize")
+    if not _is_positive_finite_media_size(selected_size):
+        selected_size = metadata.get("filesize_approx")
+    if _media_size_exceeds_limit(selected_size, max_media_bytes):
+        _log_inspection_error("unsupported media", "media_size_exceeded")
+        raise MediaByteLimitExceeded
+
+
+def _is_positive_finite_media_size(value: object) -> bool:
+    """Return whether a provider size is a usable positive finite numeric value."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, Decimal):
+        return value.is_finite() and value > 0
+    if isinstance(value, int):
+        return value > 0
+    if not isinstance(value, Real):
+        return False
+    try:
+        numeric_value = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+    return isfinite(numeric_value) and numeric_value > 0
+
+
+def _media_size_exceeds_limit(value: object, max_media_bytes: int) -> bool:
+    """Return whether a usable provider size is greater than the byte limit."""
+    if not _is_positive_finite_media_size(value):
+        return False
+    if isinstance(value, Decimal | int):
+        return value > max_media_bytes
+    return float(cast(Real, value)) > max_media_bytes
+
+
+def _raise_if_completed_media_exceeds_limit(
+    media_path: Path,
+    max_media_bytes: int,
+) -> None:
+    """Reject a completed media file whose exact size exceeds the byte limit."""
+    if media_path.stat().st_size > max_media_bytes:
+        _log_inspection_error("unsupported media", "media_size_exceeded")
+        raise MediaByteLimitExceeded
+
+
 class _MetadataDurationLimitExceeded(Exception):
     """Indicate that inspection found a source exceeding the duration limit."""
 
@@ -277,14 +328,21 @@ class MetadataExtractor(Protocol):
 class YtDlpMetadataExtractor:
     """Retrieve Source metadata and recover missing durations through audio download."""
 
-    def __init__(self, max_duration_seconds: int, temp_media_dir: Path) -> None:
-        """Initialize fallback media storage and the permitted video duration.
+    def __init__(
+        self,
+        max_duration_seconds: int,
+        max_media_bytes: int,
+        temp_media_dir: Path,
+    ) -> None:
+        """Initialize fallback storage and media duration and byte limits.
 
         Args:
             max_duration_seconds: Maximum duration accepted by the extraction pipeline.
+            max_media_bytes: Inclusive limit for selected or downloaded media.
             temp_media_dir: Root directory for private inspection media directories.
         """
         self._max_duration_seconds = max_duration_seconds
+        self._max_media_bytes = max_media_bytes
         self._temp_media_dir = temp_media_dir
 
     def extract(
@@ -323,6 +381,10 @@ class YtDlpMetadataExtractor:
         raise_if_cancelled_or_expired(
             deadline=deadline,
             cancellation_event=cancellation_event,
+        )
+        _raise_if_selected_media_exceeds_limit(
+            metadata,
+            self._max_media_bytes,
         )
         if metadata.get("duration") is not None:
             return ExtractedMetadata(metadata)
@@ -373,6 +435,7 @@ class YtDlpMetadataExtractor:
                     build_yt_dlp_progress_hook(
                         deadline=deadline,
                         cancellation_event=cancellation_event,
+                        max_media_bytes=self._max_media_bytes,
                     )
                 ],
             }
@@ -386,6 +449,10 @@ class YtDlpMetadataExtractor:
                 )
                 if not isinstance(raw_metadata, Mapping) or "entries" in raw_metadata:
                     raise _metadata_provider_error("invalid_duration_download_result")
+                _raise_if_selected_media_exceeds_limit(
+                    raw_metadata,
+                    self._max_media_bytes,
+                )
                 prepared_path = youtube_dl.prepare_filename(raw_metadata)
 
             if not isinstance(prepared_path, (str, Path)):
@@ -393,6 +460,10 @@ class YtDlpMetadataExtractor:
             audio_path = Path(prepared_path).resolve()
             if audio_path.parent != request_directory or not audio_path.is_file():
                 raise _metadata_provider_error("duration_audio_file_missing")
+            _raise_if_completed_media_exceeds_limit(
+                audio_path,
+                self._max_media_bytes,
+            )
             raise_if_cancelled_or_expired(
                 deadline=deadline,
                 cancellation_event=cancellation_event,

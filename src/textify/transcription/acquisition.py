@@ -5,7 +5,7 @@ import logging
 import tempfile
 import threading
 import time
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from decimal import Decimal
 from numbers import Real
 from pathlib import Path
@@ -29,11 +29,13 @@ from textify.transcription.exceptions import (
     TranscriptionCapacityExceededError,
     TranscriptionFailedError,
     TranscriptionTimeoutError,
+    UnsupportedMediaError,
 )
 from textify.transcription.inspection import (
     PreparedAudio,
     _cleanup_request_directory,
     _is_timeout_exception,
+    _raise_if_selected_media_exceeds_limit,
 )
 from textify.transcription.types import (
     RawSegment,
@@ -42,6 +44,7 @@ from textify.transcription.types import (
     normalize_transcript,
 )
 from textify.transcription.util import (
+    MediaByteLimitExceeded,
     build_yt_dlp_progress_hook,
     extract_info_with_retries,
 )
@@ -380,6 +383,10 @@ class _WhisperModel(Protocol):
 class YtDlpAudioDownloader:
     """Download native best audio into a private request directory."""
 
+    def __init__(self, max_media_bytes: int) -> None:
+        """Initialize the inclusive byte limit for every native download."""
+        self._max_media_bytes = max_media_bytes
+
     def download(
         self,
         source_url: str,
@@ -411,6 +418,7 @@ class YtDlpAudioDownloader:
                 build_yt_dlp_progress_hook(
                     deadline=deadline,
                     cancellation_event=cancellation_event,
+                    max_media_bytes=self._max_media_bytes,
                 )
             ],
         }
@@ -429,8 +437,14 @@ class YtDlpAudioDownloader:
                         "invalid_download_result",
                     )
                     raise _AudioDownloadProviderFailure
+                _raise_if_selected_media_exceeds_limit(
+                    raw_info,
+                    self._max_media_bytes,
+                )
                 prepared_path = youtube_dl.prepare_filename(raw_info)
         except _AudioDownloadProviderFailure:
+            raise
+        except MediaByteLimitExceeded:
             raise
         except DownloadError as exc:
             if _is_timeout_exception(exc):
@@ -563,35 +577,60 @@ def load_whisper_transcriber(
     return FasterWhisperTranscriber(model, settings)
 
 
-async def _finish_cancelled_worker(
-    worker: asyncio.Task[Transcript],
-) -> None:
-    """Wait for native inference before releasing its permit after cancellation."""
-    while not worker.done():
-        try:
-            await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            continue
-        except (
-            _TranscriptionProviderFailure,
-            _TranscriptionProviderTimeout,
-        ):
+class TranscriptionOwnership:
+    """Own request admission and inspection media across native inference."""
+
+    def __init__(
+        self,
+        prepared_audio: PreparedAudio | None,
+        cancellation_event: threading.Event,
+        release_admission: Callable[[], None],
+    ) -> None:
+        """Initialize request-scoped ownership before native work can begin."""
+        self._prepared_audio = prepared_audio
+        self._cancellation_event = cancellation_event
+        self._release_admission = release_admission
+        self._native_retained = False
+        self._request_finished = False
+        self._native_completed = False
+        self._released = False
+
+    @property
+    def prepared_audio(self) -> PreparedAudio | None:
+        """Return media prepared during metadata inspection, if any."""
+        return self._prepared_audio
+
+    @property
+    def cancellation_event(self) -> threading.Event:
+        """Return the cooperative cancellation signal for provider work."""
+        return self._cancellation_event
+
+    def retain_native_work(self) -> None:
+        """Transfer cleanup and admission release to native-work completion."""
+        self._native_retained = True
+        self._release_when_finished()
+
+    def finish_request(self) -> None:
+        """Mark the HTTP request finished and stop interruptible provider work."""
+        self._request_finished = True
+        self._cancellation_event.set()
+        self._release_when_finished()
+
+    def complete_native_work(self) -> None:
+        """Mark retained native work complete and release owned resources."""
+        self._native_completed = True
+        self._release_when_finished()
+
+    def _release_when_finished(self) -> None:
+        """Clean request resources and admission only after every owner finishes."""
+        if self._released or not self._request_finished:
             return
-    try:
-        worker.result()
-    except (_TranscriptionProviderFailure, _TranscriptionProviderTimeout):
-        return
-    except (
-        AttributeError,
-        EOFError,
-        IndexError,
-        KeyError,
-        OSError,
-        RuntimeError,
-        TypeError,
-        ValueError,
-    ):
-        logger.error("native inference failed after request cancellation")
+        if self._native_retained and not self._native_completed:
+            return
+        self._released = True
+        if self._prepared_audio is not None:
+            self._prepared_audio.cleanup()
+        self._release_admission()
 
 
 async def _finish_cancelled_download(worker: asyncio.Task[Path]) -> None:
@@ -619,8 +658,12 @@ async def _finish_cancelled_download(worker: asyncio.Task[Path]) -> None:
         logger.error("audio download failed after request cancellation")
 
 
-def _validate_audio_path(audio_path: Path, request_directory: Path) -> Path:
-    """Validate that downloaded audio remains owned by its request directory."""
+def _validate_audio_path(
+    audio_path: Path,
+    request_directory: Path,
+    max_media_bytes: int,
+) -> Path:
+    """Validate ownership and exact size of downloaded request media."""
     if not isinstance(audio_path, Path):
         _log_acquisition_error(
             "audio download provider error", "invalid_audio_path_type"
@@ -636,6 +679,9 @@ def _validate_audio_path(audio_path: Path, request_directory: Path) -> Path:
     if not resolved_path.is_file():
         _log_acquisition_error("audio download provider error", "audio_file_missing")
         raise _AudioDownloadProviderFailure
+    if resolved_path.stat().st_size > max_media_bytes:
+        _log_acquisition_error("unsupported media", "media_size_exceeded")
+        raise MediaByteLimitExceeded
     return resolved_path
 
 
@@ -757,22 +803,22 @@ class WhisperAcquirer:
             settings.transcription_queue_timeout_seconds
         )
         self._transcription_timeout_seconds = settings.transcription_timeout_seconds
+        self._max_media_bytes = settings.max_media_bytes
         self._inference_semaphore = asyncio.Semaphore(
             settings.transcription_concurrency
         )
+        self._native_finalizers: set[asyncio.Task[None]] = set()
 
     async def acquire(
         self,
         source_url: str,
-        prepared_audio: PreparedAudio | None,
-        cancellation_event: threading.Event,
+        ownership: TranscriptionOwnership,
     ) -> Transcript:
         """Acquire source audio and transcribe it under the native permit.
 
         Args:
             source_url: Original submitted TikTok URL for yt-dlp.
-            prepared_audio: Audio downloaded while recovering a missing duration.
-            cancellation_event: Signal set when request work must stop.
+            ownership: Request ownership retained when native work outlives a response.
 
         Returns:
             Normalized Transcript, including successful silent media.
@@ -785,13 +831,14 @@ class WhisperAcquirer:
             TranscriptionTimeoutError: If native inference does not respond in time.
         """
         request_directory: Path | None = None
+        inference_permit_acquired = False
+        cancellation_event = ownership.cancellation_event
         try:
             audio_path, request_directory = await self._prepare_audio(
                 source_url,
-                prepared_audio,
+                ownership.prepared_audio,
                 cancellation_event,
             )
-            inference_permit_acquired = False
             try:
                 try:
                     async with asyncio.timeout(
@@ -809,16 +856,30 @@ class WhisperAcquirer:
                     ),
                     name="native-transcription",
                 )
+                completion_event = asyncio.Event()
+                worker.add_done_callback(lambda _worker: completion_event.set())
                 try:
                     async with asyncio.timeout(self._transcription_timeout_seconds):
                         return await asyncio.shield(worker)
                 except TimeoutError as exc:
-                    cancellation_event.set()
-                    await _finish_cancelled_worker(worker)
+                    self._retain_abandoned_native_work(
+                        worker,
+                        completion_event,
+                        request_directory,
+                        ownership,
+                    )
+                    inference_permit_acquired = False
+                    request_directory = None
                     raise TranscriptionTimeoutError() from exc
                 except asyncio.CancelledError:
-                    cancellation_event.set()
-                    await _finish_cancelled_worker(worker)
+                    self._retain_abandoned_native_work(
+                        worker,
+                        completion_event,
+                        request_directory,
+                        ownership,
+                    )
+                    inference_permit_acquired = False
+                    request_directory = None
                     raise
             except _TranscriptionProviderTimeout as exc:
                 raise TranscriptionTimeoutError() from exc
@@ -827,6 +888,8 @@ class WhisperAcquirer:
             finally:
                 if inference_permit_acquired:
                     self._inference_semaphore.release()
+        except MediaByteLimitExceeded as exc:
+            raise UnsupportedMediaError() from exc
         except _AudioDownloadProviderTimeout as exc:
             raise AudioDownloadTimeoutError() from exc
         except _AudioDownloadProviderFailure as exc:
@@ -834,6 +897,69 @@ class WhisperAcquirer:
         finally:
             if request_directory is not None:
                 _cleanup_request_directory(request_directory)
+
+    def _retain_abandoned_native_work(
+        self,
+        worker: asyncio.Task[Transcript],
+        completion_event: asyncio.Event,
+        request_directory: Path | None,
+        ownership: TranscriptionOwnership,
+    ) -> None:
+        """Transfer native cleanup to a finalizer without awaiting inference."""
+        ownership.retain_native_work()
+        finalizer = asyncio.create_task(
+            self._finalize_abandoned_native_work(
+                worker,
+                completion_event,
+                request_directory,
+                ownership,
+            ),
+            name="native-transcription-finalizer",
+        )
+        self._native_finalizers.add(finalizer)
+        finalizer.add_done_callback(self._consume_native_finalizer)
+
+    async def _finalize_abandoned_native_work(
+        self,
+        worker: asyncio.Task[Transcript],
+        completion_event: asyncio.Event,
+        request_directory: Path | None,
+        ownership: TranscriptionOwnership,
+    ) -> None:
+        """Release abandoned native work after its worker actually completes."""
+        try:
+            while not completion_event.is_set():
+                try:
+                    await asyncio.shield(completion_event.wait())
+                except asyncio.CancelledError:
+                    continue
+            worker_exception = worker.exception()
+            if worker_exception is None:
+                worker.result()
+            elif not isinstance(
+                worker_exception,
+                (_TranscriptionProviderFailure, _TranscriptionProviderTimeout),
+            ):
+                logger.error("abandoned native inference failed")
+        finally:
+            if request_directory is not None:
+                _cleanup_request_directory(request_directory)
+            self._inference_semaphore.release()
+            ownership.complete_native_work()
+
+    def _consume_native_finalizer(self, task: asyncio.Task[None]) -> None:
+        """Consume finalizer outcomes so background cleanup cannot leak warnings."""
+        self._native_finalizers.discard(task)
+        if task.cancelled():
+            return
+        if task.exception() is not None:
+            logger.error("native inference finalizer failed")
+
+    async def shutdown(self) -> None:
+        """Wait for abandoned native workers without cancelling their inference."""
+        while self._native_finalizers:
+            finalizers = tuple(self._native_finalizers)
+            await asyncio.gather(*finalizers, return_exceptions=True)
 
     async def _prepare_audio(
         self,
@@ -847,6 +973,7 @@ class WhisperAcquirer:
                 _validate_audio_path,
                 prepared_audio.path,
                 prepared_audio.request_directory,
+                self._max_media_bytes,
             )
             return audio_path, None
 
@@ -910,10 +1037,16 @@ class WhisperAcquirer:
                 deadline=deadline,
                 cancellation_event=cancellation_event,
             )
-            return _validate_audio_path(downloaded_path, request_directory)
+            return _validate_audio_path(
+                downloaded_path,
+                request_directory,
+                self._max_media_bytes,
+            )
         except _AudioDownloadProviderTimeout:
             raise
         except _AudioDownloadProviderFailure:
+            raise
+        except MediaByteLimitExceeded:
             raise
         except DownloadCancelled as exc:
             raise _AudioDownloadProviderFailure from exc

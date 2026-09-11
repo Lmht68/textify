@@ -10,6 +10,14 @@ from yt_dlp.utils import DownloadCancelled
 _MAX_YTDLP_ATTEMPTS: Final[int] = 10
 
 
+class MediaByteLimitExceeded(DownloadCancelled):  # type: ignore[misc]
+    """Stop yt-dlp when a media transfer exceeds the configured byte limit."""
+
+    def __init__(self) -> None:
+        """Initialize the stable safe policy-rejection message."""
+        super().__init__("Downloaded media exceeds the configured byte limit.")
+
+
 def raise_if_cancelled_or_expired(
     *,
     deadline: float,
@@ -35,22 +43,34 @@ def build_yt_dlp_progress_hook(
     *,
     deadline: float,
     cancellation_event: threading.Event,
+    max_media_bytes: int,
 ) -> Callable[[dict[str, object]], None]:
-    """Build a transfer hook that enforces one operation's deadline.
+    """Build a transfer hook that enforces cancellation, deadline, and byte limits.
 
     Args:
-        deadline: Monotonic absolute deadline for the complete operation.
-        cancellation_event: Signal set when request work must stop cooperatively.
+        deadline: Monotonic absolute deadline for the provider operation.
+        cancellation_event: Signal set when request work must stop.
+        max_media_bytes: Inclusive limit for the selected downloaded media.
 
     Returns:
-        Progress callback suitable for yt-dlp request options.
+        yt-dlp progress callback that interrupts oversized transfers.
     """
 
-    def _check_progress(_status: dict[str, object]) -> None:
+    def _check_progress(status: dict[str, object]) -> None:
         raise_if_cancelled_or_expired(
             deadline=deadline,
             cancellation_event=cancellation_event,
         )
+        if status.get("status") not in {"downloading", "finished"}:
+            return
+        for field_name in ("downloaded_bytes", "total_bytes"):
+            byte_count = status.get(field_name)
+            if (
+                isinstance(byte_count, int)
+                and not isinstance(byte_count, bool)
+                and byte_count > max_media_bytes
+            ):
+                raise MediaByteLimitExceeded
 
     return _check_progress
 

@@ -15,7 +15,7 @@ from httpx import ASGITransport, AsyncClient, Response
 from starlette.types import Message, Scope
 
 from textify.config import AppConfig, Environment
-from textify.main import create_app
+from textify.main import _validate_temporary_media_capacity, create_app
 from textify.transcription.acquisition import CaptionTrack
 from textify.transcription.config import TranscriptionConfig
 from textify.transcription.exceptions import (
@@ -47,6 +47,11 @@ from textify.transcription.types import (
 DIRECT_TIKTOK_URL = "https://www.tiktok.com/@creator/video/1234567890123456789"
 SHORT_TIKTOK_URL = "https://vm.tiktok.com/abcdefgh"
 YOUTUBE_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+
+def _sufficient_temporary_media_bytes(_root: Path) -> int:
+    """Return a capacity value independent of the test host filesystem."""
+    return 1 << 60
 
 
 def _controlled_tiktok_metadata() -> dict[str, object]:
@@ -209,10 +214,14 @@ class ControlledAdapterState:
 
     metadata_waits_for_cancellation: bool = False
     metadata_prepares_audio_after_cancellation: bool = False
+    metadata_prepares_audio: bool = False
     download_waits_for_cancellation: bool = False
     native_waits_for_release: bool = False
     metadata_delay_seconds: float = 0.0
     download_delay_seconds: float = 0.0
+    download_size_bytes: int = 5
+    native_failure: Exception | None = None
+    native_result_texts: list[str] = field(default_factory=list)
     metadata_calls: list[str] = field(default_factory=list)
     metadata_deadlines: list[float] = field(default_factory=list)
     download_calls: list[str] = field(default_factory=list)
@@ -225,6 +234,7 @@ class ControlledAdapterState:
     download_entered: threading.Event = field(default_factory=threading.Event)
     download_second_entered: threading.Event = field(default_factory=threading.Event)
     native_entered: threading.Event = field(default_factory=threading.Event)
+    native_completed: threading.Event = field(default_factory=threading.Event)
     native_release: threading.Event = field(default_factory=threading.Event)
 
 
@@ -252,6 +262,8 @@ class ControlledMetadataExtractor:
         self._state.metadata_deadlines.append(deadline)
         self._state.call_order.append("metadata")
         self._state.metadata_entered.set()
+        if self._state.metadata_prepares_audio:
+            return self._prepare_late_audio()
         if self._state.metadata_delay_seconds:
             threading.Event().wait(self._state.metadata_delay_seconds)
         if self._state.metadata_waits_for_cancellation:
@@ -300,7 +312,7 @@ class ControlledAudioDownloader:
         self._state.request_directories.append(destination)
         self._state.call_order.append("download")
         audio_path = destination / "audio.webm"
-        audio_path.write_bytes(b"media")
+        audio_path.write_bytes(b"x" * self._state.download_size_bytes)
         self._state.download_entered.set()
         if len(self._state.download_calls) == 2:
             self._state.download_second_entered.set()
@@ -322,13 +334,24 @@ class ControlledTranscriber:
     def transcribe(self, audio_path: Path) -> Transcript:
         """Return a transcript after any configured non-cancellable wait."""
         assert audio_path.is_file()
+        call_index = len(self._state.native_calls)
         self._state.native_calls.append(audio_path)
         self._state.call_order.append("native")
         self._state.native_entered.set()
-        if self._state.native_waits_for_release:
-            self._state.native_release.wait()
-        segment = Segment(0.0, 1.0, "One")
-        return Transcript(TranscriptMethod.FASTER_WHISPER, "en", (segment,), "One")
+        try:
+            if self._state.native_waits_for_release:
+                self._state.native_release.wait()
+            if self._state.native_failure is not None:
+                raise self._state.native_failure
+            text = (
+                self._state.native_result_texts[call_index]
+                if call_index < len(self._state.native_result_texts)
+                else "One"
+            )
+            segment = Segment(0.0, 1.0, text)
+            return Transcript(TranscriptMethod.FASTER_WHISPER, "en", (segment,), text)
+        finally:
+            self._state.native_completed.set()
 
 
 class ControlledAdaptersFactory:
@@ -425,6 +448,7 @@ def transcription_config(temporary_media_root: Path) -> TranscriptionConfig:
         condition_on_previous_text=True,
         transcription_concurrency=1,
         max_pending_transcriptions=2,
+        max_media_bytes=1024,
         metadata_timeout_seconds=30.0,
         audio_download_timeout_seconds=300.0,
         transcription_queue_timeout_seconds=300.0,
@@ -506,6 +530,122 @@ async def _start_disconnect_request(
     return app_task, sent_messages
 
 
+def test_temporary_media_capacity_accepts_exact_quota(tmp_path: Path) -> None:
+    """The configured quota accepts exactly the required free bytes."""
+    settings = transcription_config(tmp_path).model_copy(
+        update={
+            "transcription_concurrency": 2,
+            "max_pending_transcriptions": 3,
+            "max_media_bytes": 100,
+        }
+    )
+
+    _validate_temporary_media_capacity(
+        settings,
+        available_bytes=lambda _root: 600,
+    )
+
+
+def test_temporary_media_capacity_rejects_one_byte_short(tmp_path: Path) -> None:
+    """The configured quota rejects free space below the exact requirement."""
+    settings = transcription_config(tmp_path).model_copy(
+        update={
+            "transcription_concurrency": 2,
+            "max_pending_transcriptions": 3,
+            "max_media_bytes": 100,
+        }
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=("Temporary media root requires 600 available bytes; 599 are available."),
+    ):
+        _validate_temporary_media_capacity(
+            settings,
+            available_bytes=lambda _root: 599,
+        )
+
+
+def test_temporary_media_capacity_translates_disk_usage_failure(
+    tmp_path: Path,
+) -> None:
+    """An unavailable capacity reader exposes the stable startup failure."""
+    settings = transcription_config(tmp_path)
+
+    def unavailable_capacity_reader(_root: Path) -> int:
+        """Raise the filesystem failure that must stay internal."""
+        raise OSError("disk query failed")
+
+    with pytest.raises(
+        RuntimeError,
+        match="Unable to determine temporary media root capacity.",
+    ) as error:
+        _validate_temporary_media_capacity(
+            settings,
+            available_bytes=unavailable_capacity_reader,
+        )
+
+    assert isinstance(error.value.__cause__, OSError)
+
+
+@pytest.mark.asyncio
+async def test_api_starts_at_exact_temporary_media_capacity(tmp_path: Path) -> None:
+    """Startup succeeds when free space equals the configured media quota."""
+    settings = transcription_config(tmp_path).model_copy(
+        update={
+            "transcription_concurrency": 2,
+            "max_pending_transcriptions": 3,
+            "max_media_bytes": 100,
+        }
+    )
+    application = create_app(
+        app_config(),
+        settings,
+        CountingAdaptersFactory(),
+        available_temporary_media_bytes=lambda _root: 600,
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            health_response = await client.get("/health")
+
+    assert health_response.json() == {"status": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_api_fails_startup_before_model_when_temporary_media_capacity_is_low(
+    tmp_path: Path,
+) -> None:
+    """Low capacity aborts startup after root creation but before adapters load."""
+    media_root = tmp_path / "media"
+    settings = transcription_config(media_root).model_copy(
+        update={
+            "transcription_concurrency": 2,
+            "max_pending_transcriptions": 3,
+            "max_media_bytes": 100,
+        }
+    )
+    factory = CountingAdaptersFactory()
+    application = create_app(
+        app_config(),
+        settings,
+        factory,
+        available_temporary_media_bytes=lambda _root: 599,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=("Temporary media root requires 600 available bytes; 599 are available."),
+    ):
+        async with application.router.lifespan_context(application):
+            pass
+
+    assert media_root.is_dir()
+    assert factory.calls == 0
+    assert application.state.ready is False
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("submitted_url", (DIRECT_TIKTOK_URL, SHORT_TIKTOK_URL))
 async def test_api_transcribes_current_tiktok_forms_with_one_lifespan_model(
@@ -518,6 +658,7 @@ async def test_api_transcribes_current_tiktok_forms_with_one_lifespan_model(
         app_config(),
         transcription_config(tmp_path),
         factory,
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
     )
 
     async with application.router.lifespan_context(application):
@@ -554,6 +695,7 @@ async def test_api_returns_safe_request_validation_error(tmp_path: Path) -> None
         app_config(),
         transcription_config(tmp_path),
         CountingAdaptersFactory(),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
     )
 
     async with application.router.lifespan_context(application):
@@ -594,6 +736,7 @@ async def test_api_maps_all_baseline_domain_errors(tmp_path: Path) -> None:
         app_config(),
         transcription_config(tmp_path),
         CountingAdaptersFactory(),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
     )
 
     async with application.router.lifespan_context(application):
@@ -618,6 +761,7 @@ async def test_api_fails_startup_before_readiness_when_adapter_factory_fails(
         app_config(),
         transcription_config(tmp_path),
         StartupFailureFactory(),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
     )
 
     with pytest.raises(RuntimeError, match="native startup failed"):
@@ -625,6 +769,33 @@ async def test_api_fails_startup_before_readiness_when_adapter_factory_fails(
             pass
 
     assert application.state.ready is False
+
+
+@pytest.mark.asyncio
+async def test_api_rejects_oversized_completed_audio_before_native(
+    tmp_path: Path,
+) -> None:
+    """A completed audio file above the cap never reaches native inference."""
+    state = ControlledAdapterState(download_size_bytes=1025)
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path),
+        ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/transcripts",
+                json={"url": DIRECT_TIKTOK_URL},
+            )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "unsupported_media"
+    assert state.native_calls == []
+    assert all(not directory.exists() for directory in state.request_directories)
 
 
 @pytest.mark.asyncio
@@ -643,6 +814,7 @@ async def test_api_rejects_work_beyond_active_and_pending_capacity_before_downlo
             }
         ),
         ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
     )
 
     async with application.router.lifespan_context(application):
@@ -694,6 +866,7 @@ async def test_api_expires_the_inference_queue_and_cleans_waiting_media(
             }
         ),
         ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
     )
 
     async with application.router.lifespan_context(application):
@@ -740,6 +913,7 @@ async def test_api_expires_metadata_deadline_and_cleans_late_prepared_media(
             update={"metadata_timeout_seconds": 0.05}
         ),
         ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
     )
 
     async with application.router.lifespan_context(application):
@@ -773,6 +947,7 @@ async def test_api_expires_download_deadline_and_cleans_request_media(
             update={"audio_download_timeout_seconds": 0.05}
         ),
         ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
     )
 
     async with application.router.lifespan_context(application):
@@ -794,10 +969,129 @@ async def test_api_expires_download_deadline_and_cleans_request_media(
 
 
 @pytest.mark.asyncio
-async def test_api_reports_native_response_deadline_after_retained_worker_finishes(
+async def test_api_returns_native_timeout_before_abandoned_work_completes(
     tmp_path: Path,
 ) -> None:
-    """Retain native permit and media until a timed-out native worker returns."""
+    """A native timeout returns while retained work still owns permit and media."""
+    state = ControlledAdapterState(
+        native_waits_for_release=True,
+        native_result_texts=["abandoned", "fresh"],
+    )
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path).model_copy(
+            update={
+                "transcription_timeout_seconds": 0.05,
+                "transcription_concurrency": 1,
+                "max_pending_transcriptions": 1,
+                "transcription_queue_timeout_seconds": 1.0,
+            }
+        ),
+        ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            timed_response = await client.post(
+                "/api/transcripts",
+                json={"url": DIRECT_TIKTOK_URL},
+            )
+            assert timed_response.status_code == 504
+            assert timed_response.json()["error"]["code"] == "transcription_timeout"
+            assert not state.native_completed.is_set()
+            assert state.request_directories[0].exists()
+
+            queued_request = asyncio.create_task(
+                client.post("/api/transcripts", json={"url": DIRECT_TIKTOK_URL})
+            )
+            await _wait_for_thread_event(state.download_second_entered)
+            await _assert_request_pending(queued_request)
+
+            overload_response = await client.post(
+                "/api/transcripts",
+                json={"url": DIRECT_TIKTOK_URL},
+            )
+            assert overload_response.status_code == 503
+            assert len(state.metadata_calls) == 2
+            assert len(state.native_calls) == 1
+
+            state.native_release.set()
+            queued_response = await _await_request(queued_request)
+            await _wait_for_condition(
+                lambda: all(
+                    not directory.exists() for directory in state.request_directories
+                )
+            )
+            reusable_response = await client.post(
+                "/api/transcripts",
+                json={"url": DIRECT_TIKTOK_URL},
+            )
+
+    assert queued_response.status_code == 200
+    assert queued_response.json()["transcript"]["text"] == "fresh"
+    assert "abandoned" not in str(queued_response.json())
+    assert reusable_response.status_code == 200
+    assert all(not directory.exists() for directory in state.request_directories)
+
+
+@pytest.mark.asyncio
+async def test_api_consumes_abandoned_native_failure(tmp_path: Path) -> None:
+    """A failed abandoned worker is consumed without an event-loop task warning."""
+    state = ControlledAdapterState(
+        native_waits_for_release=True,
+        native_failure=Exception("native failure"),
+    )
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path).model_copy(
+            update={"transcription_timeout_seconds": 0.05}
+        ),
+        ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
+    )
+    loop = asyncio.get_running_loop()
+    previous_exception_handler = loop.get_exception_handler()
+    handler_contexts: list[dict[str, object]] = []
+    loop.set_exception_handler(lambda _loop, context: handler_contexts.append(context))
+    try:
+        async with application.router.lifespan_context(application):
+            transport = ASGITransport(app=application)
+            async with AsyncClient(
+                transport=transport,
+                base_url="http://test",
+            ) as client:
+                timeout_response = await client.post(
+                    "/api/transcripts",
+                    json={"url": DIRECT_TIKTOK_URL},
+                )
+                assert timeout_response.status_code == 504
+
+                state.native_release.set()
+                await _wait_for_thread_event(state.native_completed)
+                await _wait_for_condition(
+                    lambda: all(
+                        not directory.exists()
+                        for directory in state.request_directories
+                    )
+                )
+                state.native_failure = None
+                later_response = await client.post(
+                    "/api/transcripts",
+                    json={"url": DIRECT_TIKTOK_URL},
+                )
+    finally:
+        loop.set_exception_handler(previous_exception_handler)
+
+    assert later_response.status_code == 200
+    await asyncio.sleep(0)
+    assert handler_contexts == []
+
+
+@pytest.mark.asyncio
+async def test_api_shutdown_drains_abandoned_native_work(tmp_path: Path) -> None:
+    """Lifespan exit waits for retained native work and its media cleanup."""
     state = ControlledAdapterState(native_waits_for_release=True)
     application = create_app(
         app_config(),
@@ -805,29 +1099,40 @@ async def test_api_reports_native_response_deadline_after_retained_worker_finish
             update={"transcription_timeout_seconds": 0.05}
         ),
         ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
     )
-
-    async with application.router.lifespan_context(application):
+    lifespan = application.router.lifespan_context(application)
+    await lifespan.__aenter__()
+    shutdown_task: asyncio.Task[bool | None] | None = None
+    try:
         transport = ASGITransport(app=application)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
-            timed_request = asyncio.create_task(
-                client.post("/api/transcripts", json={"url": DIRECT_TIKTOK_URL})
-            )
-            await _wait_for_thread_event(state.native_entered)
-            await _assert_request_pending(timed_request)
-            assert state.request_directories[0].exists()
-
-            state.native_release.set()
-            timed_response = await _await_request(timed_request)
-            reusable_response = await client.post(
+            timeout_response = await client.post(
                 "/api/transcripts",
                 json={"url": DIRECT_TIKTOK_URL},
             )
+        assert timeout_response.status_code == 504
 
-    assert timed_response.status_code == 504
-    assert timed_response.json()["error"]["code"] == "transcription_timeout"
-    assert reusable_response.status_code == 200
-    assert len(state.native_calls) == 2
+        shutdown_task = asyncio.create_task(lifespan.__aexit__(None, None, None))
+        await asyncio.sleep(0)
+        assert not shutdown_task.done()
+        assert application.state.ready is False
+
+        state.native_release.set()
+        await asyncio.wait_for(asyncio.shield(shutdown_task), 1.0)
+        await _wait_for_condition(
+            lambda: all(
+                not directory.exists() for directory in state.request_directories
+            )
+        )
+    finally:
+        if shutdown_task is None:
+            state.native_release.set()
+            await lifespan.__aexit__(None, None, None)
+        elif not shutdown_task.done():
+            state.native_release.set()
+            await asyncio.wait_for(asyncio.shield(shutdown_task), 1.0)
+
     assert all(not directory.exists() for directory in state.request_directories)
 
 
@@ -847,6 +1152,7 @@ async def test_api_applies_each_stage_deadline_independently(tmp_path: Path) -> 
             }
         ),
         ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
     )
 
     async with application.router.lifespan_context(application):
@@ -863,6 +1169,68 @@ async def test_api_applies_each_stage_deadline_independently(tmp_path: Path) -> 
     assert elapsed > 0.06
     assert state.call_order == ["metadata", "download", "native"]
     assert all(not directory.exists() for directory in state.request_directories)
+
+
+@pytest.mark.asyncio
+async def test_api_disconnect_returns_before_native_work_completes(
+    tmp_path: Path,
+) -> None:
+    """A native disconnect returns while its prepared media remains retained."""
+    state = ControlledAdapterState(
+        metadata_prepares_audio=True,
+        native_waits_for_release=True,
+    )
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path).model_copy(
+            update={
+                "transcription_concurrency": 1,
+                "max_pending_transcriptions": 1,
+                "transcription_queue_timeout_seconds": 1.0,
+            }
+        ),
+        ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
+    )
+
+    async with application.router.lifespan_context(application):
+        disconnect_task, sent_messages = await _start_disconnect_request(
+            application,
+            state.native_entered,
+        )
+        await _wait_for_thread_event(state.native_entered)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(disconnect_task), 1.0)
+
+        assert sent_messages == []
+        assert state.prepared_directories[0].exists()
+
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            queued_request = asyncio.create_task(
+                client.post("/api/transcripts", json={"url": DIRECT_TIKTOK_URL})
+            )
+            await _wait_for_condition(lambda: len(state.prepared_directories) == 2)
+            await _assert_request_pending(queued_request)
+            assert len(state.native_calls) == 1
+
+            overload_response = await client.post(
+                "/api/transcripts",
+                json={"url": DIRECT_TIKTOK_URL},
+            )
+            assert overload_response.status_code == 503
+            assert len(state.metadata_calls) == 2
+
+            state.native_release.set()
+            queued_response = await _await_request(queued_request)
+            await _wait_for_condition(
+                lambda: all(
+                    not directory.exists() for directory in state.prepared_directories
+                )
+            )
+
+    assert queued_response.status_code == 200
+    assert all(not directory.exists() for directory in state.prepared_directories)
 
 
 @pytest.mark.asyncio
@@ -894,6 +1262,7 @@ async def test_api_disconnect_cancels_interruptible_pre_native_work(
         app_config(),
         config,
         ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
     )
 
     async with application.router.lifespan_context(application):

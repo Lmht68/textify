@@ -13,6 +13,7 @@ from textify.transcription.exceptions import (
     MetadataRetrievalFailedError,
     MetadataTimeoutError,
     TranscriptionFailedError,
+    UnsupportedMediaError,
     UnsupportedPlatformError,
     VideoTooLongError,
 )
@@ -91,15 +92,21 @@ class RecordingMetadataExtractor:
 class RecordingAudioDownloader:
     """Create request-owned audio or raise one download failure."""
 
-    def __init__(self, failure: Exception | None = None) -> None:
+    def __init__(
+        self,
+        failure: Exception | None = None,
+        size_bytes: int = 0,
+    ) -> None:
         """Initialize deterministic audio download behavior.
 
         Args:
             failure: Optional provider failure to raise.
+            size_bytes: Exact byte count for every completed test audio file.
         """
         self.calls: list[str] = []
         self.request_directories: list[Path] = []
         self._failure = failure
+        self._size_bytes = size_bytes
 
     def download(
         self,
@@ -129,7 +136,7 @@ class RecordingAudioDownloader:
         if self._failure is not None:
             raise self._failure
         audio_path = destination / "audio.webm"
-        audio_path.touch()
+        audio_path.write_bytes(b"x" * self._size_bytes)
         return audio_path
 
 
@@ -218,6 +225,7 @@ def build_service(
         condition_on_previous_text=True,
         transcription_concurrency=1,
         max_pending_transcriptions=2,
+        max_media_bytes=1024,
         metadata_timeout_seconds=30.0,
         audio_download_timeout_seconds=300.0,
         transcription_queue_timeout_seconds=300.0,
@@ -249,6 +257,63 @@ async def test_transcribe_allows_the_inclusive_duration_and_cleans_media(
     assert result.transcript.text == "Transcript"
     assert downloader.calls == [DIRECT_TIKTOK_URL]
     assert all(not directory.exists() for directory in downloader.request_directories)
+
+
+@pytest.mark.asyncio
+async def test_transcribe_accepts_completed_audio_at_byte_limit(
+    tmp_path: Path,
+) -> None:
+    """An audio file exactly at the configured limit reaches native inference."""
+    extractor = RecordingMetadataExtractor(tiktok_metadata())
+    downloader = RecordingAudioDownloader(size_bytes=1024)
+    transcriber = FixedTranscriber()
+    service = build_service(tmp_path, extractor, downloader, transcriber)
+
+    result = await service.transcribe(DIRECT_TIKTOK_URL)
+
+    assert result.transcript.text == "Transcript"
+    assert len(transcriber.calls) == 1
+    assert all(not directory.exists() for directory in downloader.request_directories)
+
+
+@pytest.mark.asyncio
+async def test_transcribe_rejects_oversized_injected_metadata(tmp_path: Path) -> None:
+    """Metadata adapters cannot bypass the configured selected-media byte limit."""
+    metadata = dict(tiktok_metadata())
+    metadata["filesize"] = 1025
+    extractor = RecordingMetadataExtractor(metadata)
+    downloader = RecordingAudioDownloader()
+    transcriber = FixedTranscriber()
+    service = build_service(tmp_path, extractor, downloader, transcriber)
+
+    with pytest.raises(UnsupportedMediaError):
+        await service.transcribe(DIRECT_TIKTOK_URL)
+
+    assert downloader.calls == []
+    assert transcriber.calls == []
+
+
+@pytest.mark.asyncio
+async def test_transcribe_rejects_oversized_prepared_audio(tmp_path: Path) -> None:
+    """Prepared inspection audio cannot bypass the exact completed-file limit."""
+    prepared_directory = tmp_path / "inspection"
+    prepared_directory.mkdir()
+    prepared_path = prepared_directory / "audio.webm"
+    prepared_path.write_bytes(b"x" * 1025)
+    extractor = RecordingMetadataExtractor(
+        tiktok_metadata(),
+        PreparedAudio(prepared_path, prepared_directory),
+    )
+    downloader = RecordingAudioDownloader()
+    transcriber = FixedTranscriber()
+    service = build_service(tmp_path, extractor, downloader, transcriber)
+
+    with pytest.raises(UnsupportedMediaError):
+        await service.transcribe(DIRECT_TIKTOK_URL)
+
+    assert downloader.calls == []
+    assert transcriber.calls == []
+    assert not prepared_directory.exists()
 
 
 @pytest.mark.asyncio

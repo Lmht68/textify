@@ -2,19 +2,24 @@
 
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import ClassVar, Self
 
 import pytest
 from pytest import MonkeyPatch
 from yt_dlp.utils import DownloadCancelled
 
 from textify.transcription import acquisition
-from textify.transcription.acquisition import FasterWhisperTranscriber
+from textify.transcription.acquisition import (
+    FasterWhisperTranscriber,
+    YtDlpAudioDownloader,
+)
 from textify.transcription.config import TranscriptionConfig
 from textify.transcription.types import TranscriptMethod
 from textify.transcription.util import (
+    MediaByteLimitExceeded,
     build_yt_dlp_progress_hook,
     extract_info_with_retries,
 )
@@ -87,6 +92,54 @@ class FakeWhisperModel:
         return iter(self._segments), FakeWhisperInfo(self._language)
 
 
+class FakeYoutubeDL:
+    """Supply configurable yt-dlp results while recording constructor options."""
+
+    captured_options: ClassVar[list[dict[str, object]]] = []
+    prepared_path: ClassVar[Path] = Path()
+    progress_status: ClassVar[dict[str, object] | None] = None
+    raw_metadata: ClassVar[Mapping[str, object]] = {}
+
+    def __init__(self, options: dict[str, object]) -> None:
+        """Capture one yt-dlp constructor option mapping."""
+        self._options = options
+        self.captured_options.append(options)
+
+    def __enter__(self) -> Self:
+        """Return the configured fake context."""
+        return self
+
+    def __exit__(
+        self,
+        exception_type: object,
+        exception: object,
+        traceback: object,
+    ) -> None:
+        """Accept every context-manager exit."""
+        del exception_type, exception, traceback
+
+    def extract_info(
+        self,
+        source_url: str,
+        *,
+        download: bool,
+    ) -> Mapping[str, object]:
+        """Return configured metadata after optional transfer progress."""
+        del source_url
+        if download and self.progress_status is not None:
+            progress_hooks = self._options["progress_hooks"]
+            assert isinstance(progress_hooks, list)
+            for progress_hook in progress_hooks:
+                assert callable(progress_hook)
+                progress_hook(self.progress_status)
+        return self.raw_metadata
+
+    def prepare_filename(self, metadata: Mapping[str, object]) -> Path:
+        """Return the configured completed-media path."""
+        del metadata
+        return self.prepared_path
+
+
 def isolated_transcription_config() -> TranscriptionConfig:
     """Return a test configuration independent of local environment files."""
     return TranscriptionConfig(
@@ -103,6 +156,7 @@ def isolated_transcription_config() -> TranscriptionConfig:
         condition_on_previous_text=True,
         transcription_concurrency=1,
         max_pending_transcriptions=2,
+        max_media_bytes=1024,
         metadata_timeout_seconds=30.0,
         audio_download_timeout_seconds=300.0,
         transcription_queue_timeout_seconds=300.0,
@@ -282,10 +336,11 @@ def test_yt_dlp_cancellation_between_retries_prevents_the_next_attempt() -> None
 
 
 def test_yt_dlp_progress_hook_enforces_deadline_and_cancellation() -> None:
-    """Transfer callbacks reject expired and explicitly cancelled operations."""
+    """Transfer callbacks retain deadline, cancellation, and inclusive byte limits."""
     expired_hook = build_yt_dlp_progress_hook(
         deadline=time.monotonic() - 1.0,
         cancellation_event=threading.Event(),
+        max_media_bytes=100,
     )
     with pytest.raises(TimeoutError, match="deadline expired"):
         expired_hook({"status": "downloading"})
@@ -294,7 +349,52 @@ def test_yt_dlp_progress_hook_enforces_deadline_and_cancellation() -> None:
     cancelled_hook = build_yt_dlp_progress_hook(
         deadline=time.monotonic() + 1.0,
         cancellation_event=cancellation_event,
+        max_media_bytes=100,
     )
     cancellation_event.set()
     with pytest.raises(DownloadCancelled, match="operation cancelled"):
         cancelled_hook({"status": "downloading"})
+
+    limited_hook = build_yt_dlp_progress_hook(
+        deadline=time.monotonic() + 1.0,
+        cancellation_event=threading.Event(),
+        max_media_bytes=100,
+    )
+    limited_hook({"status": "downloading", "downloaded_bytes": 100})
+    limited_hook({"status": "finished", "total_bytes": 100})
+    with pytest.raises(MediaByteLimitExceeded):
+        limited_hook({"status": "downloading", "downloaded_bytes": 101})
+    with pytest.raises(MediaByteLimitExceeded):
+        limited_hook({"status": "finished", "total_bytes": 101})
+
+
+def test_audio_downloader_enforces_progress_byte_limit(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Native audio download exposes streamed over-limit media to the policy layer."""
+    destination = tmp_path / "media"
+    destination.mkdir()
+    FakeYoutubeDL.captured_options.clear()
+    FakeYoutubeDL.raw_metadata = {}
+    FakeYoutubeDL.prepared_path = destination / "audio.webm"
+    FakeYoutubeDL.progress_status = {
+        "status": "downloading",
+        "downloaded_bytes": 101,
+    }
+    monkeypatch.setattr(
+        "textify.transcription.acquisition.yt_dlp.YoutubeDL",
+        FakeYoutubeDL,
+    )
+
+    downloader = YtDlpAudioDownloader(max_media_bytes=100)
+
+    with pytest.raises(MediaByteLimitExceeded):
+        downloader.download(
+            "https://www.tiktok.com/@creator/video/1234567890123456789",
+            destination,
+            deadline=time.monotonic() + 1.0,
+            cancellation_event=threading.Event(),
+        )
+
+    assert len(FakeYoutubeDL.captured_options) == 1
