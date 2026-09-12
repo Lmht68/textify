@@ -123,9 +123,9 @@ class Transcript:
         """Validate transcript composition and canonical language."""
         if not isinstance(self.method, TranscriptMethod):
             raise TypeError("method must be a TranscriptMethod.")
-        if not isinstance(self.language, str) or self.language != _canonical_language(
-            self.language
-        ):
+        if not isinstance(
+            self.language, str
+        ) or self.language != normalize_language_tag(self.language):
             raise ValueError("language must be a canonical BCP 47 tag.")
         if not isinstance(self.segments, tuple) or not all(
             isinstance(segment, Segment) for segment in self.segments
@@ -208,14 +208,21 @@ def normalize_transcript(
     segments = tuple(normalized_segments)
     return Transcript(
         method,
-        _canonical_language(language),
+        normalize_language_tag(language),
         segments,
         " ".join(segment.text for segment in segments),
     )
 
 
-def _canonical_language(language: object) -> str:
-    """Return a canonical BCP 47 language tag or ``und``."""
+def normalize_language_tag(language: object) -> str:
+    """Return a canonical BCP 47 language tag or ``und``.
+
+    Args:
+        language: Provider-reported language tag.
+
+    Returns:
+        A canonical BCP 47 language tag, or ``und`` when the value is invalid.
+    """
     if not isinstance(language, str) or not language.strip():
         return "und"
     try:

@@ -15,6 +15,7 @@ from xml.etree import ElementTree
 import ctranslate2
 import yt_dlp
 from faster_whisper import WhisperModel
+from langcodes import Language
 from requests.exceptions import RequestException, Timeout
 from youtube_transcript_api import (
     CouldNotRetrieveTranscript,
@@ -41,6 +42,7 @@ from textify.transcription.types import (
     RawSegment,
     Transcript,
     TranscriptMethod,
+    normalize_language_tag,
     normalize_transcript,
 )
 from textify.transcription.util import (
@@ -52,7 +54,7 @@ from textify.transcription.util import (
 logger = logging.getLogger(__name__)
 
 _YTDLP_OPTIONS: Final[dict[str, object]] = {
-    "allowed_extractors": [r"^(?:tiktok|vm\.tiktok)$"],
+    "allowed_extractors": [r"^(?:tiktok|vm\.tiktok|youtube)$"],
     "format": "bestaudio/best",
     "ignoreconfig": True,
     "no_warnings": True,
@@ -67,7 +69,7 @@ class _CaptionProviderFailure(Exception):
     """Represent an ordinary failure at the caption provider boundary."""
 
 
-class _CaptionProviderTimeout(Exception):
+class _CaptionProviderTimeout(_CaptionProviderFailure):
     """Represent a timeout at the caption provider boundary."""
 
 
@@ -687,43 +689,68 @@ def _validate_audio_path(
 
 def _rank_caption_tracks(
     tracks: Sequence[CaptionTrack],
+    declared_language: str,
 ) -> tuple[CaptionTrack, ...]:
-    """Return caption tracks in stable English-first preference order."""
-    buckets: list[list[CaptionTrack]] = [[], [], [], [], [], []]
+    """Return original caption tracks in stable declaration-matching order."""
+    declared_primary_language = Language.get(declared_language).language
+    if declared_primary_language is None:
+        return ()
+
+    buckets: list[list[CaptionTrack]] = [[], [], [], []]
     for track in tracks:
-        language_code = track.language_code.casefold()
-        is_english = language_code == "en" or language_code.startswith("en-")
-        if is_english:
-            if track.is_generated:
-                bucket = 2 if language_code == "en" else 3
-            else:
-                bucket = 0 if language_code == "en" else 1
+        track_language = normalize_language_tag(track.language_code)
+        if track_language == "und":
+            continue
+        if track_language == declared_language:
+            bucket = 1 if track.is_generated else 0
+        elif track_language == declared_primary_language:
+            bucket = 3 if track.is_generated else 2
         else:
-            bucket = 5 if track.is_generated else 4
+            continue
         buckets[bucket].append(track)
     return tuple(track for bucket in buckets for track in bucket)
+
+
+def _canonical_caption_declaration(declared_language: str | None) -> str | None:
+    """Return a canonical declaration with a usable primary language."""
+    if declared_language is None:
+        return None
+    normalized_language = normalize_language_tag(declared_language)
+    if normalized_language == "und":
+        return None
+    primary_language = Language.get(normalized_language).language
+    if primary_language is None or primary_language.casefold().startswith("x-"):
+        return None
+    return normalized_language
 
 
 def acquire_transcript(
     provider: CaptionProvider,
     video_id: str,
+    declared_language: str | None,
 ) -> Transcript | None:
-    """Acquire the first usable dormant YouTube caption Transcript.
+    """Acquire the first usable original YouTube caption Transcript.
 
     Args:
         provider: Caption provider boundary.
         video_id: Stable YouTube video identity.
+        declared_language: Source's canonical provider-declared language.
 
     Returns:
-        First usable normalized caption Transcript, if any.
+        The first usable normalized caption Transcript, or None when the
+        declaration is absent or ambiguous or no original track is usable.
 
     Raises:
-        _CaptionProviderFailure: If listing fails.
-        _CaptionProviderTimeout: If listing times out.
+        _CaptionProviderFailure: If track listing or a candidate fetch fails.
+        _CaptionProviderTimeout: If track listing or a candidate fetch times out.
     """
+    normalized_declaration = _canonical_caption_declaration(declared_language)
+    if normalized_declaration is None:
+        return None
+
     try:
         tracks = provider.list_tracks(video_id)
-        ranked_tracks = _rank_caption_tracks(tracks)
+        ranked_tracks = _rank_caption_tracks(tracks, normalized_declaration)
     except _CaptionProviderTimeout:
         raise
     except _CaptionProviderFailure:
@@ -744,17 +771,19 @@ def acquire_transcript(
             )
         except _CaptionProviderTimeout:
             raise
+        except _CaptionProviderFailure:
+            logger.debug(
+                "caption track unavailable",
+                extra={
+                    "stage": "transcription",
+                    "reason": "track_fetch_failed",
+                },
+            )
+            continue
         except (Timeout, TimeoutError) as exc:
             _log_acquisition_error("caption provider timeout", "track_fetch_timeout")
             raise _CaptionProviderTimeout from exc
-        except (
-            AttributeError,
-            IndexError,
-            KeyError,
-            RuntimeError,
-            TypeError,
-            ValueError,
-        ):
+        except _CAPTION_EXTERNAL_FAILURES:
             logger.debug(
                 "caption track unavailable",
                 extra={

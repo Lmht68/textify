@@ -17,6 +17,7 @@ from urllib.parse import SplitResult, parse_qsl, urlencode, urlsplit, urlunsplit
 
 import av
 import yt_dlp
+from langcodes import Language
 from requests.exceptions import Timeout
 from yt_dlp.utils import DownloadCancelled, DownloadError
 
@@ -27,7 +28,7 @@ from textify.transcription.exceptions import (
     UnsupportedMediaError,
     UnsupportedPlatformError,
 )
-from textify.transcription.types import Platform
+from textify.transcription.types import Platform, normalize_language_tag
 from textify.transcription.util import (
     MediaByteLimitExceeded,
     build_yt_dlp_progress_hook,
@@ -50,6 +51,7 @@ _YOUTUBE_HOSTS: Final[frozenset[str]] = frozenset(
         "m.youtube.com",
         "music.youtube.com",
         "youtu.be",
+        "www.youtube-nocookie.com",
     }
 )
 _INSTAGRAM_HOSTS: Final[frozenset[str]] = frozenset(
@@ -152,7 +154,7 @@ _COLLECTION_TYPES: Final[frozenset[str]] = frozenset(
     {"playlist", "multi_video", "url", "url_transparent"}
 )
 _METADATA_YTDLP_OPTIONS: Final[dict[str, object]] = {
-    "allowed_extractors": [r"^(?:tiktok|vm\.tiktok)$"],
+    "allowed_extractors": [r"^(?:tiktok|vm\.tiktok|youtube)$"],
     "ignoreconfig": True,
     "no_warnings": True,
     "noplaylist": True,
@@ -523,6 +525,7 @@ class NormalizedMetadata:
     description: str
     channel: str
     duration_seconds: int
+    declared_language: str | None
 
 
 def classify_submitted_url(submitted_url: str) -> SubmittedSource:
@@ -631,6 +634,7 @@ def normalize_processed_metadata(
         else ""
     )
     duration_seconds = _normalize_duration(metadata)
+    declared_language = _declared_language(metadata)
 
     return NormalizedMetadata(
         video_id=video_id,
@@ -639,7 +643,19 @@ def normalize_processed_metadata(
         description=description,
         channel=channel,
         duration_seconds=duration_seconds,
+        declared_language=declared_language,
     )
+
+
+def _declared_language(metadata: Mapping[str, object]) -> str | None:
+    """Return a provider declaration safe for original-caption selection."""
+    normalized_language = normalize_language_tag(metadata.get("language"))
+    if normalized_language == "und":
+        return None
+    primary_language = Language.get(normalized_language).language
+    if primary_language is None or primary_language.casefold().startswith("x-"):
+        return None
+    return normalized_language
 
 
 _EXPECTED_EXTRACTOR_KEYS: Final[dict[Platform, frozenset[str]]] = {
@@ -667,7 +683,8 @@ def _parse_url(
     except ValueError as exc:
         raise _invalid_source_error("malformed_url") from exc
 
-    if parsed_url.scheme.casefold() != "https" or hostname is None:
+    scheme = parsed_url.scheme.casefold()
+    if scheme not in {"http", "https"} or hostname is None:
         raise _invalid_source_error("non_https_or_missing_host")
     if username is not None or password is not None:
         raise _invalid_source_error("url_credentials")
@@ -682,6 +699,8 @@ def _parse_url(
         raise _invalid_source_error("malformed_query") from exc
 
     host = hostname.casefold()
+    if scheme == "http" and host not in {"youtube.com", "youtu.be"}:
+        raise _invalid_source_error("non_https_or_missing_host")
     if "%" in parsed_url.path:
         raise _invalid_source_error("encoded_path")
     return parsed_url, host, query_pairs

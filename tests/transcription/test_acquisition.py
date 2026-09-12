@@ -2,7 +2,7 @@
 
 import threading
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar, Self
@@ -14,10 +14,12 @@ from yt_dlp.utils import DownloadCancelled
 from textify.transcription import acquisition
 from textify.transcription.acquisition import (
     FasterWhisperTranscriber,
+    YouTubeCaptionProvider,
     YtDlpAudioDownloader,
+    acquire_transcript,
 )
 from textify.transcription.config import TranscriptionConfig
-from textify.transcription.types import TranscriptMethod
+from textify.transcription.types import RawSegment, TranscriptMethod
 from textify.transcription.util import (
     MediaByteLimitExceeded,
     build_yt_dlp_progress_hook,
@@ -92,6 +94,177 @@ class FakeWhisperModel:
         return iter(self._segments), FakeWhisperInfo(self._language)
 
 
+class FakeCaptionTrack:
+    """Supply one observable original caption track."""
+
+    def __init__(
+        self,
+        name: str,
+        language_code: str,
+        is_generated: bool,
+        segments: tuple[RawSegment, ...],
+        failure: Exception | None = None,
+    ) -> None:
+        """Initialize one deterministic caption track.
+
+        Args:
+            name: Test-visible candidate identity.
+            language_code: Provider-reported original language tag.
+            is_generated: Whether the provider generated the track.
+            segments: Timed segments to return when fetched.
+            failure: Optional provider failure to raise when fetched.
+        """
+        self.name = name
+        self._language_code = language_code
+        self._is_generated = is_generated
+        self._segments = segments
+        self._failure = failure
+        self.fetch_calls = 0
+
+    @property
+    def language_code(self) -> str:
+        """Return the configured provider language tag."""
+        return self._language_code
+
+    @property
+    def is_generated(self) -> bool:
+        """Return the configured generated-track flag."""
+        return self._is_generated
+
+    def fetch_segments(self) -> Sequence[RawSegment]:
+        """Record and return configured caption segments.
+
+        Returns:
+            Timed raw caption segments.
+
+        Raises:
+            Exception: The configured provider failure.
+        """
+        self.fetch_calls += 1
+        if self._failure is not None:
+            raise self._failure
+        return self._segments
+
+
+class FakeCaptionProvider:
+    """List configured caption tracks while recording requests."""
+
+    def __init__(
+        self,
+        tracks: tuple[FakeCaptionTrack, ...] = (),
+        failure: Exception | None = None,
+    ) -> None:
+        """Initialize deterministic caption listing behavior.
+
+        Args:
+            tracks: Caption tracks returned in provider order.
+            failure: Optional provider failure to raise during listing.
+        """
+        self._tracks = tracks
+        self._failure = failure
+        self.list_calls: list[str] = []
+
+    def list_tracks(self, video_id: str) -> Sequence[FakeCaptionTrack]:
+        """Record a video lookup and return configured tracks.
+
+        Args:
+            video_id: Stable external video identity.
+
+        Returns:
+            Configured caption tracks.
+
+        Raises:
+            Exception: The configured provider failure.
+        """
+        self.list_calls.append(video_id)
+        if self._failure is not None:
+            raise self._failure
+        return self._tracks
+
+
+@dataclass(frozen=True)
+class FakeCaptionSnippet:
+    """Represent one external caption snippet."""
+
+    start: object
+    duration: object
+    text: object
+
+
+class FakeLibraryCaptionTrack:
+    """Expose a library-shaped caption track and observe forbidden translation."""
+
+    def __init__(
+        self,
+        language_code: str,
+        is_generated: bool,
+        snippets: tuple[FakeCaptionSnippet, ...],
+    ) -> None:
+        """Initialize library-shaped timed captions.
+
+        Args:
+            language_code: Provider-reported track language tag.
+            is_generated: Whether the provider generated the track.
+            snippets: Provider caption snippets.
+        """
+        self.language_code = language_code
+        self.is_generated = is_generated
+        self._snippets = snippets
+        self.fetch_arguments: list[bool] = []
+        self.translate_calls = 0
+
+    def fetch(
+        self, preserve_formatting: bool = False
+    ) -> tuple[FakeCaptionSnippet, ...]:
+        """Record formatting and return configured snippets.
+
+        Args:
+            preserve_formatting: Whether source formatting should be retained.
+
+        Returns:
+            Configured timed snippets.
+        """
+        self.fetch_arguments.append(preserve_formatting)
+        return self._snippets
+
+    def translate(self, language_code: str) -> "FakeLibraryCaptionTrack":
+        """Record a forbidden translation request.
+
+        Args:
+            language_code: Requested translated language.
+
+        Returns:
+            This track.
+        """
+        del language_code
+        self.translate_calls += 1
+        return self
+
+
+class FakeYouTubeTranscriptApi:
+    """Supply library-shaped tracks while recording each list client."""
+
+    tracks: ClassVar[tuple[FakeLibraryCaptionTrack, ...]] = ()
+    list_calls: ClassVar[list[str]] = []
+    client_count: ClassVar[int] = 0
+
+    def __init__(self) -> None:
+        """Record one synchronous caption-library client."""
+        type(self).client_count += 1
+
+    def list(self, video_id: str) -> tuple[FakeLibraryCaptionTrack, ...]:
+        """Record and return configured library tracks.
+
+        Args:
+            video_id: Stable external video identity.
+
+        Returns:
+            Configured library tracks.
+        """
+        type(self).list_calls.append(video_id)
+        return type(self).tracks
+
+
 class FakeYoutubeDL:
     """Supply configurable yt-dlp results while recording constructor options."""
 
@@ -164,6 +337,189 @@ def isolated_transcription_config() -> TranscriptionConfig:
         initial_prompt="test prompt",
         hf_token=None,
     )
+
+
+@pytest.mark.parametrize(
+    ("unusable_track_names", "expected_track_name", "expected_fetches"),
+    (
+        (frozenset(), "exact_manual", ("exact_manual",)),
+        (
+            frozenset({"exact_manual"}),
+            "exact_generated",
+            ("exact_manual", "exact_generated"),
+        ),
+        (
+            frozenset({"exact_manual", "exact_generated"}),
+            "base_manual",
+            ("exact_manual", "exact_generated", "base_manual"),
+        ),
+        (
+            frozenset({"exact_manual", "exact_generated", "base_manual"}),
+            "base_generated",
+            ("exact_manual", "exact_generated", "base_manual", "base_generated"),
+        ),
+    ),
+)
+def test_acquire_transcript_prefers_original_declared_language_tracks(
+    unusable_track_names: frozenset[str],
+    expected_track_name: str,
+    expected_fetches: tuple[str, ...],
+) -> None:
+    """Caption acquisition ranks exact then base original-language tracks."""
+    track_specs = (
+        ("exact_manual", "EN_us", False),
+        ("exact_generated", "en-US", True),
+        ("base_manual", "en", False),
+        ("base_generated", "en", True),
+        ("regional_sibling", "en-GB", False),
+        ("unrelated", "fr", False),
+        ("invalid", "not a language", False),
+    )
+    tracks = tuple(
+        FakeCaptionTrack(
+            name,
+            language_code,
+            is_generated,
+            () if name in unusable_track_names else ((0.0, 1.0, name),),
+        )
+        for name, language_code, is_generated in track_specs
+    )
+    provider = FakeCaptionProvider(tracks)
+
+    transcript = acquire_transcript(provider, "dQw4w9WgXcQ", "en-US")
+
+    assert transcript is not None
+    assert transcript.text == expected_track_name
+    assert provider.list_calls == ["dQw4w9WgXcQ"]
+    assert (
+        tuple(track.name for track in tracks if track.fetch_calls) == expected_fetches
+    )
+
+
+def test_acquire_transcript_preserves_provider_order_for_equal_rank_tracks() -> None:
+    """Equal-rank tracks retain listing order until one is usable."""
+    first_track = FakeCaptionTrack("first", "en-US", True, ())
+    second_track = FakeCaptionTrack("second", "en-US", True, ((0.0, 1.0, "two"),))
+    provider = FakeCaptionProvider((first_track, second_track))
+
+    transcript = acquire_transcript(provider, "dQw4w9WgXcQ", "en-US")
+
+    assert transcript is not None
+    assert transcript.text == "two"
+    assert (first_track.fetch_calls, second_track.fetch_calls) == (1, 1)
+
+
+@pytest.mark.parametrize(
+    "declared_language",
+    (None, "und", "not a language tag", "x-private"),
+)
+def test_acquire_transcript_skips_ambiguous_caption_declarations(
+    declared_language: str | None,
+) -> None:
+    """Missing or ambiguous declarations bypass caption-provider listing."""
+    provider = FakeCaptionProvider()
+
+    transcript = acquire_transcript(
+        provider,
+        "dQw4w9WgXcQ",
+        declared_language,
+    )
+
+    assert transcript is None
+    assert provider.list_calls == []
+
+
+@pytest.mark.parametrize(
+    "failure_type",
+    (acquisition._CaptionProviderFailure, acquisition._CaptionProviderTimeout),
+)
+def test_acquire_transcript_preserves_listing_provider_failures(
+    failure_type: type[Exception],
+) -> None:
+    """Caption listing failures retain their private boundary types."""
+    provider = FakeCaptionProvider(failure=failure_type())
+
+    with pytest.raises(failure_type):
+        acquire_transcript(provider, "dQw4w9WgXcQ", "en-US")
+
+
+def test_acquire_transcript_tries_next_track_after_ordinary_fetch_failure() -> None:
+    """An ordinary original-track failure falls through to the next candidate."""
+    failed_track = FakeCaptionTrack(
+        "failed",
+        "en-US",
+        False,
+        (),
+        acquisition._CaptionProviderFailure(),
+    )
+    usable_track = FakeCaptionTrack("usable", "en-US", True, ((0.0, 1.0, "text"),))
+    provider = FakeCaptionProvider((failed_track, usable_track))
+
+    transcript = acquire_transcript(provider, "dQw4w9WgXcQ", "en-US")
+
+    assert transcript is not None
+    assert transcript.text == "text"
+    assert (failed_track.fetch_calls, usable_track.fetch_calls) == (1, 1)
+
+
+def test_acquire_transcript_stops_after_caption_fetch_timeout() -> None:
+    """A candidate timeout abandons optional caption traversal immediately."""
+    timed_out_track = FakeCaptionTrack(
+        "timed_out",
+        "en-US",
+        False,
+        (),
+        TimeoutError(),
+    )
+    later_track = FakeCaptionTrack("later", "en-US", True, ((0.0, 1.0, "text"),))
+    provider = FakeCaptionProvider((timed_out_track, later_track))
+
+    with pytest.raises(acquisition._CaptionProviderTimeout):
+        acquire_transcript(provider, "dQw4w9WgXcQ", "en-US")
+
+    assert (timed_out_track.fetch_calls, later_track.fetch_calls) == (1, 0)
+
+
+def test_youtube_caption_adapter_fetches_original_timed_snippets(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The library adapter normalizes only original unformatted caption snippets."""
+    track = FakeLibraryCaptionTrack(
+        "EN_us",
+        False,
+        (
+            FakeCaptionSnippet(2.0, 1.0, " second "),
+            FakeCaptionSnippet(0.0, 1.0, " first "),
+            FakeCaptionSnippet(2.0, 0.0, " overlap "),
+            FakeCaptionSnippet(3.0, 1.0, "\t"),
+        ),
+    )
+    FakeYouTubeTranscriptApi.tracks = (track,)
+    FakeYouTubeTranscriptApi.list_calls.clear()
+    FakeYouTubeTranscriptApi.client_count = 0
+    monkeypatch.setattr(acquisition, "YouTubeTranscriptApi", FakeYouTubeTranscriptApi)
+
+    transcript = acquire_transcript(
+        YouTubeCaptionProvider(),
+        "dQw4w9WgXcQ",
+        "en-US",
+    )
+
+    assert transcript is not None
+    assert transcript.method is TranscriptMethod.YOUTUBE_CAPTIONS
+    assert transcript.language == "en-US"
+    assert transcript.text == "first second overlap"
+    assert [
+        (segment.start, segment.end, segment.text) for segment in transcript.segments
+    ] == [
+        (0.0, 1.0, "first"),
+        (2.0, 3.0, "second"),
+        (2.0, 2.0, "overlap"),
+    ]
+    assert FakeYouTubeTranscriptApi.client_count == 1
+    assert FakeYouTubeTranscriptApi.list_calls == ["dQw4w9WgXcQ"]
+    assert track.fetch_arguments == [False]
+    assert track.translate_calls == 0
 
 
 def test_load_whisper_transcriber_uses_model_environment_settings(
@@ -398,3 +754,6 @@ def test_audio_downloader_enforces_progress_byte_limit(
         )
 
     assert len(FakeYoutubeDL.captured_options) == 1
+    assert FakeYoutubeDL.captured_options[0]["allowed_extractors"] == [
+        r"^(?:tiktok|vm\.tiktok|youtube)$"
+    ]

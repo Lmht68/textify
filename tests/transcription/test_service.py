@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from textify.transcription import acquisition
 from textify.transcription.acquisition import CaptionTrack
 from textify.transcription.config import TranscriptionConfig
 from textify.transcription.exceptions import (
@@ -19,14 +20,20 @@ from textify.transcription.exceptions import (
 )
 from textify.transcription.inspection import ExtractedMetadata, PreparedAudio
 from textify.transcription.service import TranscriptionAdapters, TranscriptService
-from textify.transcription.types import Segment, Transcript, TranscriptMethod
+from textify.transcription.types import (
+    RawSegment,
+    Segment,
+    Transcript,
+    TranscriptMethod,
+)
 
 DIRECT_TIKTOK_URL = "https://www.tiktok.com/@creator/video/1234567890123456789"
 YOUTUBE_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+INSTAGRAM_URL = "https://www.instagram.com/reel/Cu0KqDGpE6h"
 
 
 class EmptyCaptionProvider:
-    """Supply no dormant caption tracks in TikTok-only tests."""
+    """Supply no active caption tracks."""
 
     def list_tracks(self, video_id: str) -> Sequence[CaptionTrack]:
         """Return no caption tracks.
@@ -39,6 +46,91 @@ class EmptyCaptionProvider:
         """
         del video_id
         return ()
+
+
+class RecordingCaptionTrack:
+    """Return deterministic caption segments or one provider failure."""
+
+    def __init__(
+        self,
+        language_code: str,
+        is_generated: bool,
+        segments: tuple[RawSegment, ...] = (),
+        failure: Exception | None = None,
+    ) -> None:
+        """Initialize deterministic caption track behavior.
+
+        Args:
+            language_code: Provider-reported original language tag.
+            is_generated: Whether the provider generated the track.
+            segments: Timed caption segments to return.
+            failure: Optional fetch failure.
+        """
+        self._language_code = language_code
+        self._is_generated = is_generated
+        self._segments = segments
+        self._failure = failure
+        self.fetch_calls = 0
+
+    @property
+    def language_code(self) -> str:
+        """Return the configured original language tag."""
+        return self._language_code
+
+    @property
+    def is_generated(self) -> bool:
+        """Return the configured generated-track flag."""
+        return self._is_generated
+
+    def fetch_segments(self) -> Sequence[RawSegment]:
+        """Record and return configured timed captions.
+
+        Returns:
+            Configured raw caption segments.
+
+        Raises:
+            Exception: The configured caption fetch failure.
+        """
+        self.fetch_calls += 1
+        if self._failure is not None:
+            raise self._failure
+        return self._segments
+
+
+class RecordingCaptionProvider:
+    """Return configured caption tracks while recording video lookups."""
+
+    def __init__(
+        self,
+        tracks: Sequence[CaptionTrack] = (),
+        failure: Exception | None = None,
+    ) -> None:
+        """Initialize deterministic caption provider behavior.
+
+        Args:
+            tracks: Tracks returned in provider order.
+            failure: Optional listing failure.
+        """
+        self._tracks = tracks
+        self._failure = failure
+        self.calls: list[str] = []
+
+    def list_tracks(self, video_id: str) -> Sequence[CaptionTrack]:
+        """Record and return configured caption tracks.
+
+        Args:
+            video_id: Stable YouTube video identity.
+
+        Returns:
+            Configured caption tracks.
+
+        Raises:
+            Exception: The configured listing failure.
+        """
+        self.calls.append(video_id)
+        if self._failure is not None:
+            raise self._failure
+        return self._tracks
 
 
 class RecordingMetadataExtractor:
@@ -197,12 +289,33 @@ def tiktok_metadata(duration: object = 1800) -> Mapping[str, object]:
     }
 
 
+def youtube_metadata(language: object = "en-US") -> Mapping[str, object]:
+    """Return external-shaped valid YouTube metadata.
+
+    Args:
+        language: Optional provider-declared source language.
+
+    Returns:
+        Metadata accepted by the YouTube normalization boundary.
+    """
+    metadata: dict[str, object] = {
+        "id": "dQw4w9WgXcQ",
+        "title": "A title",
+        "description": "A description",
+        "channel": "Creator",
+        "duration": 12,
+    }
+    if language is not None:
+        metadata["language"] = language
+    return metadata
+
+
 def build_service(
     temporary_media_root: Path,
     metadata_extractor: RecordingMetadataExtractor,
     audio_downloader: RecordingAudioDownloader,
     transcriber: FixedTranscriber,
-    max_duration_seconds: int = 1800,
+    caption_provider: acquisition.CaptionProvider | None = None,
 ) -> TranscriptService:
     """Build a TranscriptService from deterministic provider boundaries.
 
@@ -211,13 +324,13 @@ def build_service(
         metadata_extractor: Deterministic metadata provider.
         audio_downloader: Deterministic audio provider.
         transcriber: Deterministic native inference provider.
-        max_duration_seconds: Inclusive source duration ceiling.
+        caption_provider: Optional deterministic YouTube captions provider.
 
     Returns:
         Fully wired service under one inference permit.
     """
     config = TranscriptionConfig(
-        max_duration_seconds=max_duration_seconds,
+        max_duration_seconds=1800,
         temporary_media_root=temporary_media_root,
         beam_size=1,
         vad_filter=True,
@@ -235,7 +348,9 @@ def build_service(
     )
     adapters = TranscriptionAdapters(
         metadata_extractor=metadata_extractor,
-        caption_provider=EmptyCaptionProvider(),
+        caption_provider=(
+            caption_provider if caption_provider is not None else EmptyCaptionProvider()
+        ),
         audio_downloader=audio_downloader,
         whisper_transcriber=transcriber,
     )
@@ -361,13 +476,13 @@ async def test_transcribe_cleans_inspection_audio_after_inference_failure(
 async def test_transcribe_rejects_disabled_platform_before_provider_calls(
     tmp_path: Path,
 ) -> None:
-    """A recognizable non-TikTok URL does not reach any provider boundary."""
+    """A recognizable unsupported URL does not reach any provider boundary."""
     extractor = RecordingMetadataExtractor(tiktok_metadata())
     downloader = RecordingAudioDownloader()
     service = build_service(tmp_path, extractor, downloader, FixedTranscriber())
 
     with pytest.raises(UnsupportedPlatformError):
-        await service.transcribe(YOUTUBE_URL)
+        await service.transcribe(INSTAGRAM_URL)
 
     assert extractor.calls == []
     assert downloader.calls == []
@@ -409,3 +524,166 @@ async def test_transcribe_translates_ordinary_metadata_failures(tmp_path: Path) 
 
     with pytest.raises(MetadataRetrievalFailedError):
         await service.transcribe(DIRECT_TIKTOK_URL)
+
+
+@pytest.mark.asyncio
+async def test_transcribe_returns_youtube_captions_without_native_work(
+    tmp_path: Path,
+) -> None:
+    """A usable original caption returns before audio download or inference."""
+    caption_track = RecordingCaptionTrack(
+        "en-US",
+        False,
+        ((0.0, 1.0, "caption"),),
+    )
+    caption_provider = RecordingCaptionProvider((caption_track,))
+    downloader = RecordingAudioDownloader()
+    transcriber = FixedTranscriber()
+    service = build_service(
+        tmp_path,
+        RecordingMetadataExtractor(youtube_metadata()),
+        downloader,
+        transcriber,
+        caption_provider,
+    )
+
+    result = await service.transcribe(YOUTUBE_URL)
+
+    assert result.source.video_id == "dQw4w9WgXcQ"
+    assert result.source.url == YOUTUBE_URL
+    assert result.transcript.method is TranscriptMethod.YOUTUBE_CAPTIONS
+    assert result.transcript.text == "caption"
+    assert caption_provider.calls == ["dQw4w9WgXcQ"]
+    assert downloader.calls == []
+    assert transcriber.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("metadata_language", "tracks", "failure", "expected_caption_calls"),
+    (
+        ("en-US", (), None, 1),
+        (None, (), None, 0),
+        ("en-US", (), acquisition._CaptionProviderFailure(), 1),
+        (
+            "en-US",
+            (RecordingCaptionTrack("en-US", False, ()),),
+            None,
+            1,
+        ),
+    ),
+    ids=("missing", "ambiguous", "inaccessible", "unusable"),
+)
+async def test_transcribe_falls_back_after_unusable_youtube_captions(
+    tmp_path: Path,
+    metadata_language: object | None,
+    tracks: Sequence[CaptionTrack],
+    failure: Exception | None,
+    expected_caption_calls: int,
+) -> None:
+    """Every optional-caption miss reaches the unchanged native path."""
+    caption_provider = RecordingCaptionProvider(tracks, failure)
+    downloader = RecordingAudioDownloader()
+    transcriber = FixedTranscriber()
+    service = build_service(
+        tmp_path,
+        RecordingMetadataExtractor(youtube_metadata(metadata_language)),
+        downloader,
+        transcriber,
+        caption_provider,
+    )
+
+    result = await service.transcribe(YOUTUBE_URL)
+
+    assert result.transcript.method is TranscriptMethod.FASTER_WHISPER
+    assert len(caption_provider.calls) == expected_caption_calls
+    assert downloader.calls == [YOUTUBE_URL]
+    assert len(transcriber.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_transcribe_cleans_prepared_audio_after_youtube_caption_success(
+    tmp_path: Path,
+) -> None:
+    """Caption success cleans metadata-stage audio before releasing admission."""
+    prepared_directory = tmp_path / "inspection"
+    prepared_directory.mkdir()
+    prepared_path = prepared_directory / "audio.webm"
+    prepared_path.touch()
+    caption_provider = RecordingCaptionProvider(
+        (RecordingCaptionTrack("en-US", False, ((0.0, 1.0, "caption"),)),)
+    )
+    downloader = RecordingAudioDownloader()
+    transcriber = FixedTranscriber()
+    service = build_service(
+        tmp_path,
+        RecordingMetadataExtractor(
+            youtube_metadata(),
+            PreparedAudio(prepared_path, prepared_directory),
+        ),
+        downloader,
+        transcriber,
+        caption_provider,
+    )
+
+    result = await service.transcribe(YOUTUBE_URL)
+
+    assert result.transcript.method is TranscriptMethod.YOUTUBE_CAPTIONS
+    assert not prepared_directory.exists()
+    assert downloader.calls == []
+    assert transcriber.calls == []
+
+
+@pytest.mark.asyncio
+async def test_transcribe_reuses_prepared_audio_after_youtube_caption_miss(
+    tmp_path: Path,
+) -> None:
+    """A caption miss transfers inspection audio into the existing native path."""
+    prepared_directory = tmp_path / "inspection"
+    prepared_directory.mkdir()
+    prepared_path = prepared_directory / "audio.webm"
+    prepared_path.touch()
+    downloader = RecordingAudioDownloader()
+    transcriber = FixedTranscriber()
+    service = build_service(
+        tmp_path,
+        RecordingMetadataExtractor(
+            youtube_metadata(),
+            PreparedAudio(prepared_path, prepared_directory),
+        ),
+        downloader,
+        transcriber,
+        RecordingCaptionProvider(),
+    )
+
+    result = await service.transcribe(YOUTUBE_URL)
+
+    assert result.transcript.method is TranscriptMethod.FASTER_WHISPER
+    assert downloader.calls == []
+    assert transcriber.calls == [prepared_path]
+    assert not prepared_directory.exists()
+
+
+@pytest.mark.asyncio
+async def test_transcribe_preserves_native_failure_after_caption_failure(
+    tmp_path: Path,
+) -> None:
+    """The terminal native safe error remains public after caption failure."""
+    caption_provider = RecordingCaptionProvider(
+        failure=acquisition._CaptionProviderFailure()
+    )
+    downloader = RecordingAudioDownloader()
+    service = build_service(
+        tmp_path,
+        RecordingMetadataExtractor(youtube_metadata()),
+        downloader,
+        FixedTranscriber(RuntimeError("native provider failed")),
+        caption_provider,
+    )
+
+    with pytest.raises(TranscriptionFailedError):
+        await service.transcribe(YOUTUBE_URL)
+
+    assert caption_provider.calls == ["dQw4w9WgXcQ"]
+    assert downloader.calls == [YOUTUBE_URL]
+    assert all(not directory.exists() for directory in downloader.request_directories)

@@ -16,6 +16,7 @@ from starlette.types import Message, Scope
 
 from textify.config import AppConfig, Environment
 from textify.main import _validate_temporary_media_capacity, create_app
+from textify.transcription import acquisition
 from textify.transcription.acquisition import CaptionTrack
 from textify.transcription.config import TranscriptionConfig
 from textify.transcription.exceptions import (
@@ -38,6 +39,7 @@ from textify.transcription.exceptions import (
 from textify.transcription.inspection import ExtractedMetadata, PreparedAudio
 from textify.transcription.service import TranscriptionAdapters
 from textify.transcription.types import (
+    RawSegment,
     Segment,
     Transcript,
     TranscriptionResult,
@@ -47,6 +49,25 @@ from textify.transcription.types import (
 DIRECT_TIKTOK_URL = "https://www.tiktok.com/@creator/video/1234567890123456789"
 SHORT_TIKTOK_URL = "https://vm.tiktok.com/abcdefgh"
 YOUTUBE_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+YOUTUBE_URL_FORMS = (
+    "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    "http://youtube.com/watch?v=dQw4w9WgXcQ",
+    "https://m.youtube.com/watch?v=dQw4w9WgXcQ",
+    "https://music.youtube.com/watch?v=dQw4w9WgXcQ",
+    "https://youtu.be/dQw4w9WgXcQ",
+    "http://youtu.be/dQw4w9WgXcQ",
+    "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+    "https://m.youtube.com/shorts/dQw4w9WgXcQ",
+    "https://www.youtube.com/embed/dQw4w9WgXcQ",
+    "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ",
+    "https://www.youtube.com/live/dQw4w9WgXcQ",
+    "https://youtube.com/live/dQw4w9WgXcQ",
+    "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=43",
+    "https://www.youtube.com/watch?v=dQw4w9WgXcQ&si=abc#fragment",
+    "https://www.youtube.com/shorts/dQw4w9WgXcQ?feature=share#fragment",
+    "https://www.youtube.com/embed/dQw4w9WgXcQ?start=43",
+    "https://youtu.be/dQw4w9WgXcQ?si=abc&t=43#fragment",
+)
 
 
 def _sufficient_temporary_media_bytes(_root: Path) -> int:
@@ -68,8 +89,20 @@ def _controlled_tiktok_metadata() -> dict[str, object]:
     }
 
 
+def _controlled_youtube_metadata() -> dict[str, object]:
+    """Return valid raw YouTube metadata with a declared original language."""
+    return {
+        "id": "dQw4w9WgXcQ",
+        "title": "Title",
+        "description": "Description",
+        "channel": "Creator",
+        "duration": 12,
+        "language": "en-US",
+    }
+
+
 class ApiCaptionProvider:
-    """Supply no dormant captions for TikTok-only API tests."""
+    """Supply no active captions for baseline API tests."""
 
     def list_tracks(self, video_id: str) -> Sequence[CaptionTrack]:
         """Return no caption tracks.
@@ -222,11 +255,16 @@ class ControlledAdapterState:
     download_size_bytes: int = 5
     native_failure: Exception | None = None
     native_result_texts: list[str] = field(default_factory=list)
+    caption_listing_failure: Exception | None = None
+    youtube_caption_tracks: Sequence[CaptionTrack] = ()
     metadata_calls: list[str] = field(default_factory=list)
     metadata_deadlines: list[float] = field(default_factory=list)
     download_calls: list[str] = field(default_factory=list)
     download_deadlines: list[float] = field(default_factory=list)
     native_calls: list[Path] = field(default_factory=list)
+    caption_list_calls: list[str] = field(default_factory=list)
+    caption_fetch_calls: list[str] = field(default_factory=list)
+    caption_translation_calls: list[str] = field(default_factory=list)
     request_directories: list[Path] = field(default_factory=list)
     prepared_directories: list[Path] = field(default_factory=list)
     call_order: list[str] = field(default_factory=list)
@@ -236,6 +274,101 @@ class ControlledAdapterState:
     native_entered: threading.Event = field(default_factory=threading.Event)
     native_completed: threading.Event = field(default_factory=threading.Event)
     native_release: threading.Event = field(default_factory=threading.Event)
+
+
+class ControlledCaptionTrack:
+    """Provide observable original captions without translation support."""
+
+    def __init__(
+        self,
+        state: ControlledAdapterState,
+        name: str,
+        language_code: str,
+        is_generated: bool,
+        segments: tuple[RawSegment, ...],
+        failure: Exception | None = None,
+    ) -> None:
+        """Initialize one deterministic caption track.
+
+        Args:
+            state: Shared lifecycle observation state.
+            name: Test-visible caption candidate identity.
+            language_code: Provider-reported original language tag.
+            is_generated: Whether the provider generated the track.
+            segments: Timed caption segments returned when fetched.
+            failure: Optional caption fetch failure.
+        """
+        self._state = state
+        self._name = name
+        self._language_code = language_code
+        self._is_generated = is_generated
+        self._segments = segments
+        self._failure = failure
+
+    @property
+    def language_code(self) -> str:
+        """Return the configured original language tag."""
+        return self._language_code
+
+    @property
+    def is_generated(self) -> bool:
+        """Return the configured generated-track flag."""
+        return self._is_generated
+
+    def fetch_segments(self) -> Sequence[RawSegment]:
+        """Record and return configured original caption segments.
+
+        Returns:
+            Configured raw caption segments.
+
+        Raises:
+            Exception: The configured caption fetch failure.
+        """
+        self._state.caption_fetch_calls.append(self._name)
+        if self._failure is not None:
+            raise self._failure
+        return self._segments
+
+    def translate(self, language_code: str) -> "ControlledCaptionTrack":
+        """Record a forbidden translation request.
+
+        Args:
+            language_code: Requested translation target.
+
+        Returns:
+            This track.
+        """
+        self._state.caption_translation_calls.append(f"{self._name}:{language_code}")
+        return self
+
+
+class ControlledCaptionProvider:
+    """List configured caption tracks while recording access failures."""
+
+    def __init__(self, state: ControlledAdapterState) -> None:
+        """Initialize one provider against shared lifecycle state.
+
+        Args:
+            state: Shared lifecycle observation state.
+        """
+        self._state = state
+
+    def list_tracks(self, video_id: str) -> Sequence[CaptionTrack]:
+        """Record and return configured caption tracks.
+
+        Args:
+            video_id: Stable YouTube video identity.
+
+        Returns:
+            Configured caption tracks in provider order.
+
+        Raises:
+            Exception: The configured caption listing failure.
+        """
+        self._state.caption_list_calls.append(video_id)
+        if self._state.caption_listing_failure is not None:
+            raise self._state.caption_listing_failure
+        return self._state.youtube_caption_tracks
 
 
 class ControlledMetadataExtractor:
@@ -271,6 +404,8 @@ class ControlledMetadataExtractor:
                 self._state.metadata_deadlines.append(deadline)
             if self._state.metadata_prepares_audio_after_cancellation:
                 return self._prepare_late_audio()
+        if canonical_url == YOUTUBE_URL:
+            return ExtractedMetadata(_controlled_youtube_metadata())
         return ExtractedMetadata(_controlled_tiktok_metadata())
 
     def _prepare_late_audio(self) -> ExtractedMetadata:
@@ -370,7 +505,7 @@ class ControlledAdaptersFactory:
                 self._state,
                 config.temporary_media_root,
             ),
-            caption_provider=ApiCaptionProvider(),
+            caption_provider=ControlledCaptionProvider(self._state),
             audio_downloader=ControlledAudioDownloader(self._state),
             whisper_transcriber=ControlledTranscriber(self._state),
         )
@@ -1316,3 +1451,191 @@ async def test_api_disconnect_cancels_interruptible_pre_native_work(
 
     if stage == "queue":
         assert all(not directory.exists() for directory in state.request_directories)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("submitted_url", YOUTUBE_URL_FORMS)
+async def test_api_transcribes_every_supported_youtube_form_with_captions(
+    tmp_path: Path,
+    submitted_url: str,
+) -> None:
+    """Every accepted YouTube URL returns normalized original captions."""
+    state = ControlledAdapterState()
+    state.youtube_caption_tracks = (
+        ControlledCaptionTrack(
+            state,
+            "original",
+            "en-US",
+            False,
+            (
+                (2.0, 3.0, " second "),
+                (0.0, 1.0, " first "),
+            ),
+        ),
+    )
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path),
+        ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/transcripts", json={"url": submitted_url}
+            )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "source": {
+            "platform": "youtube",
+            "video_id": "dQw4w9WgXcQ",
+            "url": YOUTUBE_URL,
+            "title": "Title",
+            "description": "Description",
+            "channel": "Creator",
+            "duration_seconds": 12,
+        },
+        "transcript": {
+            "method": "youtube_captions",
+            "language": "en-US",
+            "segments": [
+                {"start": 0.0, "end": 1.0, "text": "first"},
+                {"start": 2.0, "end": 3.0, "text": "second"},
+            ],
+            "text": "first second",
+        },
+    }
+    assert state.metadata_calls == [YOUTUBE_URL]
+    assert state.caption_list_calls == ["dQw4w9WgXcQ"]
+    assert state.caption_fetch_calls == ["original"]
+    assert state.caption_translation_calls == []
+    assert state.download_calls == []
+    assert state.native_calls == []
+
+
+@pytest.mark.asyncio
+async def test_api_youtube_captions_bypass_busy_native_permit_and_release_admission(
+    tmp_path: Path,
+) -> None:
+    """Caption requests bypass inference and release broad admission immediately."""
+    state = ControlledAdapterState(native_waits_for_release=True)
+    state.youtube_caption_tracks = (
+        ControlledCaptionTrack(
+            state,
+            "original",
+            "en-US",
+            False,
+            ((0.0, 1.0, "caption"),),
+        ),
+    )
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path).model_copy(
+            update={
+                "transcription_concurrency": 1,
+                "max_pending_transcriptions": 1,
+            }
+        ),
+        ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            native_request = asyncio.create_task(
+                client.post("/api/transcripts", json={"url": DIRECT_TIKTOK_URL})
+            )
+            await _wait_for_thread_event(state.native_entered)
+
+            first_caption_response = await client.post(
+                "/api/transcripts",
+                json={"url": YOUTUBE_URL},
+            )
+            second_caption_response = await client.post(
+                "/api/transcripts",
+                json={"url": YOUTUBE_URL},
+            )
+
+            state.native_release.set()
+            native_response = await _await_request(native_request)
+
+    assert first_caption_response.status_code == 200
+    assert second_caption_response.status_code == 200
+    assert native_response.status_code == 200
+    assert len(state.caption_list_calls) == 2
+    assert state.download_calls == [DIRECT_TIKTOK_URL]
+    assert len(state.native_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_api_youtube_falls_back_without_translating_unrelated_caption(
+    tmp_path: Path,
+) -> None:
+    """An unrelated translatable track reaches native fallback without translation."""
+    state = ControlledAdapterState()
+    state.youtube_caption_tracks = (
+        ControlledCaptionTrack(
+            state,
+            "unrelated",
+            "fr",
+            False,
+            ((0.0, 1.0, "bonjour"),),
+        ),
+    )
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path),
+        ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post("/api/transcripts", json={"url": YOUTUBE_URL})
+
+    assert response.status_code == 200
+    assert response.json()["transcript"]["method"] == "faster_whisper"
+    assert state.caption_list_calls == ["dQw4w9WgXcQ"]
+    assert state.caption_fetch_calls == []
+    assert state.caption_translation_calls == []
+    assert state.download_calls == [YOUTUBE_URL]
+    assert len(state.native_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_api_returns_native_safe_error_after_caption_listing_failure(
+    tmp_path: Path,
+) -> None:
+    """Caption failure never changes the native terminal safe error envelope."""
+    state = ControlledAdapterState(
+        caption_listing_failure=acquisition._CaptionProviderFailure(),
+        native_failure=RuntimeError("native provider failed"),
+    )
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path),
+        ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post("/api/transcripts", json={"url": YOUTUBE_URL})
+
+    assert response.status_code == 502
+    assert response.json() == {
+        "error": {
+            "code": "transcription_failed",
+            "message": "The source could not be transcribed.",
+        }
+    }
+    assert state.caption_list_calls == ["dQw4w9WgXcQ"]
+    assert state.download_calls == [YOUTUBE_URL]
+    assert len(state.native_calls) == 1
+    assert all(not directory.exists() for directory in state.request_directories)

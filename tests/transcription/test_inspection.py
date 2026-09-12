@@ -15,9 +15,11 @@ from textify.transcription.exceptions import (
     UnsupportedPlatformError,
 )
 from textify.transcription.inspection import (
+    SubmittedSource,
     YtDlpMetadataExtractor,
     _normalize_duration,
     classify_submitted_url,
+    normalize_processed_metadata,
 )
 from textify.transcription.types import Platform
 from textify.transcription.util import MediaByteLimitExceeded
@@ -173,7 +175,9 @@ def test_metadata_extractor_accepts_selected_media_at_byte_limit(
     )
 
     assert extracted.metadata == metadata
-    assert FakeYoutubeDL.captured_options[0]["format"] == "bestaudio/best"
+    assert FakeYoutubeDL.captured_options[0]["allowed_extractors"] == [
+        r"^(?:tiktok|vm\.tiktok|youtube)$"
+    ]
 
 
 @pytest.mark.parametrize(
@@ -228,3 +232,35 @@ def test_duration_fallback_enforces_progress_byte_limit_and_cleans(
         )
 
     assert not any(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("language", "expected_language"),
+    (
+        ("en_us", "en-US"),
+        (None, None),
+        ("not a language tag", None),
+        ("und", None),
+        ("x-private", None),
+    ),
+)
+def test_normalize_processed_metadata_carries_safe_declared_language(
+    language: object,
+    expected_language: str | None,
+) -> None:
+    """YouTube metadata retains only usable canonical language declarations."""
+    metadata = {
+        "id": "dQw4w9WgXcQ",
+        "title": "Title",
+        "duration": 12,
+        "language": language,
+    }
+    submitted = SubmittedSource(
+        Platform.YOUTUBE,
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        "dQw4w9WgXcQ",
+    )
+
+    normalized = normalize_processed_metadata(metadata, submitted)
+
+    assert normalized.declared_language == expected_language

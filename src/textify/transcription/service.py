@@ -24,6 +24,7 @@ from textify.transcription.exceptions import (
 from textify.transcription.types import (
     Platform,
     Source,
+    Transcript,
     TranscriptionResult,
 )
 from textify.transcription.util import MediaByteLimitExceeded
@@ -35,7 +36,7 @@ class TranscriptionAdapters:
 
     Attributes:
         metadata_extractor: Provider boundary for Source metadata.
-        caption_provider: Dormant YouTube captions provider.
+        caption_provider: Active YouTube captions provider.
         audio_downloader: Provider boundary for request-scoped audio.
         whisper_transcriber: Preloaded native inference provider.
     """
@@ -111,7 +112,7 @@ async def _finish_cancelled_metadata(
 
 
 class TranscriptService:
-    """Transcribe one submitted TikTok URL through the complete lifecycle."""
+    """Transcribe one submitted Supported Platform URL through the lifecycle."""
 
     def __init__(
         self,
@@ -125,6 +126,7 @@ class TranscriptService:
             settings: Validated transcription configuration.
         """
         self._metadata_extractor = adapters.metadata_extractor
+        self._caption_provider = adapters.caption_provider
         self._settings = settings
         self._admission_limit = (
             settings.transcription_concurrency + settings.max_pending_transcriptions
@@ -149,7 +151,7 @@ class TranscriptService:
         self._admitted_transcriptions -= 1
 
     async def transcribe(self, submitted_url: str) -> TranscriptionResult:
-        """Retrieve one normalized TikTok Source and Transcript.
+        """Retrieve one normalized Supported Platform Source and Transcript.
 
         Args:
             submitted_url: URL supplied by the API caller.
@@ -161,7 +163,7 @@ class TranscriptService:
             TranscriptionError: If URL, provider, capacity, media, or work fails.
         """
         submitted = inspection.classify_submitted_url(submitted_url)
-        if submitted.platform is not Platform.TIKTOK:
+        if submitted.platform not in (Platform.TIKTOK, Platform.YOUTUBE):
             raise UnsupportedPlatformError()
 
         self._admit()
@@ -194,6 +196,16 @@ class TranscriptService:
             if source.duration_seconds > self._settings.max_duration_seconds:
                 raise VideoTooLongError()
 
+            if source.platform is Platform.YOUTUBE:
+                video_id = submitted.youtube_video_id
+                if video_id is not None:
+                    caption_transcript = await self._acquire_youtube_caption(
+                        video_id,
+                        normalized_metadata.declared_language,
+                    )
+                    if caption_transcript is not None:
+                        return TranscriptionResult(source, caption_transcript)
+
             ownership = acquisition.TranscriptionOwnership(
                 prepared_audio,
                 cancellation_event,
@@ -220,6 +232,24 @@ class TranscriptService:
     async def shutdown(self) -> None:
         """Wait for retained native inference and its request-media cleanup."""
         await self._whisper_acquirer.shutdown()
+
+    async def _acquire_youtube_caption(
+        self,
+        video_id: str,
+        declared_language: str | None,
+    ) -> Transcript | None:
+        """Acquire optional YouTube captions without blocking the event loop."""
+        try:
+            return await asyncio.to_thread(
+                acquisition.acquire_transcript,
+                self._caption_provider,
+                video_id,
+                declared_language,
+            )
+        except acquisition._CaptionProviderTimeout:
+            return None
+        except acquisition._CaptionProviderFailure:
+            return None
 
     async def _extract_metadata(
         self,

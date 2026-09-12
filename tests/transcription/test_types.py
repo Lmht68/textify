@@ -11,6 +11,7 @@ from textify.transcription.types import (
     Source,
     Transcript,
     TranscriptMethod,
+    normalize_language_tag,
     normalize_transcript,
 )
 
@@ -63,6 +64,23 @@ def test_normalize_transcript_handles_invalid_language_and_silence() -> None:
 
     assert unknown_language.language == "und"
     assert silent == Transcript(TranscriptMethod.FASTER_WHISPER, "und", (), "")
+
+
+@pytest.mark.parametrize(
+    ("language", "expected"),
+    (
+        ("en_us", "en-US"),
+        ("not a language tag", "und"),
+        (None, "und"),
+        (1, "und"),
+    ),
+)
+def test_normalize_language_tag_handles_provider_values(
+    language: object,
+    expected: str,
+) -> None:
+    """Provider language declarations canonicalize only valid string tags."""
+    assert normalize_language_tag(language) == expected
 
 
 @pytest.mark.parametrize(
