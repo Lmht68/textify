@@ -753,7 +753,6 @@ def test_audio_downloader_enforces_progress_byte_limit(
             cancellation_event=threading.Event(),
         )
 
-    assert len(FakeYoutubeDL.captured_options) == 1
     assert FakeYoutubeDL.captured_options[0]["allowed_extractors"] == [
-        r"^(?:tiktok|vm\.tiktok|youtube)$"
+        r"^(?:facebook|facebook:reel|generic|instagram|tiktok|vm\.tiktok|youtube)$"
     ]

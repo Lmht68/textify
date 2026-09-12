@@ -5,7 +5,7 @@ import json
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -13,6 +13,7 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient, Response
 from starlette.types import Message, Scope
+from yt_dlp.utils import YoutubeDLError
 
 from textify.config import AppConfig, Environment
 from textify.main import _validate_temporary_media_capacity, create_app
@@ -39,6 +40,7 @@ from textify.transcription.exceptions import (
 from textify.transcription.inspection import ExtractedMetadata, PreparedAudio
 from textify.transcription.service import TranscriptionAdapters
 from textify.transcription.types import (
+    Platform,
     RawSegment,
     Segment,
     Transcript,
@@ -67,6 +69,40 @@ YOUTUBE_URL_FORMS = (
     "https://www.youtube.com/shorts/dQw4w9WgXcQ?feature=share#fragment",
     "https://www.youtube.com/embed/dQw4w9WgXcQ?start=43",
     "https://youtu.be/dQw4w9WgXcQ?si=abc&t=43#fragment",
+)
+
+FACEBOOK_CANONICAL_WATCH_URL = "https://www.facebook.com/watch?v=123456789012345"
+FACEBOOK_SHORT_URL = "https://fb.watch/short_1"
+INSTAGRAM_REEL_URL = "https://www.instagram.com/reel/C0social_1"
+_INSTAGRAM_SOCIAL_PATHS = (
+    "p/C0social_1",
+    "tv/C0social_1",
+    "reel/C0social_1",
+    "reels/C0social_1",
+)
+_FACEBOOK_SOCIAL_PATHS = (
+    "watch?v=123456789012345",
+    "video.php?v=123456789012345",
+    "video/video.php?v=123456789012345",
+    "reel/123456789012345",
+    "share/some-owner/video/share_1",
+    "share/v/1HQUctaBZS",
+    "creator.page-name/videos/123456789012345",
+    "creator.page-name/series_1/videos/123456789012345",
+    "creator.page-name/posts/123456789012345",
+)
+SOCIAL_URL_CASES = (
+    tuple(
+        (Platform.INSTAGRAM, f"https://{host}/{path}")
+        for host in ("instagram.com", "www.instagram.com")
+        for path in _INSTAGRAM_SOCIAL_PATHS
+    )
+    + tuple(
+        (Platform.FACEBOOK, f"https://{host}/{path}")
+        for host in ("facebook.com", "www.facebook.com", "m.facebook.com")
+        for path in _FACEBOOK_SOCIAL_PATHS
+    )
+    + ((Platform.FACEBOOK, FACEBOOK_SHORT_URL),)
 )
 
 
@@ -99,6 +135,157 @@ def _controlled_youtube_metadata() -> dict[str, object]:
         "duration": 12,
         "language": "en-US",
     }
+
+
+def _controlled_social_metadata(
+    platform: Platform,
+    canonical_url: str,
+    *,
+    duration: object = 1800,
+    extractor_key: str | None = None,
+) -> dict[str, object]:
+    """Return valid raw Facebook or Instagram metadata for controlled providers.
+
+    Args:
+        platform: Social Platform represented by the metadata.
+        canonical_url: Provider-authoritative canonical Source URL.
+        duration: Provider duration value exposed to normalization.
+        extractor_key: Optional exact processed yt-dlp extractor key.
+
+    Returns:
+        External-shaped metadata accepted by the social provider boundary.
+
+    Raises:
+        ValueError: If platform does not identify Facebook or Instagram.
+    """
+    if platform is Platform.INSTAGRAM:
+        video_id = "C0social_1"
+        default_extractor_key = "Instagram"
+    elif platform is Platform.FACEBOOK:
+        video_id = "123456789012345"
+        default_extractor_key = "Facebook"
+    else:
+        raise ValueError("Controlled social metadata requires Facebook or Instagram.")
+
+    return {
+        "id": video_id,
+        "extractor_key": (
+            default_extractor_key if extractor_key is None else extractor_key
+        ),
+        "webpage_url": canonical_url,
+        "title": "Title",
+        "description": "Description",
+        "channel": "Creator",
+        "duration": duration,
+        "formats": ({"vcodec": "h264"},),
+    }
+
+
+NATIVE_TIMEOUT_CASES = (
+    (
+        Platform.TIKTOK,
+        DIRECT_TIKTOK_URL,
+        _controlled_tiktok_metadata(),
+    ),
+    (
+        Platform.INSTAGRAM,
+        "https://www.instagram.com/reel/C0social_1",
+        _controlled_social_metadata(
+            Platform.INSTAGRAM,
+            "https://www.instagram.com/reel/C0social_1",
+        ),
+    ),
+    (
+        Platform.FACEBOOK,
+        FACEBOOK_CANONICAL_WATCH_URL,
+        _controlled_social_metadata(
+            Platform.FACEBOOK,
+            FACEBOOK_CANONICAL_WATCH_URL,
+        ),
+    ),
+)
+
+SOCIAL_METADATA_STATE_CASES = tuple(
+    (platform, submitted_url, metadata_updates, expected_status, expected_code)
+    for platform, submitted_url in (
+        (Platform.INSTAGRAM, INSTAGRAM_REEL_URL),
+        (Platform.FACEBOOK, FACEBOOK_CANONICAL_WATCH_URL),
+    )
+    for metadata_updates, expected_status, expected_code in (
+        ({"formats": ({"vcodec": "none"},)}, 422, "unsupported_media"),
+        ({"entries": ()}, 400, "invalid_url"),
+        ({"is_live": True}, 400, "invalid_url"),
+        ({"duration": 1800.1}, 422, "video_too_long"),
+    )
+)
+SOCIAL_PROVIDER_FAILURE_CASES = (
+    (
+        Platform.FACEBOOK,
+        FACEBOOK_CANONICAL_WATCH_URL,
+        "This video is only available for registered users",
+        422,
+        "unsupported_content",
+    ),
+    (
+        Platform.FACEBOOK,
+        FACEBOOK_CANONICAL_WATCH_URL,
+        "This video has been deleted",
+        422,
+        "unsupported_content",
+    ),
+    (
+        Platform.FACEBOOK,
+        FACEBOOK_CANONICAL_WATCH_URL,
+        "The video is not available",
+        422,
+        "unsupported_content",
+    ),
+    (
+        Platform.FACEBOOK,
+        FACEBOOK_CANONICAL_WATCH_URL,
+        "Blocked in your country",
+        422,
+        "unsupported_content",
+    ),
+    (
+        Platform.INSTAGRAM,
+        INSTAGRAM_REEL_URL,
+        "This content is only available for registered users who follow this account",
+        422,
+        "unsupported_content",
+    ),
+    (
+        Platform.INSTAGRAM,
+        INSTAGRAM_REEL_URL,
+        "This video has been deleted",
+        422,
+        "unsupported_content",
+    ),
+    (
+        Platform.INSTAGRAM,
+        INSTAGRAM_REEL_URL,
+        (
+            "Instagram sent an empty media response. Check if this post is "
+            "accessible in your browser without being logged-in."
+        ),
+        422,
+        "unsupported_content",
+    ),
+    (
+        Platform.INSTAGRAM,
+        INSTAGRAM_REEL_URL,
+        "Restricted Video",
+        422,
+        "unsupported_content",
+    ),
+    (
+        Platform.INSTAGRAM,
+        INSTAGRAM_REEL_URL,
+        "There is no video in this post",
+        422,
+        "unsupported_media",
+    ),
+)
 
 
 class ApiCaptionProvider:
@@ -253,6 +440,8 @@ class ControlledAdapterState:
     metadata_delay_seconds: float = 0.0
     download_delay_seconds: float = 0.0
     download_size_bytes: int = 5
+    metadata_override: Mapping[str, object] | None = None
+    metadata_failure: Exception | None = None
     native_failure: Exception | None = None
     native_result_texts: list[str] = field(default_factory=list)
     caption_listing_failure: Exception | None = None
@@ -404,6 +593,10 @@ class ControlledMetadataExtractor:
                 self._state.metadata_deadlines.append(deadline)
             if self._state.metadata_prepares_audio_after_cancellation:
                 return self._prepare_late_audio()
+        if self._state.metadata_failure is not None:
+            raise self._state.metadata_failure
+        if self._state.metadata_override is not None:
+            return ExtractedMetadata(self._state.metadata_override)
         if canonical_url == YOUTUBE_URL:
             return ExtractedMetadata(_controlled_youtube_metadata())
         return ExtractedMetadata(_controlled_tiktok_metadata())
@@ -824,6 +1017,237 @@ async def test_api_transcribes_current_tiktok_forms_with_one_lifespan_model(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("platform", "submitted_url"), SOCIAL_URL_CASES)
+async def test_api_transcribes_every_supported_social_form_with_faster_whisper(
+    tmp_path: Path,
+    platform: Platform,
+    submitted_url: str,
+) -> None:
+    """Every documented Facebook and Instagram form reaches native transcription."""
+    canonical_url = (
+        FACEBOOK_CANONICAL_WATCH_URL
+        if submitted_url == FACEBOOK_SHORT_URL
+        else submitted_url
+    )
+    extractor_key = (
+        "FacebookReel"
+        if platform is Platform.FACEBOOK and "/reel/" in submitted_url
+        else None
+    )
+    expected_video_id = (
+        "C0social_1" if platform is Platform.INSTAGRAM else "123456789012345"
+    )
+    state = ControlledAdapterState(
+        metadata_override=_controlled_social_metadata(
+            platform,
+            canonical_url,
+            extractor_key=extractor_key,
+        )
+    )
+    factory = ControlledAdaptersFactory(state)
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path),
+        factory,
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/transcripts",
+                json={"url": submitted_url},
+            )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "source": {
+            "platform": platform.value,
+            "video_id": expected_video_id,
+            "url": canonical_url,
+            "title": "Title",
+            "description": "Description",
+            "channel": "Creator",
+            "duration_seconds": 1800,
+        },
+        "transcript": {
+            "method": "faster_whisper",
+            "language": "en",
+            "segments": [{"start": 0.0, "end": 1.0, "text": "One"}],
+            "text": "One",
+        },
+    }
+    assert factory.calls == 1
+    assert state.metadata_calls == [submitted_url]
+    assert state.download_calls == [submitted_url]
+    assert state.call_order == ["metadata", "download", "native"]
+    assert state.caption_list_calls == []
+    assert state.caption_fetch_calls == []
+    assert state.caption_translation_calls == []
+    assert len(state.native_calls) == 1
+    assert all(not directory.exists() for directory in state.request_directories)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("submitted_url", "expected_status", "expected_code"),
+    (
+        ("https://www.instagram.com/creator", 400, "invalid_url"),
+        ("https://www.facebook.com/creator", 400, "invalid_url"),
+        ("https://www.facebook.com/share/some-owner/share_1", 400, "invalid_url"),
+        (
+            "https://www.facebook.com/creator/videos/series_1/123456789012345",
+            400,
+            "invalid_url",
+        ),
+        (
+            "https://x.com/creator/status/1234567890123456789",
+            400,
+            "unsupported_platform",
+        ),
+    ),
+)
+async def test_api_rejects_invalid_social_url_forms_before_provider_access(
+    tmp_path: Path,
+    submitted_url: str,
+    expected_status: int,
+    expected_code: str,
+) -> None:
+    """Invalid social forms and disabled X never reach a provider boundary."""
+    state = ControlledAdapterState()
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path),
+        ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/transcripts", json={"url": submitted_url}
+            )
+
+    payload = response.json()
+    assert response.status_code == expected_status
+    assert payload["error"]["code"] == expected_code
+    assert payload["error"]["message"]
+    assert submitted_url not in str(payload)
+    assert state.metadata_calls == []
+    assert state.caption_list_calls == []
+    assert state.caption_fetch_calls == []
+    assert state.caption_translation_calls == []
+    assert state.download_calls == []
+    assert state.native_calls == []
+    assert state.request_directories == []
+    assert state.prepared_directories == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "platform",
+        "submitted_url",
+        "metadata_updates",
+        "expected_status",
+        "expected_code",
+    ),
+    SOCIAL_METADATA_STATE_CASES,
+)
+async def test_api_rejects_social_metadata_states_safely(
+    tmp_path: Path,
+    platform: Platform,
+    submitted_url: str,
+    metadata_updates: Mapping[str, object],
+    expected_status: int,
+    expected_code: str,
+) -> None:
+    """Non-video, collection, live, and over-limit social metadata is bounded."""
+    metadata = _controlled_social_metadata(platform, submitted_url)
+    metadata.update(metadata_updates)
+    state = ControlledAdapterState(metadata_override=metadata)
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path),
+        ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/transcripts", json={"url": submitted_url}
+            )
+
+    assert response.status_code == expected_status
+    assert response.json()["error"]["code"] == expected_code
+    assert state.metadata_calls == [submitted_url]
+    assert state.caption_list_calls == []
+    assert state.caption_fetch_calls == []
+    assert state.caption_translation_calls == []
+    assert state.download_calls == []
+    assert state.native_calls == []
+    assert state.request_directories == []
+    assert state.prepared_directories == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "platform",
+        "submitted_url",
+        "provider_message",
+        "expected_status",
+        "expected_code",
+    ),
+    SOCIAL_PROVIDER_FAILURE_CASES,
+)
+async def test_api_maps_social_provider_failures_without_leaking_details(
+    tmp_path: Path,
+    platform: Platform,
+    submitted_url: str,
+    provider_message: str,
+    expected_status: int,
+    expected_code: str,
+) -> None:
+    """Known social provider failures expose only their stable safe envelope."""
+    state = ControlledAdapterState(
+        metadata_failure=YoutubeDLError(provider_message),
+    )
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path),
+        ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/transcripts", json={"url": submitted_url}
+            )
+
+    payload = response.json()
+    assert response.status_code == expected_status
+    assert payload["error"]["code"] == expected_code
+    assert payload["error"]["message"]
+    assert submitted_url not in str(payload)
+    assert provider_message not in str(payload)
+    assert state.metadata_calls == [submitted_url]
+    assert state.caption_list_calls == []
+    assert state.caption_fetch_calls == []
+    assert state.caption_translation_calls == []
+    assert state.download_calls == []
+    assert state.native_calls == []
+    assert state.request_directories == []
+    assert state.prepared_directories == []
+
+
+@pytest.mark.asyncio
 async def test_api_returns_safe_request_validation_error(tmp_path: Path) -> None:
     """Malformed payloads return invalid_request without echoing their value."""
     application = create_app(
@@ -1104,13 +1528,21 @@ async def test_api_expires_download_deadline_and_cleans_request_media(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("platform", "submitted_url", "metadata_override"),
+    NATIVE_TIMEOUT_CASES,
+)
 async def test_api_returns_native_timeout_before_abandoned_work_completes(
     tmp_path: Path,
+    platform: Platform,
+    submitted_url: str,
+    metadata_override: Mapping[str, object],
 ) -> None:
-    """A native timeout returns while retained work still owns permit and media."""
+    """A native timeout retains owned work until inference completes."""
     state = ControlledAdapterState(
         native_waits_for_release=True,
         native_result_texts=["abandoned", "fresh"],
+        metadata_override=metadata_override,
     )
     application = create_app(
         app_config(),
@@ -1131,7 +1563,7 @@ async def test_api_returns_native_timeout_before_abandoned_work_completes(
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             timed_response = await client.post(
                 "/api/transcripts",
-                json={"url": DIRECT_TIKTOK_URL},
+                json={"url": submitted_url},
             )
             assert timed_response.status_code == 504
             assert timed_response.json()["error"]["code"] == "transcription_timeout"
@@ -1139,14 +1571,14 @@ async def test_api_returns_native_timeout_before_abandoned_work_completes(
             assert state.request_directories[0].exists()
 
             queued_request = asyncio.create_task(
-                client.post("/api/transcripts", json={"url": DIRECT_TIKTOK_URL})
+                client.post("/api/transcripts", json={"url": submitted_url})
             )
             await _wait_for_thread_event(state.download_second_entered)
             await _assert_request_pending(queued_request)
 
             overload_response = await client.post(
                 "/api/transcripts",
-                json={"url": DIRECT_TIKTOK_URL},
+                json={"url": submitted_url},
             )
             assert overload_response.status_code == 503
             assert len(state.metadata_calls) == 2
@@ -1161,7 +1593,7 @@ async def test_api_returns_native_timeout_before_abandoned_work_completes(
             )
             reusable_response = await client.post(
                 "/api/transcripts",
-                json={"url": DIRECT_TIKTOK_URL},
+                json={"url": submitted_url},
             )
 
     assert queued_response.status_code == 200
@@ -1169,6 +1601,10 @@ async def test_api_returns_native_timeout_before_abandoned_work_completes(
     assert "abandoned" not in str(queued_response.json())
     assert reusable_response.status_code == 200
     assert all(not directory.exists() for directory in state.request_directories)
+    if platform is not Platform.TIKTOK:
+        assert state.caption_list_calls == []
+        assert state.caption_fetch_calls == []
+        assert state.caption_translation_calls == []
 
 
 @pytest.mark.asyncio

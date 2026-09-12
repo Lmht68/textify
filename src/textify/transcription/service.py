@@ -163,7 +163,12 @@ class TranscriptService:
             TranscriptionError: If URL, provider, capacity, media, or work fails.
         """
         submitted = inspection.classify_submitted_url(submitted_url)
-        if submitted.platform not in (Platform.TIKTOK, Platform.YOUTUBE):
+        if submitted.platform not in (
+            Platform.TIKTOK,
+            Platform.YOUTUBE,
+            Platform.INSTAGRAM,
+            Platform.FACEBOOK,
+        ):
             raise UnsupportedPlatformError()
 
         self._admit()
@@ -304,6 +309,8 @@ class TranscriptService:
         except YoutubeDLError as exc:
             if inspection._is_timeout_exception(exc):
                 raise MetadataTimeoutError() from exc
+            if inspection._is_unsupported_media_error(str(exc)):
+                raise UnsupportedMediaError() from exc
             if inspection._is_unavailable_error(str(exc)):
                 raise UnsupportedContentError() from exc
             raise MetadataRetrievalFailedError() from exc

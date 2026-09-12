@@ -148,13 +148,21 @@ _UNAVAILABLE_MARKERS: Final[frozenset[str]] = frozenset(
         "sign in to confirm",
         "requires login",
         "requires you to sign in",
+        "only available for registered users",
+        "instagram sent an empty media response",
+        "restricted video",
     }
+)
+_UNSUPPORTED_MEDIA_MARKERS: Final[frozenset[str]] = frozenset(
+    {"there is no video in this post"}
 )
 _COLLECTION_TYPES: Final[frozenset[str]] = frozenset(
     {"playlist", "multi_video", "url", "url_transparent"}
 )
 _METADATA_YTDLP_OPTIONS: Final[dict[str, object]] = {
-    "allowed_extractors": [r"^(?:tiktok|vm\.tiktok|youtube)$"],
+    "allowed_extractors": [
+        r"^(?:facebook|facebook:reel|generic|instagram|tiktok|vm\.tiktok|youtube)$"
+    ],
     "ignoreconfig": True,
     "no_warnings": True,
     "noplaylist": True,
@@ -817,20 +825,34 @@ def _facebook_identity(
         if query_values:
             raise _invalid_source_error("facebook_reel_query")
         return _facebook_id(path[1])
-    if len(path) == 3 and path[0] == "share":
+    if len(path) == 3 and path[:2] == ("share", "v"):
         if query_values:
             raise _invalid_source_error("facebook_share_query")
-        return path[2]  # share ID, not facebook ID
-    if len(path) in {3, 4} and path[1] in {"videos", "posts"}:
-        if path[1] == "posts" and len(path) != 3:
-            raise _invalid_source_error("invalid_facebook_posts_path")
+        return _safe_segment(path[2])
+    if len(path) == 4 and path[0] == "share":
+        if query_values:
+            raise _invalid_source_error("facebook_share_query")
+        return _safe_segment(path[3])
+    if len(path) == 3 and path[1] == "videos":
         if query_values:
             raise _invalid_source_error("facebook_query_not_supported")
         if _FACEBOOK_OWNER_PATTERN.fullmatch(path[0]) is None:
             raise _invalid_source_error("invalid_facebook_owner")
-        if len(path) == 4 and _SAFE_SEGMENT_PATTERN.fullmatch(path[2]) is None:
+        return _facebook_id(path[2])
+    if len(path) == 4 and path[2] == "videos":
+        if query_values:
+            raise _invalid_source_error("facebook_query_not_supported")
+        if _FACEBOOK_OWNER_PATTERN.fullmatch(path[0]) is None:
+            raise _invalid_source_error("invalid_facebook_owner")
+        if _SAFE_SEGMENT_PATTERN.fullmatch(path[1]) is None:
             raise _invalid_source_error("invalid_facebook_path_segment")
-        return _facebook_id(path[-1])
+        return _facebook_id(path[3])
+    if len(path) == 3 and path[1] == "posts":
+        if query_values:
+            raise _invalid_source_error("facebook_query_not_supported")
+        if _FACEBOOK_OWNER_PATTERN.fullmatch(path[0]) is None:
+            raise _invalid_source_error("invalid_facebook_owner")
+        return _facebook_id(path[2])
     raise _invalid_source_error("unsupported_facebook_path")
 
 
@@ -1154,6 +1176,12 @@ def _is_timeout_exception(error: BaseException) -> bool:
 def _is_unavailable_error(message: str) -> bool:
     normalized_message = message.casefold()
     return any(marker in normalized_message for marker in _UNAVAILABLE_MARKERS)
+
+
+def _is_unsupported_media_error(message: str) -> bool:
+    """Return whether a provider error describes a non-video source."""
+    normalized_message = message.casefold()
+    return any(marker in normalized_message for marker in _UNSUPPORTED_MEDIA_MARKERS)
 
 
 def safe_submitted_url(submitted_url: str) -> str:

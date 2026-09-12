@@ -29,7 +29,7 @@ from textify.transcription.types import (
 
 DIRECT_TIKTOK_URL = "https://www.tiktok.com/@creator/video/1234567890123456789"
 YOUTUBE_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-INSTAGRAM_URL = "https://www.instagram.com/reel/Cu0KqDGpE6h"
+X_URL = "https://x.com/creator/status/1234567890123456789"
 
 
 class EmptyCaptionProvider:
@@ -473,19 +473,29 @@ async def test_transcribe_cleans_inspection_audio_after_inference_failure(
 
 
 @pytest.mark.asyncio
-async def test_transcribe_rejects_disabled_platform_before_provider_calls(
+async def test_transcribe_rejects_still_disabled_platform_before_provider_calls(
     tmp_path: Path,
 ) -> None:
-    """A recognizable unsupported URL does not reach any provider boundary."""
+    """A recognizable disabled URL does not reach any provider boundary."""
     extractor = RecordingMetadataExtractor(tiktok_metadata())
+    caption_provider = RecordingCaptionProvider()
     downloader = RecordingAudioDownloader()
-    service = build_service(tmp_path, extractor, downloader, FixedTranscriber())
+    transcriber = FixedTranscriber()
+    service = build_service(
+        tmp_path,
+        extractor,
+        downloader,
+        transcriber,
+        caption_provider,
+    )
 
     with pytest.raises(UnsupportedPlatformError):
-        await service.transcribe(INSTAGRAM_URL)
+        await service.transcribe(X_URL)
 
     assert extractor.calls == []
+    assert caption_provider.calls == []
     assert downloader.calls == []
+    assert transcriber.calls == []
 
 
 @pytest.mark.asyncio

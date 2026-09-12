@@ -54,7 +54,9 @@ from textify.transcription.util import (
 logger = logging.getLogger(__name__)
 
 _YTDLP_OPTIONS: Final[dict[str, object]] = {
-    "allowed_extractors": [r"^(?:tiktok|vm\.tiktok|youtube)$"],
+    "allowed_extractors": [
+        r"^(?:facebook|facebook:reel|generic|instagram|tiktok|vm\.tiktok|youtube)$"
+    ],
     "format": "bestaudio/best",
     "ignoreconfig": True,
     "no_warnings": True,
@@ -846,7 +848,7 @@ class WhisperAcquirer:
         """Acquire source audio and transcribe it under the native permit.
 
         Args:
-            source_url: Original submitted TikTok URL for yt-dlp.
+            source_url: Original submitted Supported Platform URL for yt-dlp.
             ownership: Request ownership retained when native work outlives a response.
 
         Returns:

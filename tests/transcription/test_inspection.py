@@ -121,6 +121,14 @@ def test_classify_submitted_url_accepts_current_tiktok_forms(
     assert submitted.provider_url == expected_url
 
 
+def test_classify_submitted_url_accepts_facebook_short_share_video() -> None:
+    """A Facebook short share-video URL remains a Facebook provider request."""
+    submitted = classify_submitted_url("https://www.facebook.com/share/v/1HQUctaBZS/")
+
+    assert submitted.platform is Platform.FACEBOOK
+    assert submitted.provider_url == "https://www.facebook.com/share/v/1HQUctaBZS"
+
+
 @pytest.mark.parametrize(
     ("url", "error_type"),
     (
@@ -176,7 +184,7 @@ def test_metadata_extractor_accepts_selected_media_at_byte_limit(
 
     assert extracted.metadata == metadata
     assert FakeYoutubeDL.captured_options[0]["allowed_extractors"] == [
-        r"^(?:tiktok|vm\.tiktok|youtube)$"
+        r"^(?:facebook|facebook:reel|generic|instagram|tiktok|vm\.tiktok|youtube)$"
     ]
 
 
@@ -264,3 +272,80 @@ def test_normalize_processed_metadata_carries_safe_declared_language(
     normalized = normalize_processed_metadata(metadata, submitted)
 
     assert normalized.declared_language == expected_language
+
+
+@pytest.mark.parametrize(
+    ("submitted", "metadata", "expected_video_id", "expected_url"),
+    (
+        (
+            SubmittedSource(
+                Platform.INSTAGRAM,
+                "https://www.instagram.com/reel/C0submitted_1",
+            ),
+            {
+                "id": "C0social_1",
+                "extractor_key": "Instagram",
+                "webpage_url": "https://www.instagram.com/reel/C0social_1",
+                "title": "Title",
+                "description": "Description",
+                "channel": "Creator",
+                "duration": 12.1,
+                "formats": ({"vcodec": "h264"},),
+            },
+            "C0social_1",
+            "https://www.instagram.com/reel/C0social_1",
+        ),
+        (
+            SubmittedSource(
+                Platform.FACEBOOK,
+                "https://www.facebook.com/watch?v=123456789012345",
+            ),
+            {
+                "id": "123456789012345",
+                "extractor_key": "Facebook",
+                "webpage_url": "https://www.facebook.com/watch?v=123456789012345",
+                "title": "Title",
+                "description": "Description",
+                "channel": "Creator",
+                "duration": 12.1,
+                "formats": ({"vcodec": "h264"},),
+            },
+            "123456789012345",
+            "https://www.facebook.com/watch?v=123456789012345",
+        ),
+        (
+            SubmittedSource(
+                Platform.FACEBOOK,
+                "https://www.facebook.com/reel/123456789012345",
+            ),
+            {
+                "id": "123456789012345",
+                "extractor_key": "FacebookReel",
+                "webpage_url": "https://www.facebook.com/reel/123456789012345",
+                "title": "Title",
+                "description": "Description",
+                "channel": "Creator",
+                "duration": 12.1,
+                "formats": ({"vcodec": "h264"},),
+            },
+            "123456789012345",
+            "https://www.facebook.com/reel/123456789012345",
+        ),
+    ),
+)
+def test_normalize_processed_social_metadata(
+    submitted: SubmittedSource,
+    metadata: Mapping[str, object],
+    expected_video_id: str,
+    expected_url: str,
+) -> None:
+    """Social metadata uses provider-authoritative identity and fields."""
+    normalized = normalize_processed_metadata(metadata, submitted)
+
+    assert normalized.video_id == expected_video_id
+    assert normalized.canonical_url == expected_url
+    assert normalized.title == "Title"
+    assert normalized.description == "Description"
+    assert normalized.channel == "Creator"
+    assert normalized.duration_seconds == 13
+    assert normalized.declared_language is None
