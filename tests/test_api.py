@@ -74,6 +74,9 @@ YOUTUBE_URL_FORMS = (
 FACEBOOK_CANONICAL_WATCH_URL = "https://www.facebook.com/watch?v=123456789012345"
 FACEBOOK_SHORT_URL = "https://fb.watch/short_1"
 INSTAGRAM_REEL_URL = "https://www.instagram.com/reel/C0social_1"
+X_STATUS_ID = "1234567890123456789"
+X_CANONICAL_STATUS_URL = f"https://x.com/creator/status/{X_STATUS_ID}"
+X_SHORT_URL = "https://t.co/short_1"
 _INSTAGRAM_SOCIAL_PATHS = (
     "p/C0social_1",
     "tv/C0social_1",
@@ -91,18 +94,71 @@ _FACEBOOK_SOCIAL_PATHS = (
     "creator.page-name/series_1/videos/123456789012345",
     "creator.page-name/posts/123456789012345",
 )
+_X_SOCIAL_PATHS = (
+    f"creator/status/{X_STATUS_ID}",
+    f"creator/status/{X_STATUS_ID}/video/1",
+    f"i/web/status/{X_STATUS_ID}",
+    f"i/web/status/{X_STATUS_ID}/video/1",
+    f"statuses/{X_STATUS_ID}",
+    f"statuses/{X_STATUS_ID}/video/1",
+)
+_X_SOCIAL_HOSTS = (
+    "x.com",
+    "www.x.com",
+    "m.x.com",
+    "mobile.x.com",
+    "twitter.com",
+    "www.twitter.com",
+    "m.twitter.com",
+    "mobile.twitter.com",
+)
 SOCIAL_URL_CASES = (
     tuple(
-        (Platform.INSTAGRAM, f"https://{host}/{path}")
+        (
+            Platform.INSTAGRAM,
+            f"https://{host}/{path}",
+            f"https://{host}/{path}",
+            f"https://{host}/{path}",
+        )
         for host in ("instagram.com", "www.instagram.com")
         for path in _INSTAGRAM_SOCIAL_PATHS
     )
     + tuple(
-        (Platform.FACEBOOK, f"https://{host}/{path}")
+        (
+            Platform.FACEBOOK,
+            f"https://{host}/{path}",
+            f"https://{host}/{path}",
+            f"https://{host}/{path}",
+        )
         for host in ("facebook.com", "www.facebook.com", "m.facebook.com")
         for path in _FACEBOOK_SOCIAL_PATHS
     )
-    + ((Platform.FACEBOOK, FACEBOOK_SHORT_URL),)
+    + (
+        (
+            Platform.FACEBOOK,
+            FACEBOOK_SHORT_URL,
+            FACEBOOK_CANONICAL_WATCH_URL,
+            FACEBOOK_CANONICAL_WATCH_URL,
+        ),
+    )
+    + tuple(
+        (
+            Platform.X,
+            f"https://{host}/{path}",
+            f"https://{host}/{path}",
+            f"https://x.com/{path}",
+        )
+        for host in _X_SOCIAL_HOSTS
+        for path in _X_SOCIAL_PATHS
+    )
+    + (
+        (
+            Platform.X,
+            X_SHORT_URL,
+            f"https://twitter.com/creator/status/{X_STATUS_ID}",
+            X_CANONICAL_STATUS_URL,
+        ),
+    )
 )
 
 
@@ -144,10 +200,10 @@ def _controlled_social_metadata(
     duration: object = 1800,
     extractor_key: str | None = None,
 ) -> dict[str, object]:
-    """Return valid raw Facebook or Instagram metadata for controlled providers.
+    """Return valid raw supported-social metadata for controlled providers.
 
     Args:
-        platform: Social Platform represented by the metadata.
+        platform: Supported social Platform represented by the metadata.
         canonical_url: Provider-authoritative canonical Source URL.
         duration: Provider duration value exposed to normalization.
         extractor_key: Optional exact processed yt-dlp extractor key.
@@ -156,7 +212,7 @@ def _controlled_social_metadata(
         External-shaped metadata accepted by the social provider boundary.
 
     Raises:
-        ValueError: If platform does not identify Facebook or Instagram.
+        ValueError: If platform does not identify a supported social platform.
     """
     if platform is Platform.INSTAGRAM:
         video_id = "C0social_1"
@@ -164,8 +220,11 @@ def _controlled_social_metadata(
     elif platform is Platform.FACEBOOK:
         video_id = "123456789012345"
         default_extractor_key = "Facebook"
+    elif platform is Platform.X:
+        video_id = X_STATUS_ID
+        default_extractor_key = "Twitter"
     else:
-        raise ValueError("Controlled social metadata requires Facebook or Instagram.")
+        raise ValueError("Controlled social metadata requires a supported platform.")
 
     return {
         "id": video_id,
@@ -177,7 +236,14 @@ def _controlled_social_metadata(
         "description": "Description",
         "channel": "Creator",
         "duration": duration,
-        "formats": ({"vcodec": "h264"},),
+        "formats": (
+            {
+                "url": "https://video.twimg.com/example.mp4",
+                "format_id": "http-832",
+            }
+            if platform is Platform.X
+            else {"vcodec": "h264"},
+        ),
     }
 
 
@@ -203,6 +269,11 @@ NATIVE_TIMEOUT_CASES = (
             FACEBOOK_CANONICAL_WATCH_URL,
         ),
     ),
+    (
+        Platform.X,
+        X_CANONICAL_STATUS_URL,
+        _controlled_social_metadata(Platform.X, X_CANONICAL_STATUS_URL),
+    ),
 )
 
 SOCIAL_METADATA_STATE_CASES = tuple(
@@ -210,6 +281,7 @@ SOCIAL_METADATA_STATE_CASES = tuple(
     for platform, submitted_url in (
         (Platform.INSTAGRAM, INSTAGRAM_REEL_URL),
         (Platform.FACEBOOK, FACEBOOK_CANONICAL_WATCH_URL),
+        (Platform.X, X_CANONICAL_STATUS_URL),
     )
     for metadata_updates, expected_status, expected_code in (
         ({"formats": ({"vcodec": "none"},)}, 422, "unsupported_media"),
@@ -282,6 +354,69 @@ SOCIAL_PROVIDER_FAILURE_CASES = (
         Platform.INSTAGRAM,
         INSTAGRAM_REEL_URL,
         "There is no video in this post",
+        422,
+        "unsupported_media",
+    ),
+    (
+        Platform.X,
+        X_CANONICAL_STATUS_URL,
+        "NSFW tweet requires authentication",
+        422,
+        "unsupported_content",
+    ),
+    (
+        Platform.X,
+        X_CANONICAL_STATUS_URL,
+        "You are not authorized to view this protected tweet",
+        422,
+        "unsupported_content",
+    ),
+    (
+        Platform.X,
+        X_CANONICAL_STATUS_URL,
+        "Twitter API says: Tweet has been deleted",
+        422,
+        "unsupported_content",
+    ),
+    (
+        Platform.X,
+        X_CANONICAL_STATUS_URL,
+        "Requested tweet is unavailable",
+        422,
+        "unsupported_content",
+    ),
+    (
+        Platform.X,
+        X_CANONICAL_STATUS_URL,
+        "Suspended",
+        422,
+        "unsupported_content",
+    ),
+    (
+        Platform.X,
+        X_CANONICAL_STATUS_URL,
+        "Geo-restricted",
+        422,
+        "unsupported_content",
+    ),
+    (
+        Platform.X,
+        X_CANONICAL_STATUS_URL,
+        "Video #2 is unavailable",
+        422,
+        "unsupported_content",
+    ),
+    (
+        Platform.X,
+        X_CANONICAL_STATUS_URL,
+        "No video could be found in this tweet",
+        422,
+        "unsupported_media",
+    ),
+    (
+        Platform.X,
+        X_CANONICAL_STATUS_URL,
+        "Media #1 is not a video",
         422,
         "unsupported_media",
     ),
@@ -1017,30 +1152,38 @@ async def test_api_transcribes_current_tiktok_forms_with_one_lifespan_model(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("platform", "submitted_url"), SOCIAL_URL_CASES)
+@pytest.mark.parametrize(
+    (
+        "platform",
+        "submitted_url",
+        "provider_webpage_url",
+        "expected_canonical_url",
+    ),
+    SOCIAL_URL_CASES,
+)
 async def test_api_transcribes_every_supported_social_form_with_faster_whisper(
     tmp_path: Path,
     platform: Platform,
     submitted_url: str,
+    provider_webpage_url: str,
+    expected_canonical_url: str,
 ) -> None:
-    """Every documented Facebook and Instagram form reaches native transcription."""
-    canonical_url = (
-        FACEBOOK_CANONICAL_WATCH_URL
-        if submitted_url == FACEBOOK_SHORT_URL
-        else submitted_url
-    )
+    """Every documented supported-social form reaches native transcription."""
     extractor_key = (
         "FacebookReel"
         if platform is Platform.FACEBOOK and "/reel/" in submitted_url
         else None
     )
-    expected_video_id = (
-        "C0social_1" if platform is Platform.INSTAGRAM else "123456789012345"
-    )
+    if platform is Platform.INSTAGRAM:
+        expected_video_id = "C0social_1"
+    elif platform is Platform.FACEBOOK:
+        expected_video_id = "123456789012345"
+    else:
+        expected_video_id = X_STATUS_ID
     state = ControlledAdapterState(
         metadata_override=_controlled_social_metadata(
             platform,
-            canonical_url,
+            provider_webpage_url,
             extractor_key=extractor_key,
         )
     )
@@ -1065,7 +1208,7 @@ async def test_api_transcribes_every_supported_social_form_with_faster_whisper(
         "source": {
             "platform": platform.value,
             "video_id": expected_video_id,
-            "url": canonical_url,
+            "url": expected_canonical_url,
             "title": "Title",
             "description": "Description",
             "channel": "Creator",
@@ -1101,11 +1244,13 @@ async def test_api_transcribes_every_supported_social_form_with_faster_whisper(
             400,
             "invalid_url",
         ),
+        ("https://x.com/creator", 400, "invalid_url"),
         (
-            "https://x.com/creator/status/1234567890123456789",
+            f"https://twitter.com/creator/status/{X_STATUS_ID}/photo/1",
             400,
-            "unsupported_platform",
+            "invalid_url",
         ),
+        ("https://t.co/short_1/extra", 400, "invalid_url"),
     ),
 )
 async def test_api_rejects_invalid_social_url_forms_before_provider_access(
@@ -1114,7 +1259,7 @@ async def test_api_rejects_invalid_social_url_forms_before_provider_access(
     expected_status: int,
     expected_code: str,
 ) -> None:
-    """Invalid social forms and disabled X never reach a provider boundary."""
+    """Invalid supported-social forms never reach a provider boundary."""
     state = ControlledAdapterState()
     application = create_app(
         app_config(),
@@ -1164,7 +1309,7 @@ async def test_api_rejects_social_metadata_states_safely(
     expected_status: int,
     expected_code: str,
 ) -> None:
-    """Non-video, collection, live, and over-limit social metadata is bounded."""
+    """Non-video, collection, live, and over-limit supported-social metadata is bounded."""
     metadata = _controlled_social_metadata(platform, submitted_url)
     metadata.update(metadata_updates)
     state = ControlledAdapterState(metadata_override=metadata)

@@ -64,7 +64,7 @@ async def _cancel_and_await[T](task: asyncio.Task[T]) -> None:
     summary="Create a transcript",
     description=(
         "Retrieve a normalized timed transcript for one public Facebook, Instagram, "
-        "TikTok, or YouTube video."
+        "TikTok, X, or YouTube video."
     ),
     response_description="Canonical source metadata and its transcript.",
     tags=["transcripts"],

@@ -12,6 +12,7 @@ from pytest import MonkeyPatch
 from textify.transcription.exceptions import (
     InvalidMediaDurationError,
     InvalidUrlError,
+    UnsupportedMediaError,
     UnsupportedPlatformError,
 )
 from textify.transcription.inspection import (
@@ -184,7 +185,7 @@ def test_metadata_extractor_accepts_selected_media_at_byte_limit(
 
     assert extracted.metadata == metadata
     assert FakeYoutubeDL.captured_options[0]["allowed_extractors"] == [
-        r"^(?:facebook|facebook:reel|generic|instagram|tiktok|vm\.tiktok|youtube)$"
+        r"^(?:facebook|facebook:reel|generic|instagram|tiktok|twitter|twitter:shortener|vm\.tiktok|youtube)$"
     ]
 
 
@@ -331,6 +332,54 @@ def test_normalize_processed_metadata_carries_safe_declared_language(
             "123456789012345",
             "https://www.facebook.com/reel/123456789012345",
         ),
+        (
+            SubmittedSource(
+                Platform.X,
+                "https://x.com/creator/status/1234567890123456789",
+            ),
+            {
+                "id": "1234567890123456789",
+                "extractor_key": "Twitter",
+                "webpage_url": "https://x.com/creator/status/1234567890123456789",
+                "title": "Title",
+                "description": "Description",
+                "channel": "Creator",
+                "duration": 12.1,
+                "formats": (
+                    {
+                        "url": "https://video.twimg.com/example.mp4",
+                        "format_id": "http-832",
+                    },
+                ),
+            },
+            "1234567890123456789",
+            "https://x.com/creator/status/1234567890123456789",
+        ),
+        (
+            SubmittedSource(
+                Platform.X,
+                "https://twitter.com/creator/status/1234567890123456789",
+            ),
+            {
+                "id": "1234567890123456789",
+                "extractor_key": "Twitter",
+                "webpage_url": (
+                    "https://twitter.com/creator/status/1234567890123456789"
+                ),
+                "title": "Title",
+                "description": "Description",
+                "channel": "Creator",
+                "duration": 12.1,
+                "formats": (
+                    {
+                        "url": "https://video.twimg.com/example.mp4",
+                        "format_id": "http-832",
+                    },
+                ),
+            },
+            "1234567890123456789",
+            "https://x.com/creator/status/1234567890123456789",
+        ),
     ),
 )
 def test_normalize_processed_social_metadata(
@@ -349,3 +398,29 @@ def test_normalize_processed_social_metadata(
     assert normalized.channel == "Creator"
     assert normalized.duration_seconds == 13
     assert normalized.declared_language is None
+
+
+def test_normalize_processed_metadata_rejects_missing_codec_http_facebook_format() -> (
+    None
+):
+    """Only X accepts yt-dlp's missing-codec direct HTTP video formats."""
+    metadata = {
+        "id": "123456789012345",
+        "extractor_key": "Facebook",
+        "webpage_url": "https://www.facebook.com/watch?v=123456789012345",
+        "formats": (
+            {
+                "url": "https://video.twimg.com/example.mp4",
+                "format_id": "http-832",
+            },
+        ),
+    }
+
+    with pytest.raises(UnsupportedMediaError):
+        normalize_processed_metadata(
+            metadata,
+            SubmittedSource(
+                Platform.FACEBOOK,
+                "https://www.facebook.com/watch?v=123456789012345",
+            ),
+        )

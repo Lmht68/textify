@@ -29,7 +29,7 @@ from textify.transcription.types import (
 
 DIRECT_TIKTOK_URL = "https://www.tiktok.com/@creator/video/1234567890123456789"
 YOUTUBE_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-X_URL = "https://x.com/creator/status/1234567890123456789"
+UNKNOWN_PLATFORM_URL = "https://example.com/video/123"
 
 
 class EmptyCaptionProvider:
@@ -473,10 +473,10 @@ async def test_transcribe_cleans_inspection_audio_after_inference_failure(
 
 
 @pytest.mark.asyncio
-async def test_transcribe_rejects_still_disabled_platform_before_provider_calls(
+async def test_transcribe_rejects_unknown_platform_before_provider_calls(
     tmp_path: Path,
 ) -> None:
-    """A recognizable disabled URL does not reach any provider boundary."""
+    """An unknown-platform URL does not reach any provider boundary."""
     extractor = RecordingMetadataExtractor(tiktok_metadata())
     caption_provider = RecordingCaptionProvider()
     downloader = RecordingAudioDownloader()
@@ -490,7 +490,7 @@ async def test_transcribe_rejects_still_disabled_platform_before_provider_calls(
     )
 
     with pytest.raises(UnsupportedPlatformError):
-        await service.transcribe(X_URL)
+        await service.transcribe(UNKNOWN_PLATFORM_URL)
 
     assert extractor.calls == []
     assert caption_provider.calls == []

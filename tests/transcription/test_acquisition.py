@@ -754,5 +754,5 @@ def test_audio_downloader_enforces_progress_byte_limit(
         )
 
     assert FakeYoutubeDL.captured_options[0]["allowed_extractors"] == [
-        r"^(?:facebook|facebook:reel|generic|instagram|tiktok|vm\.tiktok|youtube)$"
+        r"^(?:facebook|facebook:reel|generic|instagram|tiktok|twitter|twitter:shortener|vm\.tiktok|youtube)$"
     ]

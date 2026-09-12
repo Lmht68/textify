@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 
 _YTDLP_OPTIONS: Final[dict[str, object]] = {
     "allowed_extractors": [
-        r"^(?:facebook|facebook:reel|generic|instagram|tiktok|vm\.tiktok|youtube)$"
+        r"^(?:facebook|facebook:reel|generic|instagram|tiktok|twitter|twitter:shortener|vm\.tiktok|youtube)$"
     ],
     "format": "bestaudio/best",
     "ignoreconfig": True,

@@ -151,17 +151,29 @@ _UNAVAILABLE_MARKERS: Final[frozenset[str]] = frozenset(
         "only available for registered users",
         "instagram sent an empty media response",
         "restricted video",
+        "requires authentication",
+        "protected tweet",
+        "tweet is unavailable",
+        "tweet has been deleted",
+        "suspended",
     }
 )
+_INDEXED_VIDEO_UNAVAILABLE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\bvideo #[1-9][0-9]* is unavailable\b"
+)
 _UNSUPPORTED_MEDIA_MARKERS: Final[frozenset[str]] = frozenset(
-    {"there is no video in this post"}
+    {
+        "there is no video in this post",
+        "no video could be found in this tweet",
+        "is not a video",
+    }
 )
 _COLLECTION_TYPES: Final[frozenset[str]] = frozenset(
     {"playlist", "multi_video", "url", "url_transparent"}
 )
 _METADATA_YTDLP_OPTIONS: Final[dict[str, object]] = {
     "allowed_extractors": [
-        r"^(?:facebook|facebook:reel|generic|instagram|tiktok|vm\.tiktok|youtube)$"
+        r"^(?:facebook|facebook:reel|generic|instagram|tiktok|twitter|twitter:shortener|vm\.tiktok|youtube)$"
     ],
     "ignoreconfig": True,
     "no_warnings": True,
@@ -628,7 +640,7 @@ def normalize_processed_metadata(
             raise _invalid_source_error("unexpected_extractor")
         video_id = _social_video_id(metadata)
         canonical_url = _canonical_social_url(metadata, submitted.platform)
-        _validate_social_formats(metadata)
+        _validate_social_formats(metadata, submitted.platform)
 
     title = _normalize_title(metadata, submitted.platform)
     description = _optional_text(metadata, "description") or ""
@@ -1030,7 +1042,13 @@ def _canonical_social_url(metadata: Mapping[str, object], platform: Platform) ->
     except InvalidUrlError:
         raise
     return urlunsplit(
-        (parsed_url.scheme, parsed_url.netloc, parsed_url.path, parsed_url.query, "")
+        (
+            parsed_url.scheme,
+            "x.com" if platform is Platform.X else parsed_url.netloc,
+            parsed_url.path,
+            parsed_url.query,
+            "",
+        )
     )
 
 
@@ -1090,7 +1108,10 @@ def _normalize_duration(metadata: Mapping[str, object]) -> int:
         raise _invalid_media_duration_error("duration_normalization_failed") from exc
 
 
-def _validate_social_formats(metadata: Mapping[str, object]) -> None:
+def _validate_social_formats(
+    metadata: Mapping[str, object],
+    platform: Platform,
+) -> None:
     formats = metadata.get("formats", _MISSING)
     if formats is _MISSING:
         raise _metadata_provider_error("missing_formats")
@@ -1109,6 +1130,18 @@ def _validate_social_formats(metadata: Mapping[str, object]) -> None:
         if video_codec is not None and not isinstance(video_codec, str):
             raise _metadata_provider_error("invalid_video_codec")
         if video_codec and video_codec.casefold() != "none":
+            has_video = True
+            continue
+        format_url = item.get("url")
+        format_id = item.get("format_id")
+        if (
+            platform is Platform.X
+            and "vcodec" not in item
+            and isinstance(format_url, str)
+            and format_url.startswith(("http://", "https://"))
+            and isinstance(format_id, str)
+            and (format_id == "http" or format_id.startswith("http-"))
+        ):
             has_video = True
     if not has_video:
         raise _unsupported_media_error("no_video_format")
@@ -1175,7 +1208,10 @@ def _is_timeout_exception(error: BaseException) -> bool:
 
 def _is_unavailable_error(message: str) -> bool:
     normalized_message = message.casefold()
-    return any(marker in normalized_message for marker in _UNAVAILABLE_MARKERS)
+    return (
+        any(marker in normalized_message for marker in _UNAVAILABLE_MARKERS)
+        or _INDEXED_VIDEO_UNAVAILABLE_PATTERN.search(normalized_message) is not None
+    )
 
 
 def _is_unsupported_media_error(message: str) -> bool:

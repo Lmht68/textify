@@ -168,6 +168,7 @@ class TranscriptService:
             Platform.YOUTUBE,
             Platform.INSTAGRAM,
             Platform.FACEBOOK,
+            Platform.X,
         ):
             raise UnsupportedPlatformError()
 
