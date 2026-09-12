@@ -218,7 +218,10 @@ class TranscriptService:
                 self._release_admission,
             )
             prepared_audio = None
-            transcript = await self._whisper_acquirer.acquire(submitted_url, ownership)
+            transcript = await self._whisper_acquirer.acquire(
+                submitted.provider_url,
+                ownership,
+            )
             return TranscriptionResult(source, transcript)
         except MediaByteLimitExceeded as exc:
             raise UnsupportedMediaError() from exc
@@ -265,7 +268,7 @@ class TranscriptService:
         """Retrieve metadata within its full provider-operation deadline.
 
         Args:
-            provider_url: Validated minimal provider URL.
+            provider_url: Validated provider URL.
             cancellation_event: Signal set when request work must stop.
 
         Returns:

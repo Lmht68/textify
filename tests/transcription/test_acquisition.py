@@ -22,7 +22,9 @@ from textify.transcription.config import TranscriptionConfig
 from textify.transcription.types import RawSegment, TranscriptMethod
 from textify.transcription.util import (
     MediaByteLimitExceeded,
+    _TextifyFacebookIE,
     build_yt_dlp_progress_hook,
+    create_yt_dlp,
     extract_info_with_retries,
 )
 
@@ -269,6 +271,8 @@ class FakeYoutubeDL:
     """Supply configurable yt-dlp results while recording constructor options."""
 
     captured_options: ClassVar[list[dict[str, object]]] = []
+    calls: ClassVar[list[tuple[str, bool]]] = []
+    added_extractors: ClassVar[list[object]] = []
     prepared_path: ClassVar[Path] = Path()
     progress_status: ClassVar[dict[str, object] | None] = None
     raw_metadata: ClassVar[Mapping[str, object]] = {}
@@ -277,6 +281,10 @@ class FakeYoutubeDL:
         """Capture one yt-dlp constructor option mapping."""
         self._options = options
         self.captured_options.append(options)
+
+    def add_info_extractor(self, extractor: object) -> None:
+        """Record the Textify-only Facebook extractor registration."""
+        self.added_extractors.append(extractor)
 
     def __enter__(self) -> Self:
         """Return the configured fake context."""
@@ -297,8 +305,7 @@ class FakeYoutubeDL:
         *,
         download: bool,
     ) -> Mapping[str, object]:
-        """Return configured metadata after optional transfer progress."""
-        del source_url
+        self.calls.append((source_url, download))
         if download and self.progress_status is not None:
             progress_hooks = self._options["progress_hooks"]
             assert isinstance(progress_hooks, list)
@@ -311,6 +318,40 @@ class FakeYoutubeDL:
         """Return the configured completed-media path."""
         del metadata
         return self.prepared_path
+
+
+_EXPECTED_YTDLP_POLICY: dict[str, object] = {
+    "allowed_extractors": [
+        r"^(?:facebook|facebook:reel|instagram|tiktok|twitter|twitter:shortener|vm\.tiktok|youtube)$"
+    ],
+    "format": "bestaudio/best",
+    "ignoreconfig": True,
+    "quiet": True,
+    "no_warnings": True,
+    "noplaylist": True,
+    "playlist_items": "1",
+    "extract_flat": False,
+    "ignoreerrors": False,
+    "cookiefile": None,
+    "cookiesfrombrowser": None,
+    "usenetrc": False,
+    "netrc_location": None,
+    "netrc_cmd": None,
+    "remote_components": [],
+    "external_downloader": {"default": "native"},
+    "external_downloader_args": {},
+    "force_generic_extractor": False,
+    "enable_file_urls": False,
+    "default_search": None,
+    "prefer_insecure": False,
+}
+
+
+def _assert_shared_ytdlp_policy(options: Mapping[str, object]) -> None:
+    """Assert the complete non-overridable yt-dlp policy on one operation."""
+    assert {
+        option_name: options[option_name] for option_name in _EXPECTED_YTDLP_POLICY
+    } == _EXPECTED_YTDLP_POLICY
 
 
 def isolated_transcription_config() -> TranscriptionConfig:
@@ -724,7 +765,66 @@ def test_yt_dlp_progress_hook_enforces_deadline_and_cancellation() -> None:
         limited_hook({"status": "finished", "total_bytes": 101})
 
 
-def test_audio_downloader_enforces_progress_byte_limit(
+def test_create_yt_dlp_registers_restricted_facebook_extractor() -> None:
+    """Factory replaces Facebook extraction without enabling Generic extraction."""
+    youtube_dl = create_yt_dlp()
+    try:
+        extractors = vars(youtube_dl)["_ies"]
+        assert isinstance(extractors, dict)
+        facebook_extractor = extractors["Facebook"]
+        assert isinstance(facebook_extractor, _TextifyFacebookIE)
+        assert facebook_extractor.ie_key() == "Facebook"
+        assert facebook_extractor.IE_NAME == "facebook"
+        assert _TextifyFacebookIE.suitable("https://fb.watch/short_1")
+        assert _TextifyFacebookIE.suitable("https://www.facebook.com/share/v/short_1")
+        assert _TextifyFacebookIE.suitable(
+            "https://m.facebook.com/share/owner/kind/short_1"
+        )
+        assert not _TextifyFacebookIE.suitable("http://fb.watch/short_1")
+        assert not _TextifyFacebookIE.suitable("https://fb.watch/short_1/extra")
+        assert not _TextifyFacebookIE.suitable(
+            "https://www.instagram.com/share/v/short_1"
+        )
+        assert "Generic" not in extractors
+    finally:
+        youtube_dl.close()
+
+
+def test_create_yt_dlp_prevents_operation_policy_overrides(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Operation options retain output controls but cannot weaken shared policy."""
+
+    def progress_hook(status: dict[str, object]) -> None:
+        """Accept the test transfer status without side effects."""
+        del status
+
+    FakeYoutubeDL.captured_options.clear()
+    FakeYoutubeDL.calls.clear()
+    FakeYoutubeDL.added_extractors.clear()
+    monkeypatch.setattr(
+        "textify.transcription.util.yt_dlp.YoutubeDL",
+        FakeYoutubeDL,
+    )
+
+    create_yt_dlp(
+        {
+            "outtmpl": "custom.%(ext)s",
+            "progress_hooks": [progress_hook],
+            "allowed_extractors": ["generic"],
+            "quiet": False,
+        }
+    )
+
+    options = FakeYoutubeDL.captured_options[0]
+    assert set(options) == {*_EXPECTED_YTDLP_POLICY, "outtmpl", "progress_hooks"}
+    _assert_shared_ytdlp_policy(options)
+    assert options["outtmpl"] == "custom.%(ext)s"
+    assert options["progress_hooks"] == [progress_hook]
+    assert len(FakeYoutubeDL.added_extractors) == 1
+
+
+def test_yt_dlp_audio_download_enforces_shared_policy(
     monkeypatch: MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -734,12 +834,14 @@ def test_audio_downloader_enforces_progress_byte_limit(
     FakeYoutubeDL.captured_options.clear()
     FakeYoutubeDL.raw_metadata = {}
     FakeYoutubeDL.prepared_path = destination / "audio.webm"
+    FakeYoutubeDL.calls.clear()
+    FakeYoutubeDL.added_extractors.clear()
     FakeYoutubeDL.progress_status = {
         "status": "downloading",
         "downloaded_bytes": 101,
     }
     monkeypatch.setattr(
-        "textify.transcription.acquisition.yt_dlp.YoutubeDL",
+        "textify.transcription.util.yt_dlp.YoutubeDL",
         FakeYoutubeDL,
     )
 
@@ -753,6 +855,17 @@ def test_audio_downloader_enforces_progress_byte_limit(
             cancellation_event=threading.Event(),
         )
 
-    assert FakeYoutubeDL.captured_options[0]["allowed_extractors"] == [
-        r"^(?:facebook|facebook:reel|generic|instagram|tiktok|twitter|twitter:shortener|vm\.tiktok|youtube)$"
+    assert FakeYoutubeDL.calls == [
+        ("https://www.tiktok.com/@creator/video/1234567890123456789", True)
     ]
+    options = FakeYoutubeDL.captured_options[0]
+    assert set(options) == {*_EXPECTED_YTDLP_POLICY, "outtmpl", "progress_hooks"}
+    _assert_shared_ytdlp_policy(options)
+    outtmpl = options["outtmpl"]
+    assert isinstance(outtmpl, str)
+    assert Path(outtmpl).name == "audio.%(ext)s"
+    progress_hooks = options["progress_hooks"]
+    assert isinstance(progress_hooks, list)
+    assert len(progress_hooks) == 1
+    assert callable(progress_hooks[0])
+    assert len(FakeYoutubeDL.added_extractors) == 1

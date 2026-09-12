@@ -49,31 +49,66 @@ from textify.transcription.types import (
 )
 
 DIRECT_TIKTOK_URL = "https://www.tiktok.com/@creator/video/1234567890123456789"
-SHORT_TIKTOK_URL = "https://vm.tiktok.com/abcdefgh"
+TIKTOK_URL_CASES = (
+    (
+        "https://www.tiktok.com/@creator/video/1234567890123456789",
+        "https://www.tiktok.com/@creator/video/1234567890123456789",
+    ),
+    (
+        "https://www.tiktok.com/embed/1234567890123456789",
+        "https://www.tiktok.com/embed/1234567890123456789",
+    ),
+    ("https://www.tiktok.com/t/abcdefgh", "https://www.tiktok.com/t/abcdefgh"),
+    ("https://vm.tiktok.com/abcdefgh", "https://vm.tiktok.com/abcdefgh"),
+    ("https://vt.tiktok.com/abcdefgh", "https://vt.tiktok.com/abcdefgh"),
+    (
+        (
+            "https://www.tiktok.com/@creator/video/1234567890123456789"
+            "?is_from_webapp=1&sender_device=pc&web_id=7615327134046848533"
+            "#fragment"
+        ),
+        (
+            "https://www.tiktok.com/@creator/video/1234567890123456789"
+            "?is_from_webapp=1&sender_device=pc&web_id=7615327134046848533"
+        ),
+    ),
+    (
+        "https://www.tiktok.com/@creator/video/1234567890123456789?V=1",
+        "https://www.tiktok.com/@creator/video/1234567890123456789?V=1",
+    ),
+)
 YOUTUBE_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-YOUTUBE_URL_FORMS = (
-    "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-    "http://youtube.com/watch?v=dQw4w9WgXcQ",
-    "https://m.youtube.com/watch?v=dQw4w9WgXcQ",
-    "https://music.youtube.com/watch?v=dQw4w9WgXcQ",
+YOUTUBE_URL_FORMS = tuple(
+    f"https://{host}/{path}"
+    for host in (
+        "youtube.com",
+        "www.youtube.com",
+        "m.youtube.com",
+        "music.youtube.com",
+    )
+    for path in (
+        "watch?v=dQw4w9WgXcQ",
+        "shorts/dQw4w9WgXcQ",
+        "embed/dQw4w9WgXcQ",
+        "live/dQw4w9WgXcQ",
+    )
+) + (
     "https://youtu.be/dQw4w9WgXcQ",
-    "http://youtu.be/dQw4w9WgXcQ",
-    "https://www.youtube.com/shorts/dQw4w9WgXcQ",
-    "https://m.youtube.com/shorts/dQw4w9WgXcQ",
-    "https://www.youtube.com/embed/dQw4w9WgXcQ",
-    "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ",
-    "https://www.youtube.com/live/dQw4w9WgXcQ",
-    "https://youtube.com/live/dQw4w9WgXcQ",
-    "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=43",
-    "https://www.youtube.com/watch?v=dQw4w9WgXcQ&si=abc#fragment",
-    "https://www.youtube.com/shorts/dQw4w9WgXcQ?feature=share#fragment",
-    "https://www.youtube.com/embed/dQw4w9WgXcQ?start=43",
-    "https://youtu.be/dQw4w9WgXcQ?si=abc&t=43#fragment",
+    "https://www.youtube.com/watch?v=dQw4w9WgXcQ&utm_source=test#fragment",
 )
 
 FACEBOOK_CANONICAL_WATCH_URL = "https://www.facebook.com/watch?v=123456789012345"
 FACEBOOK_SHORT_URL = "https://fb.watch/short_1"
 INSTAGRAM_REEL_URL = "https://www.instagram.com/reel/C0social_1"
+FACEBOOK_SHARE_ID = "1HQUctaBZS"
+FACEBOOK_SHARED_URL = f"https://www.facebook.com/share/v/{FACEBOOK_SHARE_ID}/"
+FACEBOOK_SHARE_PROVIDER_URL = f"https://www.facebook.com/share/v/{FACEBOOK_SHARE_ID}"
+INSTAGRAM_REEL_ID = "DbL1byRmp4g"
+INSTAGRAM_SHARED_REEL_URL = (
+    f"https://www.instagram.com/reel/{INSTAGRAM_REEL_ID}/"
+    "?utm_source=ig_web_copy_link&igsh=MzRlODBiNWFlZA="
+)
+INSTAGRAM_REEL_PROVIDER_URL = f"https://www.instagram.com/reel/{INSTAGRAM_REEL_ID}"
 X_STATUS_ID = "1234567890123456789"
 X_CANONICAL_STATUS_URL = f"https://x.com/creator/status/{X_STATUS_ID}"
 X_SHORT_URL = "https://t.co/short_1"
@@ -119,6 +154,7 @@ SOCIAL_URL_CASES = (
             f"https://{host}/{path}",
             f"https://{host}/{path}",
             f"https://{host}/{path}",
+            f"https://{host}/{path}",
         )
         for host in ("instagram.com", "www.instagram.com")
         for path in _INSTAGRAM_SOCIAL_PATHS
@@ -126,6 +162,7 @@ SOCIAL_URL_CASES = (
     + tuple(
         (
             Platform.FACEBOOK,
+            f"https://{host}/{path}",
             f"https://{host}/{path}",
             f"https://{host}/{path}",
             f"https://{host}/{path}",
@@ -137,6 +174,7 @@ SOCIAL_URL_CASES = (
         (
             Platform.FACEBOOK,
             FACEBOOK_SHORT_URL,
+            FACEBOOK_SHORT_URL,
             FACEBOOK_CANONICAL_WATCH_URL,
             FACEBOOK_CANONICAL_WATCH_URL,
         ),
@@ -144,6 +182,7 @@ SOCIAL_URL_CASES = (
     + tuple(
         (
             Platform.X,
+            f"https://{host}/{path}",
             f"https://{host}/{path}",
             f"https://{host}/{path}",
             f"https://x.com/{path}",
@@ -155,7 +194,29 @@ SOCIAL_URL_CASES = (
         (
             Platform.X,
             X_SHORT_URL,
+            X_SHORT_URL,
             f"https://twitter.com/creator/status/{X_STATUS_ID}",
+            X_CANONICAL_STATUS_URL,
+        ),
+        (
+            Platform.INSTAGRAM,
+            "https://www.instagram.com/reel/C0social_1?utm_source=test#fragment",
+            "https://www.instagram.com/reel/C0social_1?utm_source=test",
+            "https://www.instagram.com/reel/C0social_1?utm_source=test#fragment",
+            "https://www.instagram.com/reel/C0social_1",
+        ),
+        (
+            Platform.FACEBOOK,
+            "https://www.facebook.com/watch?v=123456789012345&utm_source=test#fragment",
+            "https://www.facebook.com/watch?v=123456789012345&utm_source=test",
+            "https://www.facebook.com/watch?v=123456789012345&utm_source=test#fragment",
+            FACEBOOK_CANONICAL_WATCH_URL,
+        ),
+        (
+            Platform.X,
+            f"https://twitter.com/creator/status/{X_STATUS_ID}?utm_source=test#fragment",
+            f"https://twitter.com/creator/status/{X_STATUS_ID}?utm_source=test",
+            f"https://mobile.twitter.com/creator/status/{X_STATUS_ID}?utm_source=test#fragment",
             X_CANONICAL_STATUS_URL,
         ),
     )
@@ -185,6 +246,7 @@ def _controlled_youtube_metadata() -> dict[str, object]:
     """Return valid raw YouTube metadata with a declared original language."""
     return {
         "id": "dQw4w9WgXcQ",
+        "extractor_key": "Youtube",
         "title": "Title",
         "description": "Description",
         "channel": "Creator",
@@ -199,6 +261,7 @@ def _controlled_social_metadata(
     *,
     duration: object = 1800,
     extractor_key: str | None = None,
+    video_id: str | None = None,
 ) -> dict[str, object]:
     """Return valid raw supported-social metadata for controlled providers.
 
@@ -207,6 +270,7 @@ def _controlled_social_metadata(
         canonical_url: Provider-authoritative canonical Source URL.
         duration: Provider duration value exposed to normalization.
         extractor_key: Optional exact processed yt-dlp extractor key.
+        video_id: Optional provider video identifier.
 
     Returns:
         External-shaped metadata accepted by the social provider boundary.
@@ -215,19 +279,19 @@ def _controlled_social_metadata(
         ValueError: If platform does not identify a supported social platform.
     """
     if platform is Platform.INSTAGRAM:
-        video_id = "C0social_1"
+        default_video_id = "C0social_1"
         default_extractor_key = "Instagram"
     elif platform is Platform.FACEBOOK:
-        video_id = "123456789012345"
+        default_video_id = "123456789012345"
         default_extractor_key = "Facebook"
     elif platform is Platform.X:
-        video_id = X_STATUS_ID
+        default_video_id = X_STATUS_ID
         default_extractor_key = "Twitter"
     else:
         raise ValueError("Controlled social metadata requires a supported platform.")
 
     return {
-        "id": video_id,
+        "id": default_video_id if video_id is None else video_id,
         "extractor_key": (
             default_extractor_key if extractor_key is None else extractor_key
         ),
@@ -448,7 +512,7 @@ class ApiMetadataExtractor:
 
     def extract(
         self,
-        canonical_url: str,
+        provider_url: str,
         *,
         deadline: float,
         cancellation_event: threading.Event,
@@ -456,7 +520,7 @@ class ApiMetadataExtractor:
         """Return valid TikTok metadata for one provider URL.
 
         Args:
-            canonical_url: Validated TikTok provider URL.
+            provider_url: Validated TikTok provider URL.
             deadline: Monotonic absolute metadata deadline.
             cancellation_event: Cooperative request-cancellation signal.
 
@@ -464,7 +528,7 @@ class ApiMetadataExtractor:
             External-shaped metadata accepted by the provider boundary.
         """
         del deadline, cancellation_event
-        self.calls.append(canonical_url)
+        self.calls.append(provider_url)
         return ExtractedMetadata(
             {
                 "id": "1234567890123456789",
@@ -480,7 +544,7 @@ class ApiMetadataExtractor:
 
 
 class ApiAudioDownloader:
-    """Create request-owned audio while recording the submitted URL."""
+    """Create request-owned audio while recording the validated provider URL."""
 
     def __init__(self) -> None:
         """Initialize call and directory recording."""
@@ -498,7 +562,7 @@ class ApiAudioDownloader:
         """Create a deterministic request-owned audio file.
 
         Args:
-            source_url: Original submitted TikTok URL.
+            source_url: Validated provider URL.
             destination: Request-scoped temporary directory.
             deadline: Monotonic absolute audio-download deadline.
             cancellation_event: Cooperative request-cancellation signal.
@@ -709,13 +773,13 @@ class ControlledMetadataExtractor:
 
     def extract(
         self,
-        canonical_url: str,
+        provider_url: str,
         *,
         deadline: float,
         cancellation_event: threading.Event,
     ) -> ExtractedMetadata:
         """Return metadata after the configured synchronous test behavior."""
-        self._state.metadata_calls.append(canonical_url)
+        self._state.metadata_calls.append(provider_url)
         self._state.metadata_deadlines.append(deadline)
         self._state.call_order.append("metadata")
         self._state.metadata_entered.set()
@@ -732,7 +796,7 @@ class ControlledMetadataExtractor:
             raise self._state.metadata_failure
         if self._state.metadata_override is not None:
             return ExtractedMetadata(self._state.metadata_override)
-        if canonical_url == YOUTUBE_URL:
+        if provider_url == YOUTUBE_URL or provider_url.startswith(f"{YOUTUBE_URL}&"):
             return ExtractedMetadata(_controlled_youtube_metadata())
         return ExtractedMetadata(_controlled_tiktok_metadata())
 
@@ -1110,12 +1174,13 @@ async def test_api_fails_startup_before_model_when_temporary_media_capacity_is_l
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("submitted_url", (DIRECT_TIKTOK_URL, SHORT_TIKTOK_URL))
-async def test_api_transcribes_current_tiktok_forms_with_one_lifespan_model(
+@pytest.mark.parametrize(("submitted_url", "expected_provider_url"), TIKTOK_URL_CASES)
+async def test_api_transcribes_every_supported_tiktok_form(
     tmp_path: Path,
     submitted_url: str,
+    expected_provider_url: str,
 ) -> None:
-    """Readiness and direct or short TikTok requests work without provider I/O."""
+    """Every documented TikTok form reaches native transcription."""
     factory = CountingAdaptersFactory()
     application = create_app(
         app_config(),
@@ -1144,7 +1209,8 @@ async def test_api_transcribes_current_tiktok_forms_with_one_lifespan_model(
         "text": "One",
     }
     assert factory.calls == 1
-    assert factory.audio_downloaders[0].calls == [submitted_url]
+    assert factory.audio_downloaders[0].calls == [expected_provider_url]
+    assert factory.metadata_extractors[0].calls == [expected_provider_url]
     assert all(
         not directory.exists()
         for directory in factory.audio_downloaders[0].request_directories
@@ -1156,6 +1222,7 @@ async def test_api_transcribes_current_tiktok_forms_with_one_lifespan_model(
     (
         "platform",
         "submitted_url",
+        "expected_provider_url",
         "provider_webpage_url",
         "expected_canonical_url",
     ),
@@ -1165,6 +1232,7 @@ async def test_api_transcribes_every_supported_social_form_with_faster_whisper(
     tmp_path: Path,
     platform: Platform,
     submitted_url: str,
+    expected_provider_url: str,
     provider_webpage_url: str,
     expected_canonical_url: str,
 ) -> None:
@@ -1222,8 +1290,8 @@ async def test_api_transcribes_every_supported_social_form_with_faster_whisper(
         },
     }
     assert factory.calls == 1
-    assert state.metadata_calls == [submitted_url]
-    assert state.download_calls == [submitted_url]
+    assert state.metadata_calls == [expected_provider_url]
+    assert state.download_calls == [expected_provider_url]
     assert state.call_order == ["metadata", "download", "native"]
     assert state.caption_list_calls == []
     assert state.caption_fetch_calls == []
@@ -1234,32 +1302,136 @@ async def test_api_transcribes_every_supported_social_form_with_faster_whisper(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("submitted_url", "expected_status", "expected_code"),
     (
-        ("https://www.instagram.com/creator", 400, "invalid_url"),
-        ("https://www.facebook.com/creator", 400, "invalid_url"),
-        ("https://www.facebook.com/share/some-owner/share_1", 400, "invalid_url"),
+        "platform",
+        "submitted_url",
+        "canonical_url",
+        "expected_provider_url",
+        "video_id",
+    ),
+    (
         (
-            "https://www.facebook.com/creator/videos/series_1/123456789012345",
-            400,
-            "invalid_url",
+            Platform.INSTAGRAM,
+            INSTAGRAM_SHARED_REEL_URL,
+            INSTAGRAM_REEL_PROVIDER_URL,
+            (
+                f"{INSTAGRAM_REEL_PROVIDER_URL}?utm_source=ig_web_copy_link"
+                "&igsh=MzRlODBiNWFlZA="
+            ),
+            INSTAGRAM_REEL_ID,
         ),
-        ("https://x.com/creator", 400, "invalid_url"),
         (
-            f"https://twitter.com/creator/status/{X_STATUS_ID}/photo/1",
-            400,
-            "invalid_url",
+            Platform.FACEBOOK,
+            FACEBOOK_SHARED_URL,
+            FACEBOOK_SHARE_PROVIDER_URL,
+            FACEBOOK_SHARE_PROVIDER_URL,
+            FACEBOOK_SHARE_ID,
         ),
-        ("https://t.co/short_1/extra", 400, "invalid_url"),
     ),
 )
-async def test_api_rejects_invalid_social_url_forms_before_provider_access(
+async def test_api_transcribes_social_urls_with_single_trailing_slash(
+    tmp_path: Path,
+    platform: Platform,
+    submitted_url: str,
+    canonical_url: str,
+    expected_provider_url: str,
+    video_id: str,
+) -> None:
+    """Supported social trailing slashes normalize before provider access."""
+    state = ControlledAdapterState(
+        metadata_override=_controlled_social_metadata(
+            platform,
+            canonical_url,
+            video_id=video_id,
+        )
+    )
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path),
+        ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/transcripts", json={"url": submitted_url}
+            )
+
+    assert response.status_code == 200
+    assert response.json()["source"] == {
+        "platform": platform.value,
+        "video_id": video_id,
+        "url": canonical_url,
+        "title": "Title",
+        "description": "Description",
+        "channel": "Creator",
+        "duration_seconds": 1800,
+    }
+    assert state.metadata_calls == [expected_provider_url]
+    assert state.download_calls == [expected_provider_url]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("submitted_url", "expected_status", "expected_code"),
+    (
+        ("http://www.youtube.com/watch?v=dQw4w9WgXcQ", 400, "invalid_url"),
+        ("ftp://www.youtube.com/watch?v=dQw4w9WgXcQ", 400, "invalid_url"),
+        ("https://[::1", 400, "invalid_url"),
+        (
+            "https://user:password@www.youtube.com/watch?v=dQw4w9WgXcQ",
+            400,
+            "invalid_url",
+        ),
+        ("https://www.youtube.com:443/watch?v=dQw4w9WgXcQ", 400, "invalid_url"),
+        ("https://www.youtube.com/watch?v=dQw4w9WgXcQ%", 400, "invalid_url"),
+        ("https://www.youtube.com/%2Fwatch?v=dQw4w9WgXcQ", 400, "invalid_url"),
+        (
+            "https://www.tiktok.com//@creator/video/1234567890123456789",
+            400,
+            "invalid_url",
+        ),
+        (
+            "https://www.tiktok.com/@creator/video/1234567890123456789\n",
+            400,
+            "invalid_url",
+        ),
+        ("https://www.instagram.com/reel/C0social_1//", 400, "invalid_url"),
+        ("https://www.facebook.com/reel/123456789012345/", 400, "invalid_url"),
+        ("https://www.facebook.com/share/v/1HQUctaBZS//", 400, "invalid_url"),
+        ("https://twitter.com/creator/status/1234567890123456789/", 400, "invalid_url"),
+        (
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&v=dQw4w9WgXcQ",
+            400,
+            "invalid_url",
+        ),
+        (
+            "https://www.tiktok.com.evil.example/@creator/video/1234567890123456789",
+            400,
+            "invalid_url",
+        ),
+        (
+            "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ",
+            400,
+            "unsupported_platform",
+        ),
+        ("https://example.com/video/123", 400, "unsupported_platform"),
+        ("https://www.tiktok.com/@creator", 400, "invalid_url"),
+        ("https://www.youtube.com/channel/textify", 400, "invalid_url"),
+        ("https://www.instagram.com/textify", 400, "invalid_url"),
+        ("https://www.facebook.com/textify", 400, "invalid_url"),
+        ("https://x.com/textify", 400, "invalid_url"),
+    ),
+)
+async def test_api_rejects_out_of_policy_url_before_provider_access(
     tmp_path: Path,
     submitted_url: str,
     expected_status: int,
     expected_code: str,
 ) -> None:
-    """Invalid supported-social forms never reach a provider boundary."""
+    """Rejected URLs never reach a provider boundary or create request media."""
     state = ControlledAdapterState()
     application = create_app(
         app_config(),
@@ -2089,7 +2261,12 @@ async def test_api_transcribes_every_supported_youtube_form_with_captions(
             "text": "first second",
         },
     }
-    assert state.metadata_calls == [YOUTUBE_URL]
+    expected_provider_url = (
+        f"{YOUTUBE_URL}&utm_source=test"
+        if submitted_url.endswith("&utm_source=test#fragment")
+        else YOUTUBE_URL
+    )
+    assert state.metadata_calls == [expected_provider_url]
     assert state.caption_list_calls == ["dQw4w9WgXcQ"]
     assert state.caption_fetch_calls == ["original"]
     assert state.caption_translation_calls == []

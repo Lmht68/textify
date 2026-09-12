@@ -13,7 +13,6 @@ from typing import Final, Protocol, cast
 from xml.etree import ElementTree
 
 import ctranslate2
-import yt_dlp
 from faster_whisper import WhisperModel
 from langcodes import Language
 from requests.exceptions import RequestException, Timeout
@@ -48,21 +47,12 @@ from textify.transcription.types import (
 from textify.transcription.util import (
     MediaByteLimitExceeded,
     build_yt_dlp_progress_hook,
+    create_yt_dlp,
     extract_info_with_retries,
 )
 
 logger = logging.getLogger(__name__)
 
-_YTDLP_OPTIONS: Final[dict[str, object]] = {
-    "allowed_extractors": [
-        r"^(?:facebook|facebook:reel|generic|instagram|tiktok|twitter|twitter:shortener|vm\.tiktok|youtube)$"
-    ],
-    "format": "bestaudio/best",
-    "ignoreconfig": True,
-    "no_warnings": True,
-    "noplaylist": True,
-    "quiet": True,
-}
 _AUDIO_OUTPUT_TEMPLATE: Final[str] = "audio.%(ext)s"
 _WHISPER_TEMP_PREFIX: Final[str] = "textify-whisper-"
 
@@ -415,19 +405,19 @@ class YtDlpAudioDownloader:
             _AudioDownloadProviderTimeout: If yt-dlp reports a typed timeout.
         """
         request_directory = destination.resolve()
-        options = {
-            **_YTDLP_OPTIONS,
-            "outtmpl": str(request_directory / _AUDIO_OUTPUT_TEMPLATE),
-            "progress_hooks": [
-                build_yt_dlp_progress_hook(
-                    deadline=deadline,
-                    cancellation_event=cancellation_event,
-                    max_media_bytes=self._max_media_bytes,
-                )
-            ],
-        }
         try:
-            with yt_dlp.YoutubeDL(options) as youtube_dl:
+            with create_yt_dlp(
+                {
+                    "outtmpl": str(request_directory / _AUDIO_OUTPUT_TEMPLATE),
+                    "progress_hooks": [
+                        build_yt_dlp_progress_hook(
+                            deadline=deadline,
+                            cancellation_event=cancellation_event,
+                            max_media_bytes=self._max_media_bytes,
+                        )
+                    ],
+                }
+            ) as youtube_dl:
                 raw_info = extract_info_with_retries(
                     youtube_dl.extract_info,
                     source_url,
@@ -848,7 +838,7 @@ class WhisperAcquirer:
         """Acquire source audio and transcribe it under the native permit.
 
         Args:
-            source_url: Original submitted Supported Platform URL for yt-dlp.
+            source_url: Validated provider URL for yt-dlp.
             ownership: Request ownership retained when native work outlives a response.
 
         Returns:

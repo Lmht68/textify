@@ -16,7 +16,6 @@ from typing import Any, Final, Protocol, cast
 from urllib.parse import SplitResult, parse_qsl, urlencode, urlsplit, urlunsplit
 
 import av
-import yt_dlp
 from langcodes import Language
 from requests.exceptions import Timeout
 from yt_dlp.utils import DownloadCancelled, DownloadError
@@ -32,6 +31,7 @@ from textify.transcription.types import Platform, normalize_language_tag
 from textify.transcription.util import (
     MediaByteLimitExceeded,
     build_yt_dlp_progress_hook,
+    create_yt_dlp,
     extract_info_with_retries,
     raise_if_cancelled_or_expired,
 )
@@ -39,10 +39,6 @@ from textify.transcription.util import (
 logger = logging.getLogger(__name__)
 
 _MISSING = object()
-_REDACTED_LOG_VALUE: Final[str] = "[REDACTED]"
-_SENSITIVE_QUERY_PARTS: Final[frozenset[str]] = frozenset(
-    {"api", "apikey", "auth", "authorization", "key", "password", "secret", "token"}
-)
 
 _YOUTUBE_HOSTS: Final[frozenset[str]] = frozenset(
     {
@@ -51,7 +47,6 @@ _YOUTUBE_HOSTS: Final[frozenset[str]] = frozenset(
         "m.youtube.com",
         "music.youtube.com",
         "youtu.be",
-        "www.youtube-nocookie.com",
     }
 )
 _INSTAGRAM_HOSTS: Final[frozenset[str]] = frozenset(
@@ -171,23 +166,8 @@ _UNSUPPORTED_MEDIA_MARKERS: Final[frozenset[str]] = frozenset(
 _COLLECTION_TYPES: Final[frozenset[str]] = frozenset(
     {"playlist", "multi_video", "url", "url_transparent"}
 )
-_METADATA_YTDLP_OPTIONS: Final[dict[str, object]] = {
-    "allowed_extractors": [
-        r"^(?:facebook|facebook:reel|generic|instagram|tiktok|twitter|twitter:shortener|vm\.tiktok|youtube)$"
-    ],
-    "ignoreconfig": True,
-    "no_warnings": True,
-    "noplaylist": True,
-    "quiet": True,
-    "format": "bestaudio/best",
-}
-
 _AUDIO_OUTPUT_TEMPLATE: Final[str] = "audio.%(ext)s"
 _INSPECTION_TEMP_PREFIX: Final[str] = "textify-inspection-"
-_AUDIO_FALLBACK_YTDLP_OPTIONS: Final[dict[str, object]] = {
-    **_METADATA_YTDLP_OPTIONS,
-    "format": "bestaudio/best",
-}
 
 
 def _log_inspection_error(event: str, reason: str) -> None:
@@ -329,7 +309,7 @@ class MetadataExtractor(Protocol):
 
     def extract(
         self,
-        canonical_url: str,
+        provider_url: str,
         *,
         deadline: float,
         cancellation_event: threading.Event,
@@ -337,12 +317,12 @@ class MetadataExtractor(Protocol):
         """Return provider metadata and optional inspection-stage audio.
 
         Args:
-            canonical_url: Minimal provider URL produced by URL inspection.
-            deadline: Monotonic absolute deadline for metadata retrieval.
+            provider_url: Validated provider URL produced by URL inspection.
+            deadline: Monotonic absolute metadata deadline.
             cancellation_event: Signal set when request work must stop.
 
         Returns:
-            ExtractedMetadata: Raw provider metadata and prepared audio when needed.
+            Raw provider metadata and prepared audio when needed.
         """
         ...
 
@@ -369,7 +349,7 @@ class YtDlpMetadataExtractor:
 
     def extract(
         self,
-        canonical_url: str,
+        provider_url: str,
         *,
         deadline: float,
         cancellation_event: threading.Event,
@@ -377,7 +357,7 @@ class YtDlpMetadataExtractor:
         """Extract metadata and download audio when the provider omits duration.
 
         Args:
-            canonical_url: Minimal provider URL produced by URL inspection.
+            provider_url: Validated provider URL produced by URL inspection.
             deadline: Monotonic absolute deadline for metadata retrieval.
             cancellation_event: Signal set when request work must stop.
 
@@ -388,10 +368,10 @@ class YtDlpMetadataExtractor:
             MetadataRetrievalFailedError: If yt-dlp returns a non-mapping value.
             _MetadataDurationLimitExceeded: If fallback inspection exceeds the limit.
         """
-        with yt_dlp.YoutubeDL(_METADATA_YTDLP_OPTIONS) as youtube_dl:
+        with create_yt_dlp() as youtube_dl:
             raw_metadata = extract_info_with_retries(
                 youtube_dl.extract_info,
-                canonical_url,
+                provider_url,
                 download=False,
                 deadline=deadline,
                 cancellation_event=cancellation_event,
@@ -411,14 +391,14 @@ class YtDlpMetadataExtractor:
         if metadata.get("duration") is not None:
             return ExtractedMetadata(metadata)
         return self._download_audio_for_duration(
-            canonical_url,
+            provider_url,
             deadline=deadline,
             cancellation_event=cancellation_event,
         )
 
     def _download_audio_for_duration(
         self,
-        canonical_url: str,
+        provider_url: str,
         *,
         deadline: float,
         cancellation_event: threading.Event,
@@ -449,22 +429,22 @@ class YtDlpMetadataExtractor:
 
         completed = False
         try:
-            options = {
-                **_AUDIO_FALLBACK_YTDLP_OPTIONS,
-                "outtmpl": str(request_directory / _AUDIO_OUTPUT_TEMPLATE),
-                "match_filter": _duration_filter,
-                "progress_hooks": [
-                    build_yt_dlp_progress_hook(
-                        deadline=deadline,
-                        cancellation_event=cancellation_event,
-                        max_media_bytes=self._max_media_bytes,
-                    )
-                ],
-            }
-            with yt_dlp.YoutubeDL(options) as youtube_dl:
+            with create_yt_dlp(
+                {
+                    "outtmpl": str(request_directory / _AUDIO_OUTPUT_TEMPLATE),
+                    "match_filter": _duration_filter,
+                    "progress_hooks": [
+                        build_yt_dlp_progress_hook(
+                            deadline=deadline,
+                            cancellation_event=cancellation_event,
+                            max_media_bytes=self._max_media_bytes,
+                        )
+                    ],
+                }
+            ) as youtube_dl:
                 raw_metadata = extract_info_with_retries(
                     youtube_dl.extract_info,
-                    canonical_url,
+                    provider_url,
                     download=True,
                     deadline=deadline,
                     cancellation_event=cancellation_event,
@@ -528,7 +508,7 @@ def _probe_audio_duration(audio_path: Path) -> float:
 
 @dataclass(frozen=True, slots=True)
 class SubmittedSource:
-    """Carry validated provider input facts across Source inspection."""
+    """Carry validated platform identity and provider request URL facts."""
 
     platform: Platform
     provider_url: str
@@ -549,14 +529,13 @@ class NormalizedMetadata:
 
 
 def classify_submitted_url(submitted_url: str) -> SubmittedSource:
-    """Validate a submitted URL and derive its minimal provider request.
+    """Validate a submitted URL and retain provider-required parameters.
 
     Args:
         submitted_url: URL supplied by the API caller.
 
     Returns:
         SubmittedSource: Platform and provider URL facts safe for provider access.
-
     Raises:
         InvalidUrlError: If the URL is malformed or has an unsupported shape.
         UnsupportedPlatformError: If the URL uses another host.
@@ -566,36 +545,44 @@ def classify_submitted_url(submitted_url: str) -> SubmittedSource:
         if _looks_like_supported_host_trick(host):
             raise _invalid_source_error("deceptive_supported_host")
         raise _unsupported_platform_error("unsupported_host")
+    if host in _INSTAGRAM_HOSTS:
+        normalized_path = parsed_url.path.removesuffix("/")
+        _instagram_shortcode(_path_segments(normalized_path))
+        return SubmittedSource(
+            Platform.INSTAGRAM,
+            _provider_url(parsed_url._replace(path=normalized_path)),
+        )
+
+    if host in _FACEBOOK_HOSTS and parsed_url.path.startswith("/share/v/"):
+        normalized_path = parsed_url.path.removesuffix("/")
+        facebook_path_segments = _path_segments(normalized_path)
+        _facebook_identity(host, facebook_path_segments, query_pairs)
+        return SubmittedSource(
+            Platform.FACEBOOK,
+            _provider_url(parsed_url._replace(path=normalized_path)),
+        )
+
     path_segments = _path_segments(parsed_url.path)
     if host in _YOUTUBE_HOSTS:
         video_id = _youtube_video_id(host, path_segments, query_pairs)
         return SubmittedSource(
             platform=Platform.YOUTUBE,
-            provider_url=f"https://www.youtube.com/watch?v={video_id}",
+            provider_url=_youtube_provider_url(video_id, query_pairs),
             youtube_video_id=video_id,
         )
 
-    if host in _INSTAGRAM_HOSTS:
-        _reject_video_query(query_pairs)
-        _instagram_shortcode(path_segments)
-        return SubmittedSource(Platform.INSTAGRAM, _minimal_url(parsed_url))
-
     if host in _FACEBOOK_HOSTS or host in _FACEBOOK_SHORT_HOSTS:
         _facebook_identity(host, path_segments, query_pairs)
-        return SubmittedSource(Platform.FACEBOOK, _minimal_url(parsed_url))
+        return SubmittedSource(Platform.FACEBOOK, _provider_url(parsed_url))
 
     if host in _TIKTOK_HOSTS or host in _TIKTOK_SHORT_HOSTS:
-        _reject_video_query(query_pairs)
         _tiktok_identity(host, path_segments)
-        return SubmittedSource(Platform.TIKTOK, _minimal_url(parsed_url))
+        return SubmittedSource(Platform.TIKTOK, _provider_url(parsed_url))
 
     if host in _X_HOSTS or host in _X_SHORT_HOSTS:
-        _reject_video_query(query_pairs)
         _x_identity(host, path_segments)
-        return SubmittedSource(Platform.X, _minimal_url(parsed_url))
+        return SubmittedSource(Platform.X, _provider_url(parsed_url))
 
-    if _looks_like_supported_host_trick(host):
-        raise _invalid_source_error("deceptive_supported_host")
     raise _unsupported_platform_error("unsupported_host")
 
 
@@ -620,6 +607,15 @@ def normalize_processed_metadata(
         raise _metadata_provider_error("non_mapping_metadata")
     _reject_collections_and_live(metadata, submitted.platform)
 
+    expected_extractor_keys = _EXPECTED_EXTRACTOR_KEYS[submitted.platform]
+    extractor_key = metadata.get("extractor_key", _MISSING)
+    if extractor_key is _MISSING:
+        raise _metadata_provider_error("missing_extractor_key")
+    if not isinstance(extractor_key, str) or not extractor_key.strip():
+        raise _metadata_provider_error("invalid_extractor_key")
+    if extractor_key not in expected_extractor_keys:
+        raise _invalid_source_error("unexpected_extractor")
+
     if submitted.platform is Platform.YOUTUBE:
         video_id = submitted.youtube_video_id
         if video_id is None:
@@ -628,16 +624,7 @@ def normalize_processed_metadata(
         if provider_id is not _MISSING and provider_id != video_id:
             raise _metadata_provider_error("provider_video_id_mismatch")
         canonical_url = f"https://www.youtube.com/watch?v={video_id}"
-        expected_extractor_keys: frozenset[str] | None = None
     else:
-        expected_extractor_keys = _EXPECTED_EXTRACTOR_KEYS[submitted.platform]
-        extractor_key = metadata.get("extractor_key", _MISSING)
-        if extractor_key is _MISSING:
-            raise _metadata_provider_error("missing_extractor_key")
-        if not isinstance(extractor_key, str) or not extractor_key.strip():
-            raise _metadata_provider_error("invalid_extractor_key")
-        if extractor_key not in expected_extractor_keys:
-            raise _invalid_source_error("unexpected_extractor")
         video_id = _social_video_id(metadata)
         canonical_url = _canonical_social_url(metadata, submitted.platform)
         _validate_social_formats(metadata, submitted.platform)
@@ -679,6 +666,7 @@ def _declared_language(metadata: Mapping[str, object]) -> str | None:
 
 
 _EXPECTED_EXTRACTOR_KEYS: Final[dict[Platform, frozenset[str]]] = {
+    Platform.YOUTUBE: frozenset({"Youtube"}),
     Platform.INSTAGRAM: frozenset({"Instagram"}),
     Platform.FACEBOOK: frozenset({"Facebook", "FacebookReel"}),
     Platform.TIKTOK: frozenset({"TikTok"}),
@@ -704,7 +692,7 @@ def _parse_url(
         raise _invalid_source_error("malformed_url") from exc
 
     scheme = parsed_url.scheme.casefold()
-    if scheme not in {"http", "https"} or hostname is None:
+    if scheme != "https" or hostname is None:
         raise _invalid_source_error("non_https_or_missing_host")
     if username is not None or password is not None:
         raise _invalid_source_error("url_credentials")
@@ -719,45 +707,76 @@ def _parse_url(
         raise _invalid_source_error("malformed_query") from exc
 
     host = hostname.casefold()
-    if scheme == "http" and host not in {"youtube.com", "youtu.be"}:
-        raise _invalid_source_error("non_https_or_missing_host")
     if "%" in parsed_url.path:
         raise _invalid_source_error("encoded_path")
     return parsed_url, host, query_pairs
 
 
-def _reject_video_query(query_pairs: list[tuple[str, str]]) -> None:
-    if any(key.casefold() == "v" for key, _ in query_pairs):
-        raise _invalid_source_error("video_query_not_supported")
+def _video_query_values(query_pairs: list[tuple[str, str]]) -> list[str]:
+    """Return the one permitted lowercase identity-query value when present."""
+    video_query_values: list[str] = []
+    for key, value in query_pairs:
+        if key.casefold() != "v":
+            continue
+        if key != "v":
+            raise _invalid_source_error("invalid_video_query_parameter_case")
+        video_query_values.append(value)
+    if len(video_query_values) > 1:
+        raise _invalid_source_error("duplicate_video_query_parameter")
+    return video_query_values
 
 
-def _minimal_url(parsed_url: SplitResult) -> str:
+def _provider_url(parsed_url: SplitResult) -> str:
+    """Return a validated URL for yt-dlp without a non-transmitted fragment."""
     return urlunsplit(
         (
             "https",
             parsed_url.netloc.casefold(),
-            parsed_url.path.rstrip("/"),
-            _minimal_query(parsed_url.query),
+            parsed_url.path,
+            parsed_url.query,
+            "",
+        )
+    )
+
+
+def _youtube_provider_url(
+    video_id: str,
+    query_pairs: list[tuple[str, str]],
+) -> str:
+    """Return canonical YouTube routing with submitted nonidentity parameters."""
+    provider_query = urlencode(
+        (("v", video_id), *(pair for pair in query_pairs if pair[0] != "v"))
+    )
+    return urlunsplit(("https", "www.youtube.com", "/watch", provider_query, ""))
+
+
+def _minimal_url(
+    parsed_url: SplitResult,
+    *,
+    retain_video_query: bool = False,
+) -> str:
+    return urlunsplit(
+        (
+            "https",
+            parsed_url.netloc.casefold(),
+            parsed_url.path,
+            _minimal_query(parsed_url.query) if retain_video_query else "",
             "",
         )
     )
 
 
 def _minimal_query(query: str) -> str:
-    pairs = parse_qsl(query, keep_blank_values=True)
-    identity_pairs = [(key, value) for key, value in pairs if key.casefold() == "v"]
-    if len(identity_pairs) > 1:
-        raise _invalid_source_error("duplicate_video_query_parameter")
-    return f"v={identity_pairs[0][1]}" if identity_pairs else ""
+    identity_pairs = _video_query_values(parse_qsl(query, keep_blank_values=True))
+    return f"v={identity_pairs[0]}" if identity_pairs else ""
 
 
 def _path_segments(path: str) -> list[str]:
     if not path or not path.startswith("/"):
         raise _invalid_source_error("missing_path")
-    normalized_path = path.removesuffix("/")
-    if not normalized_path or normalized_path == "/":
+    if path == "/":
         raise _invalid_source_error("empty_path")
-    segments = normalized_path[1:].split("/")
+    segments = path[1:].split("/")
     if any(not segment for segment in segments):
         raise _invalid_source_error("empty_path_segment")
     return segments
@@ -768,16 +787,14 @@ def _youtube_video_id(
     path_segments: list[str],
     query_pairs: list[tuple[str, str]],
 ) -> str:
-    video_query_values = [value for key, value in query_pairs if key == "v"]
-    if len(video_query_values) > 1:
-        raise _invalid_source_error("duplicate_video_query_parameter")
+    video_query_values = _video_query_values(query_pairs)
 
     if host == "youtu.be":
         if len(path_segments) != 1:
             raise _invalid_source_error("invalid_short_video_path")
         video_id = path_segments[0]
-        if video_query_values and video_query_values[0] not in {"", video_id}:
-            raise _invalid_source_error("conflicting_video_query")
+        if video_query_values:
+            raise _invalid_source_error("short_video_query_not_supported")
     elif path_segments[0] == "watch":
         if len(path_segments) != 1 or len(video_query_values) != 1:
             raise _invalid_source_error("invalid_watch_path")
@@ -786,8 +803,8 @@ def _youtube_video_id(
         if len(path_segments) != 2:
             raise _invalid_source_error("invalid_video_path")
         video_id = path_segments[1]
-        if video_query_values and video_query_values[0] not in {"", video_id}:
-            raise _invalid_source_error("conflicting_video_query")
+        if video_query_values:
+            raise _invalid_source_error("video_path_query_not_supported")
     else:
         raise _invalid_source_error("unsupported_video_path")
 
@@ -815,53 +832,39 @@ def _facebook_identity(
     path_segments: list[str],
     query_pairs: list[tuple[str, str]],
 ) -> str:
-    query_values = [value for key, value in query_pairs if key.casefold() == "v"]
-    if len(query_values) > 1:
-        raise _invalid_source_error("duplicate_facebook_query_parameter")
-
     if host in _FACEBOOK_SHORT_HOSTS:
-        if len(path_segments) != 1 or query_values:
+        if len(path_segments) != 1:
             raise _invalid_source_error("invalid_facebook_short_path")
         return _safe_segment(path_segments[0])
 
     path = tuple(path_segments)
     if path == ("watch",):
+        query_values = _video_query_values(query_pairs)
         if len(query_values) != 1:
             raise _invalid_source_error("missing_facebook_watch_id")
         return _facebook_id(query_values[0])
     if path == ("video.php",) or path == ("video", "video.php"):
+        query_values = _video_query_values(query_pairs)
         if len(query_values) != 1:
             raise _invalid_source_error("missing_facebook_video_id")
         return _facebook_id(query_values[0])
     if len(path) == 2 and path[0] == "reel":
-        if query_values:
-            raise _invalid_source_error("facebook_reel_query")
         return _facebook_id(path[1])
     if len(path) == 3 and path[:2] == ("share", "v"):
-        if query_values:
-            raise _invalid_source_error("facebook_share_query")
         return _safe_segment(path[2])
     if len(path) == 4 and path[0] == "share":
-        if query_values:
-            raise _invalid_source_error("facebook_share_query")
         return _safe_segment(path[3])
     if len(path) == 3 and path[1] == "videos":
-        if query_values:
-            raise _invalid_source_error("facebook_query_not_supported")
         if _FACEBOOK_OWNER_PATTERN.fullmatch(path[0]) is None:
             raise _invalid_source_error("invalid_facebook_owner")
         return _facebook_id(path[2])
     if len(path) == 4 and path[2] == "videos":
-        if query_values:
-            raise _invalid_source_error("facebook_query_not_supported")
         if _FACEBOOK_OWNER_PATTERN.fullmatch(path[0]) is None:
             raise _invalid_source_error("invalid_facebook_owner")
         if _SAFE_SEGMENT_PATTERN.fullmatch(path[1]) is None:
             raise _invalid_source_error("invalid_facebook_path_segment")
         return _facebook_id(path[3])
     if len(path) == 3 and path[1] == "posts":
-        if query_values:
-            raise _invalid_source_error("facebook_query_not_supported")
         if _FACEBOOK_OWNER_PATTERN.fullmatch(path[0]) is None:
             raise _invalid_source_error("invalid_facebook_owner")
         return _facebook_id(path[2])
@@ -1036,17 +1039,35 @@ def _canonical_social_url(metadata: Mapping[str, object], platform: Platform) ->
         raise _invalid_source_error("cross_platform_redirect")
 
     try:
-        classify_submitted_url(webpage_url)
+        canonical_source = classify_submitted_url(webpage_url)
     except UnsupportedPlatformError as exc:
         raise _invalid_source_error("cross_platform_redirect") from exc
-    except InvalidUrlError:
-        raise
+
+    if canonical_source.platform is not platform:
+        raise _invalid_source_error("cross_platform_redirect")
+    return _canonical_social_provider_url(canonical_source)
+
+
+def _canonical_social_provider_url(submitted: SubmittedSource) -> str:
+    """Remove nonidentity parameters from one validated social canonical URL."""
+    parsed_url = urlsplit(submitted.provider_url)
+    path_segments = tuple(_path_segments(parsed_url.path))
+    canonical_url = _minimal_url(
+        parsed_url,
+        retain_video_query=(
+            submitted.platform is Platform.FACEBOOK
+            and path_segments in {("watch",), ("video.php",), ("video", "video.php")}
+        ),
+    )
+    if submitted.platform is not Platform.X:
+        return canonical_url
+    canonical_components = urlsplit(canonical_url)
     return urlunsplit(
         (
-            parsed_url.scheme,
-            "x.com" if platform is Platform.X else parsed_url.netloc,
-            parsed_url.path,
-            parsed_url.query,
+            "https",
+            "x.com",
+            canonical_components.path,
+            canonical_components.query,
             "",
         )
     )
@@ -1218,44 +1239,3 @@ def _is_unsupported_media_error(message: str) -> bool:
     """Return whether a provider error describes a non-video source."""
     normalized_message = message.casefold()
     return any(marker in normalized_message for marker in _UNSUPPORTED_MEDIA_MARKERS)
-
-
-def safe_submitted_url(submitted_url: str) -> str:
-    """Redact sensitive query values and fragments before structured logging.
-
-    Args:
-        submitted_url: URL submitted by the API caller.
-
-    Returns:
-        str: Submitted URL with sensitive query values and fragments removed.
-    """
-    try:
-        parsed_url = urlsplit(submitted_url)
-        query_pairs = parse_qsl(parsed_url.query, keep_blank_values=True)
-    except ValueError:
-        return _REDACTED_LOG_VALUE
-
-    has_sensitive_query = any(_is_sensitive_query_key(key) for key, _ in query_pairs)
-    if not parsed_url.fragment and not has_sensitive_query:
-        return submitted_url
-
-    safe_pairs = [
-        (key, _REDACTED_LOG_VALUE if _is_sensitive_query_key(key) else value)
-        for key, value in query_pairs
-    ]
-    return urlunsplit(
-        (
-            parsed_url.scheme,
-            parsed_url.netloc,
-            parsed_url.path,
-            urlencode(safe_pairs),
-            "",
-        )
-    )
-
-
-def _is_sensitive_query_key(key: str) -> bool:
-    normalized_key = key.casefold().replace("-", "_")
-    return normalized_key in _SENSITIVE_QUERY_PARTS or any(
-        part in normalized_key for part in ("api_key", "token", "secret", "password")
-    )

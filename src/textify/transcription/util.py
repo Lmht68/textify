@@ -2,12 +2,87 @@
 
 import threading
 import time
-from collections.abc import Callable
-from typing import Final
+from collections.abc import Callable, Mapping
+from typing import Final, cast
 
+import yt_dlp
+from yt_dlp.extractor.facebook import FacebookIE
 from yt_dlp.utils import DownloadCancelled
 
 _MAX_YTDLP_ATTEMPTS: Final[int] = 10
+_ALLOWED_EXTRACTORS: Final[list[str]] = [
+    r"^(?:facebook|facebook:reel|instagram|tiktok|twitter|twitter:shortener|vm\.tiktok|youtube)$"
+]
+
+
+class _TextifyFacebookIE(FacebookIE):  # type: ignore[misc]
+    """Extend Facebook extraction to the accepted short and share URL families."""
+
+    _VALID_URL = (
+        FacebookIE._VALID_URL,
+        r"https://fb\.watch/(?P<id>[A-Za-z0-9_-]+)$",
+        (
+            r"https://(?:facebook\.com|www\.facebook\.com|m\.facebook\.com)"
+            r"/share/(?:v/|[^/?#]+/[^/?#]+/)(?P<id>[A-Za-z0-9_-]+)$"
+        ),
+    )
+
+    @classmethod
+    def ie_key(cls) -> str:
+        """Return Facebook's stable yt-dlp extractor key."""
+        return cast(str, FacebookIE.ie_key())
+
+
+def create_yt_dlp(
+    operation_options: Mapping[str, object] | None = None,
+) -> yt_dlp.YoutubeDL:
+    """Create a yt-dlp instance with Textify's non-overridable extractor policy.
+
+    Args:
+        operation_options: Optional output template, match filter, and progress hooks.
+
+    Returns:
+        yt-dlp instance limited to Textify's approved platform extraction paths.
+    """
+    options: dict[str, object] = {}
+    if operation_options is not None:
+        for option_name in ("outtmpl", "match_filter", "progress_hooks"):
+            if option_name not in operation_options:
+                continue
+            option = operation_options[option_name]
+            if option_name == "progress_hooks" and isinstance(option, list):
+                options[option_name] = list(option)
+            else:
+                options[option_name] = option
+
+    options.update(
+        {
+            "allowed_extractors": list(_ALLOWED_EXTRACTORS),
+            "format": "bestaudio/best",
+            "ignoreconfig": True,
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "playlist_items": "1",
+            "extract_flat": False,
+            "ignoreerrors": False,
+            "cookiefile": None,
+            "cookiesfrombrowser": None,
+            "usenetrc": False,
+            "netrc_location": None,
+            "netrc_cmd": None,
+            "remote_components": [],
+            "external_downloader": {"default": "native"},
+            "external_downloader_args": {},
+            "force_generic_extractor": False,
+            "enable_file_urls": False,
+            "default_search": None,
+            "prefer_insecure": False,
+        }
+    )
+    youtube_dl = yt_dlp.YoutubeDL(options)  # pyright: ignore[reportArgumentType]
+    youtube_dl.add_info_extractor(_TextifyFacebookIE())
+    return youtube_dl
 
 
 class MediaByteLimitExceeded(DownloadCancelled):  # type: ignore[misc]

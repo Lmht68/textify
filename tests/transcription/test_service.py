@@ -156,7 +156,7 @@ class RecordingMetadataExtractor:
 
     def extract(
         self,
-        canonical_url: str,
+        provider_url: str,
         *,
         deadline: float,
         cancellation_event: threading.Event,
@@ -164,7 +164,7 @@ class RecordingMetadataExtractor:
         """Record and return the configured provider result.
 
         Args:
-            canonical_url: Validated provider URL.
+            provider_url: Validated provider URL.
             deadline: Monotonic absolute metadata deadline.
             cancellation_event: Cooperative request-cancellation signal.
 
@@ -175,7 +175,7 @@ class RecordingMetadataExtractor:
             Exception: Configured provider failure.
         """
         del deadline, cancellation_event
-        self.calls.append(canonical_url)
+        self.calls.append(provider_url)
         if self._failure is not None:
             raise self._failure
         return ExtractedMetadata(self._metadata, self._prepared_audio)
@@ -211,7 +211,7 @@ class RecordingAudioDownloader:
         """Create a request-owned fake audio file.
 
         Args:
-            source_url: Original submitted TikTok URL.
+            source_url: Validated provider URL.
             destination: Request-scoped destination directory.
             deadline: Monotonic absolute audio-download deadline.
             cancellation_event: Cooperative request-cancellation signal.
@@ -300,6 +300,7 @@ def youtube_metadata(language: object = "en-US") -> Mapping[str, object]:
     """
     metadata: dict[str, object] = {
         "id": "dQw4w9WgXcQ",
+        "extractor_key": "Youtube",
         "title": "A title",
         "description": "A description",
         "channel": "Creator",
@@ -372,6 +373,26 @@ async def test_transcribe_allows_the_inclusive_duration_and_cleans_media(
     assert result.transcript.text == "Transcript"
     assert downloader.calls == [DIRECT_TIKTOK_URL]
     assert all(not directory.exists() for directory in downloader.request_directories)
+
+
+@pytest.mark.asyncio
+async def test_transcribe_preserves_validated_provider_parameters(
+    tmp_path: Path,
+) -> None:
+    """Metadata and native download retain provider-issued TikTok parameters."""
+    provider_url = (
+        f"{DIRECT_TIKTOK_URL}?is_from_webapp=1&sender_device=pc"
+        "&web_id=7615327134046848533"
+    )
+    submitted_url = f"{provider_url}#fragment"
+    extractor = RecordingMetadataExtractor(tiktok_metadata())
+    downloader = RecordingAudioDownloader()
+    service = build_service(tmp_path, extractor, downloader, FixedTranscriber())
+
+    await service.transcribe(submitted_url)
+
+    assert extractor.calls == [provider_url]
+    assert downloader.calls == [provider_url]
 
 
 @pytest.mark.asyncio
