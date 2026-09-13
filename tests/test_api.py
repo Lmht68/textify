@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 from fastapi import FastAPI
@@ -29,7 +30,6 @@ from textify.transcription.exceptions import (
     MetadataTimeoutError,
     NoUsableTranscriptError,
     TranscriptionCapacityExceededError,
-    TranscriptionError,
     TranscriptionFailedError,
     TranscriptionTimeoutError,
     UnsupportedContentError,
@@ -223,6 +223,43 @@ SOCIAL_URL_CASES = (
 )
 
 
+def _assert_safe_error(
+    response: Response,
+    expected_status: int,
+    expected_code: str,
+) -> None:
+    """Assert the stable two-field public error envelope.
+
+    Args:
+        response: API response expected to contain an error envelope.
+        expected_status: Stable HTTP status for the failure.
+        expected_code: Stable machine-readable failure code.
+    """
+    payload = response.json()
+    assert response.status_code == expected_status
+    assert set(payload) == {"error"}
+    assert set(payload["error"]) == {"code", "message"}
+    assert payload["error"]["code"] == expected_code
+    assert isinstance(payload["error"]["message"], str)
+    assert payload["error"]["message"]
+
+
+def _assert_generated_request_id(response: Response) -> str:
+    """Assert and return the response's server-generated canonical UUIDv4.
+
+    Args:
+        response: HTTP response carrying the correlation header.
+
+    Returns:
+        Canonical server-generated UUIDv4 request identifier.
+    """
+    request_id = response.headers["X-Request-ID"]
+    parsed_request_id = UUID(request_id)
+    assert parsed_request_id.version == 4
+    assert str(parsed_request_id) == request_id
+    return request_id
+
+
 def _sufficient_temporary_media_bytes(_root: Path) -> int:
     """Return a capacity value independent of the test host filesystem."""
     return 1 << 60
@@ -354,7 +391,7 @@ SOCIAL_METADATA_STATE_CASES = tuple(
         ({"duration": 1800.1}, 422, "video_too_long"),
     )
 )
-SOCIAL_PROVIDER_FAILURE_CASES = (
+PROVIDER_FAILURE_CASES = (
     (
         Platform.FACEBOOK,
         FACEBOOK_CANONICAL_WATCH_URL,
@@ -420,6 +457,20 @@ SOCIAL_PROVIDER_FAILURE_CASES = (
         "There is no video in this post",
         422,
         "unsupported_media",
+    ),
+    (
+        Platform.TIKTOK,
+        DIRECT_TIKTOK_URL,
+        "This video is unavailable",
+        422,
+        "unsupported_content",
+    ),
+    (
+        Platform.YOUTUBE,
+        YOUTUBE_URL,
+        "Video unavailable",
+        422,
+        "unsupported_content",
     ),
     (
         Platform.X,
@@ -920,24 +971,24 @@ class StartupFailureFactory:
 
 
 class ErrorService:
-    """Raise one configured domain error from the route boundary."""
+    """Raise one configured exception from the route boundary."""
 
-    def __init__(self, error: TranscriptionError) -> None:
-        """Initialize the domain error to expose through HTTP.
+    def __init__(self, error: Exception) -> None:
+        """Initialize the exception to expose through HTTP.
 
         Args:
-            error: Safe domain error to raise.
+            error: Configured exception to raise.
         """
         self._error = error
 
     async def transcribe(self, submitted_url: str) -> TranscriptionResult:
-        """Raise the configured safe error.
+        """Raise the configured exception.
 
         Args:
             submitted_url: Submitted URL intentionally ignored by the fake.
 
         Raises:
-            TranscriptionError: Configured safe domain error.
+            Exception: Configured exception.
         """
         del submitted_url
         raise self._error
@@ -1520,17 +1571,18 @@ async def test_api_rejects_social_metadata_states_safely(
         "expected_status",
         "expected_code",
     ),
-    SOCIAL_PROVIDER_FAILURE_CASES,
+    PROVIDER_FAILURE_CASES,
 )
-async def test_api_maps_social_provider_failures_without_leaking_details(
+async def test_api_maps_provider_failures_without_leaking_details(
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
     platform: Platform,
     submitted_url: str,
     provider_message: str,
     expected_status: int,
     expected_code: str,
 ) -> None:
-    """Known social provider failures expose only their stable safe envelope."""
+    """Known provider failures expose only their stable safe envelope."""
     state = ControlledAdapterState(
         metadata_failure=YoutubeDLError(provider_message),
     )
@@ -1542,18 +1594,23 @@ async def test_api_maps_social_provider_failures_without_leaking_details(
     )
 
     async with application.router.lifespan_context(application):
+        capsys.readouterr()
         transport = ASGITransport(app=application)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.post(
                 "/api/transcripts", json={"url": submitted_url}
             )
 
-    payload = response.json()
-    assert response.status_code == expected_status
-    assert payload["error"]["code"] == expected_code
-    assert payload["error"]["message"]
-    assert submitted_url not in str(payload)
-    assert provider_message not in str(payload)
+    _assert_safe_error(response, expected_status, expected_code)
+    request_id = _assert_generated_request_id(response)
+    formatted_logs = capsys.readouterr().err
+    provider_url = state.metadata_calls[0]
+    assert f"request_id={request_id}" in formatted_logs
+    assert f"platform={platform.value}" in formatted_logs
+    assert f"code={expected_code}" in formatted_logs
+    for sensitive_value in (submitted_url, provider_url, provider_message):
+        assert sensitive_value not in response.text
+        assert sensitive_value not in formatted_logs
     assert state.metadata_calls == [submitted_url]
     assert state.caption_list_calls == []
     assert state.caption_fetch_calls == []
@@ -1582,16 +1639,14 @@ async def test_api_returns_safe_request_validation_error(tmp_path: Path) -> None
                 json={"url": YOUTUBE_URL, "unknown": "value"},
             )
 
-    payload = response.json()
-    assert response.status_code == 422
-    assert payload["error"]["code"] == "invalid_request"
-    assert YOUTUBE_URL not in str(payload)
-    assert "value" not in str(payload)
+    _assert_safe_error(response, 422, "invalid_request")
+    assert YOUTUBE_URL not in response.text
+    assert "value" not in response.text
 
 
 @pytest.mark.asyncio
-async def test_api_maps_all_baseline_domain_errors(tmp_path: Path) -> None:
-    """Each stable domain status/code pair is observable through HTTP."""
+async def test_api_maps_all_target_domain_errors(tmp_path: Path) -> None:
+    """Each target domain status and code pair is observable through HTTP."""
     error_cases = (
         (InvalidUrlError(), 400, "invalid_url"),
         (UnsupportedPlatformError(), 400, "unsupported_platform"),
@@ -1624,8 +1679,33 @@ async def test_api_maps_all_baseline_domain_errors(tmp_path: Path) -> None:
                     "/api/transcripts",
                     json={"url": DIRECT_TIKTOK_URL},
                 )
-                assert response.status_code == expected_status
-                assert response.json()["error"]["code"] == expected_code
+                _assert_safe_error(response, expected_status, expected_code)
+
+
+@pytest.mark.asyncio
+async def test_api_maps_unexpected_error_to_internal_error(tmp_path: Path) -> None:
+    """Unexpected route failures produce only the stable internal error."""
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path),
+        CountingAdaptersFactory(),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
+    )
+
+    async with application.router.lifespan_context(application):
+        application.state.transcript_service = ErrorService(
+            RuntimeError("unexpected-runtime-sentinel")
+        )
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/transcripts",
+                json={"url": DIRECT_TIKTOK_URL},
+            )
+
+    _assert_safe_error(response, 500, "internal_error")
+    _assert_generated_request_id(response)
+    assert "unexpected-runtime-sentinel" not in response.text
 
 
 @pytest.mark.asyncio
@@ -1677,6 +1757,7 @@ async def test_api_rejects_oversized_completed_audio_before_native(
 @pytest.mark.asyncio
 async def test_api_rejects_work_beyond_active_and_pending_capacity_before_download(
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Reject a third request before it can invoke metadata or create media."""
     state = ControlledAdapterState(native_waits_for_release=True)
@@ -1694,6 +1775,7 @@ async def test_api_rejects_work_beyond_active_and_pending_capacity_before_downlo
     )
 
     async with application.router.lifespan_context(application):
+        capsys.readouterr()
         transport = ASGITransport(app=application)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             first_request = asyncio.create_task(
@@ -1710,11 +1792,16 @@ async def test_api_rejects_work_beyond_active_and_pending_capacity_before_downlo
                 "/api/transcripts",
                 json={"url": DIRECT_TIKTOK_URL},
             )
-            assert overload_response.status_code == 503
-            assert (
-                overload_response.json()["error"]["code"]
-                == "transcription_capacity_exceeded"
+            _assert_safe_error(
+                overload_response,
+                503,
+                "transcription_capacity_exceeded",
             )
+            overload_request_id = _assert_generated_request_id(overload_response)
+            overload_logs = capsys.readouterr().err
+            assert f"request_id={overload_request_id}" in overload_logs
+            assert "stage=request" in overload_logs
+            assert "code=transcription_capacity_exceeded" in overload_logs
             assert len(state.metadata_calls) == 2
             assert len(state.request_directories) == 2
 
@@ -1730,6 +1817,7 @@ async def test_api_rejects_work_beyond_active_and_pending_capacity_before_downlo
 @pytest.mark.asyncio
 async def test_api_expires_the_inference_queue_and_cleans_waiting_media(
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Expire queue waiting without allowing a second native call to start."""
     state = ControlledAdapterState(native_waits_for_release=True)
@@ -1746,6 +1834,7 @@ async def test_api_expires_the_inference_queue_and_cleans_waiting_media(
     )
 
     async with application.router.lifespan_context(application):
+        capsys.readouterr()
         transport = ASGITransport(app=application)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             first_request = asyncio.create_task(
@@ -1759,11 +1848,16 @@ async def test_api_expires_the_inference_queue_and_cleans_waiting_media(
             await _wait_for_thread_event(state.download_second_entered)
             second_response = await _await_request(second_request)
 
-            assert second_response.status_code == 503
-            assert (
-                second_response.json()["error"]["code"]
-                == "transcription_capacity_exceeded"
+            _assert_safe_error(
+                second_response,
+                503,
+                "transcription_capacity_exceeded",
             )
+            second_request_id = _assert_generated_request_id(second_response)
+            queue_logs = capsys.readouterr().err
+            assert f"request_id={second_request_id}" in queue_logs
+            assert "stage=request" in queue_logs
+            assert "code=transcription_capacity_exceeded" in queue_logs
             assert len(state.native_calls) == 1
             assert not state.request_directories[1].exists()
 
@@ -2386,14 +2480,206 @@ async def test_api_returns_native_safe_error_after_caption_listing_failure(
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.post("/api/transcripts", json={"url": YOUTUBE_URL})
 
-    assert response.status_code == 502
-    assert response.json() == {
-        "error": {
-            "code": "transcription_failed",
-            "message": "The source could not be transcribed.",
-        }
-    }
+    _assert_safe_error(response, 502, "transcription_failed")
     assert state.caption_list_calls == ["dQw4w9WgXcQ"]
     assert state.download_calls == [YOUTUBE_URL]
     assert len(state.native_calls) == 1
     assert all(not directory.exists() for directory in state.request_directories)
+
+
+@pytest.mark.asyncio
+async def test_api_success_request_id_is_safely_correlated(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Successful transcripts emit one request-correlated terminal record."""
+    factory = CountingAdaptersFactory()
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path),
+        factory,
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
+    )
+
+    async with application.router.lifespan_context(application):
+        capsys.readouterr()
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/transcripts",
+                json={"url": DIRECT_TIKTOK_URL},
+            )
+
+    assert response.status_code == 200
+    request_id = _assert_generated_request_id(response)
+    formatted_logs = capsys.readouterr().err
+    terminal_logs = [
+        line for line in formatted_logs.splitlines() if "request completed" in line
+    ]
+    assert formatted_logs.splitlines() == terminal_logs
+    assert len(terminal_logs) == 1
+    terminal_fields = (
+        terminal_logs[0].split("] request completed ", maxsplit=1)[1].split()
+    )
+    terminal_field_names = {field.partition("=")[0] for field in terminal_fields}
+    assert terminal_field_names == {
+        "duration_seconds",
+        "elapsed_seconds",
+        "method",
+        "platform",
+        "request_id",
+        "source_id",
+        "stage",
+    }
+    assert f"request_id={request_id}" in terminal_logs[0]
+    assert "platform=tiktok" in terminal_logs[0]
+    assert "source_id=1234567890123456789" in terminal_logs[0]
+    assert "method=faster_whisper" in terminal_logs[0]
+    assert "duration_seconds=12" in terminal_logs[0]
+    assert "stage=request" in terminal_logs[0]
+    elapsed_field = next(
+        field for field in terminal_fields if field.startswith("elapsed_seconds=")
+    )
+    assert float(elapsed_field.partition("=")[2]) >= 0.0
+    assert factory.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_api_native_failure_is_safe_correlated(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Controlled native failures keep external and exception data out of output."""
+    submitted_short_url = "https://vm.tiktok.com/submitted-short-sentinel"
+    provider_canonical_url = (
+        "https://www.tiktok.com/@provider_canonical/video/9876543210123456789"
+    )
+    media_url = "https://media.example.invalid/media-url-sentinel"
+    metadata_text = "metadata-text-sentinel"
+    model_exception_text = "model-exception-sentinel"
+    command = "command-sentinel"
+    sensitive_header = "header-sentinel"
+    credential = "credential-sentinel"
+    cookie = "cookie-sentinel"
+    temporary_path = "/temporary-path-sentinel"
+    inbound_request_id = "inbound-request-id-sentinel"
+    state = ControlledAdapterState(
+        metadata_override={
+            "id": "9876543210123456789",
+            "extractor_key": "TikTok",
+            "webpage_url": provider_canonical_url,
+            "title": metadata_text,
+            "description": metadata_text,
+            "channel": "Creator",
+            "duration": 12,
+            "formats": ({"vcodec": "h264", "url": media_url},),
+            "command": command,
+            "headers": sensitive_header,
+            "credential": credential,
+            "cookie": cookie,
+            "temporary_path": temporary_path,
+        },
+        native_failure=RuntimeError(model_exception_text),
+    )
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path),
+        ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
+    )
+
+    async with application.router.lifespan_context(application):
+        capsys.readouterr()
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/transcripts",
+                json={"url": submitted_short_url},
+                headers={"X-Request-ID": inbound_request_id},
+            )
+
+    _assert_safe_error(response, 502, "transcription_failed")
+    request_id = _assert_generated_request_id(response)
+    assert request_id != inbound_request_id
+    formatted_logs = capsys.readouterr().err
+    terminal_logs = [
+        line for line in formatted_logs.splitlines() if "request completed" in line
+    ]
+    assert len(terminal_logs) == 1
+    terminal_log = terminal_logs[0]
+    assert f"request_id={request_id}" in terminal_log
+    assert "platform=tiktok" in terminal_log
+    assert "source_id=9876543210123456789" in terminal_log
+    assert "duration_seconds=12" in terminal_log
+    assert "code=transcription_failed" in terminal_log
+    assert "stage=request" in terminal_log
+    for sensitive_value in (
+        submitted_short_url,
+        provider_canonical_url,
+        media_url,
+        metadata_text,
+        model_exception_text,
+        command,
+        sensitive_header,
+        credential,
+        cookie,
+        temporary_path,
+    ):
+        assert sensitive_value not in response.text
+        assert sensitive_value not in formatted_logs
+    assert state.metadata_calls == [submitted_short_url]
+    assert state.download_calls == [submitted_short_url]
+    assert len(state.native_calls) == 1
+    assert all(not directory.exists() for directory in state.request_directories)
+
+
+@pytest.mark.asyncio
+async def test_api_adds_fresh_request_ids_to_all_response_outcomes(
+    tmp_path: Path,
+) -> None:
+    """Health, success, validation, and unmatched routes get fresh UUIDv4 IDs."""
+    inbound_request_id = "inbound-request-id-sentinel"
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path),
+        CountingAdaptersFactory(),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            health_response = await client.get(
+                "/health",
+                headers={"X-Request-ID": inbound_request_id},
+            )
+            success_response = await client.post(
+                "/api/transcripts",
+                json={"url": DIRECT_TIKTOK_URL},
+                headers={"X-Request-ID": inbound_request_id},
+            )
+            validation_response = await client.post(
+                "/api/transcripts",
+                json={"url": DIRECT_TIKTOK_URL, "unknown": "value"},
+                headers={"X-Request-ID": inbound_request_id},
+            )
+            unmatched_response = await client.get(
+                "/unmatched",
+                headers={"X-Request-ID": inbound_request_id},
+            )
+
+    assert health_response.status_code == 200
+    assert success_response.status_code == 200
+    _assert_safe_error(validation_response, 422, "invalid_request")
+    assert unmatched_response.status_code == 404
+    request_ids = {
+        _assert_generated_request_id(response)
+        for response in (
+            health_response,
+            success_response,
+            validation_response,
+            unmatched_response,
+        )
+    }
+    assert len(request_ids) == 4
+    assert inbound_request_id not in request_ids

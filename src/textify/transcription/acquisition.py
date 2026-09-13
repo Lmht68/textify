@@ -81,13 +81,13 @@ class _TranscriptionProviderTimeout(Exception):
     """Represent a timeout at the native inference boundary."""
 
 
-def _log_acquisition_error(event: str, reason: str) -> None:
-    """Log a safe, structured reason for an acquisition failure."""
+def _log_acquisition_error(event: str, code: str, stage: str) -> None:
+    """Log a safe structured acquisition failure code."""
     logger.debug(
         event,
         extra={
-            "stage": "transcription",
-            "reason": reason,
+            "stage": stage,
+            "code": code,
         },
     )
 
@@ -235,10 +235,18 @@ class _YouTubeCaptionTrack:
             language_code = transcript.language_code
             is_generated = transcript.is_generated
         except (AttributeError, TypeError, ValueError) as exc:
-            _log_acquisition_error("caption provider error", "invalid_track_metadata")
+            _log_acquisition_error(
+                "caption provider error",
+                "invalid_track_metadata",
+                "captions",
+            )
             raise _CaptionProviderFailure from exc
         if not isinstance(language_code, str) or not isinstance(is_generated, bool):
-            _log_acquisition_error("caption provider error", "invalid_track_metadata")
+            _log_acquisition_error(
+                "caption provider error",
+                "invalid_track_metadata",
+                "captions",
+            )
             raise _CaptionProviderFailure
         self._transcript = transcript
         self._language_code = language_code
@@ -278,12 +286,20 @@ class _YouTubeCaptionTrack:
                 for snippet in fetched
             )
         except (Timeout, TimeoutError) as exc:
-            _log_acquisition_error("caption provider timeout", "track_fetch_timeout")
+            _log_acquisition_error(
+                "caption provider timeout",
+                "track_fetch_timeout",
+                "captions",
+            )
             raise _CaptionProviderTimeout from exc
         except _CaptionProviderFailure:
             raise
         except _CAPTION_EXTERNAL_FAILURES as exc:
-            _log_acquisition_error("caption provider error", "track_fetch_failed")
+            _log_acquisition_error(
+                "caption provider error",
+                "track_fetch_failed",
+                "captions",
+            )
             raise _CaptionProviderFailure from exc
 
 
@@ -329,17 +345,24 @@ class YouTubeCaptionProvider:
                     logger.debug(
                         "caption track unavailable",
                         extra={
-                            "stage": "transcription",
-                            "reason": "invalid_track_metadata",
+                            "stage": "captions",
+                            "code": "invalid_track_metadata",
                         },
                     )
-                    continue
             return tuple(wrapped_tracks)
         except (Timeout, TimeoutError) as exc:
-            _log_acquisition_error("caption provider timeout", "track_listing_timeout")
+            _log_acquisition_error(
+                "caption provider timeout",
+                "track_listing_timeout",
+                "captions",
+            )
             raise _CaptionProviderTimeout from exc
         except _CAPTION_EXTERNAL_FAILURES as exc:
-            _log_acquisition_error("caption provider error", "track_listing_failed")
+            _log_acquisition_error(
+                "caption provider error",
+                "track_listing_failed",
+                "captions",
+            )
             raise _CaptionProviderFailure from exc
 
 
@@ -429,6 +452,7 @@ class YtDlpAudioDownloader:
                     _log_acquisition_error(
                         "audio download provider error",
                         "invalid_download_result",
+                        "audio_download",
                     )
                     raise _AudioDownloadProviderFailure
                 _raise_if_selected_media_exceeds_limit(
@@ -445,36 +469,50 @@ class YtDlpAudioDownloader:
                 _log_acquisition_error(
                     "audio download provider timeout",
                     "audio_download_timeout",
+                    "audio_download",
                 )
                 raise _AudioDownloadProviderTimeout from exc
             _log_acquisition_error(
                 "audio download provider error",
                 "download_failed",
+                "audio_download",
             )
             raise _AudioDownloadProviderFailure from exc
         except YoutubeDLError as exc:
-            _log_acquisition_error("audio download provider error", "download_failed")
+            _log_acquisition_error(
+                "audio download provider error",
+                "download_failed",
+                "audio_download",
+            )
             raise _AudioDownloadProviderFailure from exc
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
             _log_acquisition_error(
                 "audio download provider error",
                 "invalid_download_result",
+                "audio_download",
             )
             raise _AudioDownloadProviderFailure from exc
 
         if not isinstance(prepared_path, (str, Path)):
-            _log_acquisition_error("audio download provider error", "invalid_path")
+            _log_acquisition_error(
+                "audio download provider error",
+                "invalid_path",
+                "audio_download",
+            )
             raise _AudioDownloadProviderFailure
         completed_path = Path(prepared_path).resolve()
         if completed_path.parent != request_directory:
             _log_acquisition_error(
                 "audio download provider error",
                 "audio_path_outside_request_directory",
+                "audio_download",
             )
             raise _AudioDownloadProviderFailure
         if not completed_path.is_file():
             _log_acquisition_error(
-                "audio download provider error", "audio_file_missing"
+                "audio download provider error",
+                "audio_file_missing",
+                "audio_download",
             )
             raise _AudioDownloadProviderFailure
         return completed_path
@@ -524,6 +562,7 @@ class FasterWhisperTranscriber:
             _log_acquisition_error(
                 "native transcription provider error",
                 "transcription_failed",
+                "transcription",
             )
             raise _TranscriptionProviderFailure from exc
 
@@ -532,7 +571,6 @@ class FasterWhisperTranscriber:
             extra={
                 "stage": "transcription",
                 "method": transcript.method.value,
-                "segment_count": len(transcript.segments),
             },
         )
         return transcript
@@ -555,7 +593,9 @@ def load_whisper_transcriber(
     """
     if ctranslate2.get_cuda_device_count() == 0:
         _log_acquisition_error(
-            "native transcription provider error", "cuda_unavailable"
+            "native transcription provider error",
+            "cuda_unavailable",
+            "transcription",
         )
         raise RuntimeError("CUDA is unavailable for Faster-Whisper.")
 
@@ -649,7 +689,13 @@ async def _finish_cancelled_download(worker: asyncio.Task[Path]) -> None:
     ):
         return
     except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
-        logger.error("audio download failed after request cancellation")
+        logger.error(
+            "audio download failed after request cancellation",
+            extra={
+                "stage": "cleanup",
+                "code": "audio_download_cleanup_failed",
+            },
+        )
 
 
 def _validate_audio_path(
@@ -660,7 +706,9 @@ def _validate_audio_path(
     """Validate ownership and exact size of downloaded request media."""
     if not isinstance(audio_path, Path):
         _log_acquisition_error(
-            "audio download provider error", "invalid_audio_path_type"
+            "audio download provider error",
+            "invalid_audio_path_type",
+            "audio_download",
         )
         raise _AudioDownloadProviderFailure
     resolved_path = audio_path.resolve()
@@ -668,13 +716,22 @@ def _validate_audio_path(
         _log_acquisition_error(
             "audio download provider error",
             "audio_path_outside_request_directory",
+            "audio_download",
         )
         raise _AudioDownloadProviderFailure
     if not resolved_path.is_file():
-        _log_acquisition_error("audio download provider error", "audio_file_missing")
+        _log_acquisition_error(
+            "audio download provider error",
+            "audio_file_missing",
+            "audio_download",
+        )
         raise _AudioDownloadProviderFailure
     if resolved_path.stat().st_size > max_media_bytes:
-        _log_acquisition_error("unsupported media", "media_size_exceeded")
+        _log_acquisition_error(
+            "unsupported media",
+            "media_size_exceeded",
+            "audio_download",
+        )
         raise MediaByteLimitExceeded
     return resolved_path
 
@@ -748,10 +805,18 @@ def acquire_transcript(
     except _CaptionProviderFailure:
         raise
     except (Timeout, TimeoutError) as exc:
-        _log_acquisition_error("caption provider timeout", "track_listing_timeout")
+        _log_acquisition_error(
+            "caption provider timeout",
+            "track_listing_timeout",
+            "captions",
+        )
         raise _CaptionProviderTimeout from exc
     except _CAPTION_EXTERNAL_FAILURES as exc:
-        _log_acquisition_error("caption provider error", "track_listing_failed")
+        _log_acquisition_error(
+            "caption provider error",
+            "track_listing_failed",
+            "captions",
+        )
         raise _CaptionProviderFailure from exc
 
     for track in ranked_tracks:
@@ -767,20 +832,24 @@ def acquire_transcript(
             logger.debug(
                 "caption track unavailable",
                 extra={
-                    "stage": "transcription",
-                    "reason": "track_fetch_failed",
+                    "stage": "captions",
+                    "code": "track_fetch_failed",
                 },
             )
             continue
         except (Timeout, TimeoutError) as exc:
-            _log_acquisition_error("caption provider timeout", "track_fetch_timeout")
+            _log_acquisition_error(
+                "caption provider timeout",
+                "track_fetch_timeout",
+                "captions",
+            )
             raise _CaptionProviderTimeout from exc
         except _CAPTION_EXTERNAL_FAILURES:
             logger.debug(
                 "caption track unavailable",
                 extra={
-                    "stage": "transcription",
-                    "reason": "track_fetch_failed",
+                    "stage": "captions",
+                    "code": "track_fetch_failed",
                 },
             )
             continue
@@ -790,9 +859,8 @@ def acquire_transcript(
         logger.debug(
             "transcript acquired",
             extra={
-                "stage": "transcription",
+                "stage": "captions",
                 "method": transcript.method.value,
-                "segment_count": len(transcript.segments),
             },
         )
         return transcript
@@ -961,7 +1029,13 @@ class WhisperAcquirer:
                 worker_exception,
                 (_TranscriptionProviderFailure, _TranscriptionProviderTimeout),
             ):
-                logger.error("abandoned native inference failed")
+                logger.error(
+                    "abandoned native inference failed",
+                    extra={
+                        "stage": "transcription",
+                        "code": "abandoned_native_inference_failed",
+                    },
+                )
         finally:
             if request_directory is not None:
                 _cleanup_request_directory(request_directory)
@@ -974,7 +1048,13 @@ class WhisperAcquirer:
         if task.cancelled():
             return
         if task.exception() is not None:
-            logger.error("native inference finalizer failed")
+            logger.error(
+                "native inference finalizer failed",
+                extra={
+                    "stage": "cleanup",
+                    "code": "native_inference_finalizer_failed",
+                },
+            )
 
     async def shutdown(self) -> None:
         """Wait for abandoned native workers without cancelling their inference."""
@@ -1010,6 +1090,7 @@ class WhisperAcquirer:
             _log_acquisition_error(
                 "audio download provider error",
                 "temporary_root_failed",
+                "audio_download",
             )
             raise _AudioDownloadProviderFailure from exc
 
@@ -1075,6 +1156,7 @@ class WhisperAcquirer:
             _log_acquisition_error(
                 "audio download provider timeout",
                 "audio_download_timeout",
+                "audio_download",
             )
             raise _AudioDownloadProviderTimeout from exc
         except (
@@ -1088,6 +1170,7 @@ class WhisperAcquirer:
             _log_acquisition_error(
                 "audio download provider error",
                 "audio_download_failed",
+                "audio_download",
             )
             raise _AudioDownloadProviderFailure from exc
 
@@ -1107,6 +1190,7 @@ def _transcribe_audio(
         _log_acquisition_error(
             "native transcription provider timeout",
             "transcription_timeout",
+            "transcription",
         )
         raise _TranscriptionProviderTimeout from exc
     except (
@@ -1122,6 +1206,7 @@ def _transcribe_audio(
         _log_acquisition_error(
             "native transcription provider error",
             "transcription_failed",
+            "transcription",
         )
         raise _TranscriptionProviderFailure from exc
 
@@ -1129,6 +1214,7 @@ def _transcribe_audio(
         _log_acquisition_error(
             "native transcription provider error",
             "invalid_transcription_result",
+            "transcription",
         )
         raise _TranscriptionProviderFailure
     return transcript

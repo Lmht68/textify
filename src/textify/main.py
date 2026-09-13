@@ -1,17 +1,27 @@
 """Runnable FastAPI composition root for Textify."""
 
+import asyncio
+import logging
 import shutil
+import time
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
+from uuid import uuid4
 
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.datastructures import MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from textify.config import AppConfig
-from textify.logging import configure_logging
+from textify.logging import (
+    bind_request_log_fields,
+    configure_logging,
+    request_log_context,
+)
 from textify.ops import router as operations_router
 from textify.transcription.config import TranscriptionConfig
 from textify.transcription.exceptions import (
@@ -25,6 +35,86 @@ from textify.transcription.service import (
     TranscriptService,
     build_transcription_adapters,
 )
+
+logger = logging.getLogger(__name__)
+
+
+class _RequestObservabilityMiddleware:
+    """Correlate each HTTP response with safe terminal request logging."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        """Store the next application in the ASGI chain.
+
+        Args:
+            app: Downstream ASGI application.
+        """
+        self._app = app
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        """Add a trusted correlation ID and terminal request record.
+
+        Args:
+            scope: Current ASGI connection scope.
+            receive: ASGI message receiver.
+            send: ASGI message sender.
+        """
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+
+        request_id = str(uuid4())
+        request_started_at = time.monotonic()
+        response_started = False
+
+        async def send_with_request_id(message: Message) -> None:
+            """Add the generated correlation ID to an HTTP response start."""
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                MutableHeaders(scope=message)["X-Request-ID"] = request_id
+                response_started = True
+            await send(message)
+
+        with request_log_context(request_id):
+            try:
+                await self._app(scope, receive, send_with_request_id)
+            except asyncio.CancelledError:
+                if not response_started:
+                    logger.info(
+                        "request interrupted",
+                        extra={
+                            "stage": "request",
+                            "elapsed_seconds": max(
+                                0.0,
+                                time.monotonic() - request_started_at,
+                            ),
+                        },
+                    )
+                raise
+            except Exception as exc:
+                if response_started:
+                    raise
+                response = await unhandled_error_handler(
+                    Request(scope, receive=receive),
+                    exc,
+                )
+                await response(scope, receive, send_with_request_id)
+
+            if response_started:
+                logger.info(
+                    "request completed",
+                    extra={
+                        "stage": "request",
+                        "elapsed_seconds": max(
+                            0.0,
+                            time.monotonic() - request_started_at,
+                        ),
+                    },
+                )
 
 
 async def request_validation_error_handler(
@@ -40,6 +130,7 @@ async def request_validation_error_handler(
     Returns:
         Stable invalid-request response without rejected input values.
     """
+    bind_request_log_fields(code="invalid_request")
     return JSONResponse(
         status_code=422,
         content={
@@ -142,11 +233,11 @@ def create_app(
         lifespan=lifespan,
     )
     application.state.ready = False
+    application.add_middleware(_RequestObservabilityMiddleware)
     application.add_exception_handler(TranscriptionError, transcription_error_handler)
     application.add_exception_handler(
         RequestValidationError, request_validation_error_handler
     )
-    application.add_exception_handler(Exception, unhandled_error_handler)
     application.include_router(operations_router)
     application.include_router(transcription_router)
     return application

@@ -75,6 +75,9 @@ async def _cancel_and_await[T](task: asyncio.Task[T]) -> None:
         status.HTTP_422_UNPROCESSABLE_CONTENT: {
             "description": "The source cannot produce an eligible transcript."
         },
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {
+            "description": "An unexpected internal error occurred."
+        },
         status.HTTP_502_BAD_GATEWAY: {"description": "An external provider failed."},
         status.HTTP_503_SERVICE_UNAVAILABLE: {
             "description": (

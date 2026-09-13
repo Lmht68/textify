@@ -170,13 +170,13 @@ _AUDIO_OUTPUT_TEMPLATE: Final[str] = "audio.%(ext)s"
 _INSPECTION_TEMP_PREFIX: Final[str] = "textify-inspection-"
 
 
-def _log_inspection_error(event: str, reason: str) -> None:
-    """Log a safe, structured reason for an inspection failure."""
+def _log_inspection_error(event: str, code: str) -> None:
+    """Log a safe structured inspection failure code."""
     logger.debug(
         event,
         extra={
-            "stage": "transcription",
-            "reason": reason,
+            "stage": "metadata",
+            "code": code,
         },
     )
 
@@ -191,39 +191,39 @@ def _cleanup_request_directory(request_directory: Path) -> None:
         logger.error(
             "temporary media cleanup failed",
             extra={
-                "stage": "transcription",
-                "reason": "temporary_media_cleanup_failed",
+                "stage": "cleanup",
+                "code": "temporary_media_cleanup_failed",
             },
         )
 
 
-def _metadata_provider_error(reason: str) -> MetadataRetrievalFailedError:
-    """Log a safe reason before returning the stable provider error."""
-    _log_inspection_error("metadata provider error", reason)
+def _metadata_provider_error(code: str) -> MetadataRetrievalFailedError:
+    """Log a safe code before returning the stable provider error."""
+    _log_inspection_error("metadata provider error", code)
     return MetadataRetrievalFailedError()
 
 
-def _invalid_media_duration_error(reason: str) -> InvalidMediaDurationError:
-    """Log a safe reason before returning the stable duration error."""
-    _log_inspection_error("invalid media duration", reason)
+def _invalid_media_duration_error(code: str) -> InvalidMediaDurationError:
+    """Log a safe code before returning the stable duration error."""
+    _log_inspection_error("invalid media duration", code)
     return InvalidMediaDurationError()
 
 
-def _unsupported_media_error(reason: str) -> UnsupportedMediaError:
-    """Log a safe reason before returning the stable media error."""
-    _log_inspection_error("unsupported media", reason)
+def _unsupported_media_error(code: str) -> UnsupportedMediaError:
+    """Log a safe code before returning the stable media error."""
+    _log_inspection_error("unsupported media", code)
     return UnsupportedMediaError()
 
 
-def _invalid_source_error(reason: str) -> InvalidUrlError:
-    """Log a safe reason before returning the stable invalid URL error."""
-    _log_inspection_error("invalid URL error", reason)
+def _invalid_source_error(code: str) -> InvalidUrlError:
+    """Log a safe code before returning the stable invalid URL error."""
+    _log_inspection_error("invalid URL error", code)
     return InvalidUrlError()
 
 
-def _unsupported_platform_error(reason: str) -> UnsupportedPlatformError:
-    """Log a safe reason before returning the stable platform error."""
-    _log_inspection_error("unsupported platform error", reason)
+def _unsupported_platform_error(code: str) -> UnsupportedPlatformError:
+    """Log a safe code before returning the stable platform error."""
+    _log_inspection_error("unsupported platform error", code)
     return UnsupportedPlatformError()
 
 
@@ -1107,7 +1107,7 @@ def _optional_text(metadata: Mapping[str, object], key: str) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        raise _metadata_provider_error(f"invalid_optional_metadata={key}")
+        raise _metadata_provider_error("invalid_optional_metadata")
     return value
 
 

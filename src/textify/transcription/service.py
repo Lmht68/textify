@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from requests.exceptions import RequestException, Timeout
 from yt_dlp.utils import YoutubeDLError
 
+from textify.logging import bind_request_log_fields
 from textify.transcription import acquisition, inspection
 from textify.transcription.config import TranscriptionConfig
 from textify.transcription.exceptions import (
@@ -163,6 +164,7 @@ class TranscriptService:
             TranscriptionError: If URL, provider, capacity, media, or work fails.
         """
         submitted = inspection.classify_submitted_url(submitted_url)
+        bind_request_log_fields(platform=submitted.platform.value)
         if submitted.platform not in (
             Platform.TIKTOK,
             Platform.YOUTUBE,
@@ -199,6 +201,10 @@ class TranscriptService:
                 channel=normalized_metadata.channel,
                 duration_seconds=normalized_metadata.duration_seconds,
             )
+            bind_request_log_fields(
+                source_id=source.video_id,
+                duration_seconds=source.duration_seconds,
+            )
             if source.duration_seconds > self._settings.max_duration_seconds:
                 raise VideoTooLongError()
 
@@ -210,6 +216,9 @@ class TranscriptService:
                         normalized_metadata.declared_language,
                     )
                     if caption_transcript is not None:
+                        bind_request_log_fields(
+                            method=caption_transcript.method.value,
+                        )
                         return TranscriptionResult(source, caption_transcript)
 
             ownership = acquisition.TranscriptionOwnership(
@@ -222,6 +231,7 @@ class TranscriptService:
                 submitted.provider_url,
                 ownership,
             )
+            bind_request_log_fields(method=transcript.method.value)
             return TranscriptionResult(source, transcript)
         except MediaByteLimitExceeded as exc:
             raise UnsupportedMediaError() from exc

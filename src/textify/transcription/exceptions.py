@@ -1,12 +1,11 @@
 """Safe domain errors and HTTP response handlers for transcription."""
 
-import logging
 from typing import ClassVar, cast
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-logger = logging.getLogger(__name__)
+from textify.logging import bind_request_log_fields
 
 
 class TranscriptionError(Exception):
@@ -153,6 +152,7 @@ async def transcription_error_handler(
         Error response with the domain status and code.
     """
     error = cast(TranscriptionError, exc)
+    bind_request_log_fields(code=error.code)
     return JSONResponse(
         status_code=error.status_code,
         content={"error": {"code": error.code, "message": error.message}},
@@ -169,7 +169,7 @@ async def unhandled_error_handler(_request: Request, _exc: Exception) -> JSONRes
     Returns:
         Generic internal-error response.
     """
-    logger.error("unhandled error")
+    bind_request_log_fields(code="internal_error")
     return JSONResponse(
         status_code=500,
         content={
