@@ -5,7 +5,11 @@ from typing import Annotated, cast
 
 from fastapi import APIRouter, Depends, Request, status
 
-from textify.transcription.schemas import TranscriptionResponse, TranscriptRequest
+from textify.transcription.schemas import (
+    ErrorResponse,
+    TranscriptionResponse,
+    TranscriptRequest,
+)
 from textify.transcription.service import TranscriptService
 
 router = APIRouter(prefix="/api")
@@ -61,31 +65,117 @@ async def _cancel_and_await[T](task: asyncio.Task[T]) -> None:
 @router.post(
     "/transcripts",
     status_code=status.HTTP_200_OK,
+    response_model=TranscriptionResponse,
     summary="Create a transcript",
     description=(
-        "Retrieve a normalized timed transcript for one public Facebook, Instagram, "
-        "TikTok, X, or YouTube video."
+        "Synchronously retrieve a normalized timed transcript for one public "
+        "Facebook, Instagram, TikTok, X, or YouTube video."
     ),
-    response_description="Canonical source metadata and its transcript.",
+    response_description="Canonical source metadata and its normalized transcript.",
     tags=["transcripts"],
     responses={
         status.HTTP_400_BAD_REQUEST: {
-            "description": "The URL is invalid or its platform is disabled."
+            "model": ErrorResponse,
+            "description": (
+                "Invalid input URL. Possible codes: `invalid_url`, "
+                "`unsupported_platform`."
+            ),
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": {
+                            "code": "invalid_url",
+                            "message": "The submitted URL is invalid.",
+                        }
+                    }
+                }
+            },
         },
         status.HTTP_422_UNPROCESSABLE_CONTENT: {
-            "description": "The source cannot produce an eligible transcript."
+            "model": ErrorResponse,
+            "description": (
+                "Invalid request or ineligible source. Possible codes: "
+                "`invalid_request`, `unsupported_content`, `video_too_long`, "
+                "`invalid_media_duration`, `unsupported_media`, "
+                "`no_usable_transcript`."
+            ),
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": {
+                            "code": "invalid_request",
+                            "message": "The request is invalid.",
+                        }
+                    }
+                }
+            },
         },
         status.HTTP_500_INTERNAL_SERVER_ERROR: {
-            "description": "An unexpected internal error occurred."
+            "model": ErrorResponse,
+            "description": "Unexpected server failure. Possible code: `internal_error`.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": {
+                            "code": "internal_error",
+                            "message": "An unexpected error occurred.",
+                        }
+                    }
+                }
+            },
         },
-        status.HTTP_502_BAD_GATEWAY: {"description": "An external provider failed."},
-        status.HTTP_503_SERVICE_UNAVAILABLE: {
+        status.HTTP_502_BAD_GATEWAY: {
+            "model": ErrorResponse,
             "description": (
-                "Transcription admission or inference queue capacity was exceeded."
-            )
+                "Provider or inference failure. Possible codes: "
+                "`metadata_retrieval_failed`, `audio_download_failed`, "
+                "`transcription_failed`."
+            ),
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": {
+                            "code": "metadata_retrieval_failed",
+                            "message": "Source metadata could not be retrieved.",
+                        }
+                    }
+                }
+            },
+        },
+        status.HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorResponse,
+            "description": (
+                "Transcription admission or inference capacity is unavailable. "
+                "Possible code: `transcription_capacity_exceeded`."
+            ),
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": {
+                            "code": "transcription_capacity_exceeded",
+                            "message": "Transcription capacity is currently unavailable.",
+                        }
+                    }
+                }
+            },
         },
         status.HTTP_504_GATEWAY_TIMEOUT: {
-            "description": "An external provider timed out."
+            "model": ErrorResponse,
+            "description": (
+                "Provider or inference timeout. Possible codes: "
+                "`metadata_timeout`, `audio_download_timeout`, "
+                "`transcription_timeout`."
+            ),
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": {
+                            "code": "metadata_timeout",
+                            "message": "Source metadata retrieval timed out.",
+                        }
+                    }
+                }
+            },
         },
     },
 )

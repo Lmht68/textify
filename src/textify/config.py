@@ -28,4 +28,4 @@ class AppConfig(BaseSettings):
     environment: Environment = Environment.LOCAL
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     host: str = Field(default="127.0.0.1", min_length=1)
-    port: int = Field(default=8000, ge=1, le=65535)
+    port: int = Field(default=8182, ge=1, le=65535)

@@ -605,7 +605,7 @@ def normalize_processed_metadata(
     """
     if not isinstance(metadata, Mapping):
         raise _metadata_provider_error("non_mapping_metadata")
-    _reject_collections_and_live(metadata, submitted.platform)
+    _reject_collections_and_live(metadata)
 
     expected_extractor_keys = _EXPECTED_EXTRACTOR_KEYS[submitted.platform]
     extractor_key = metadata.get("extractor_key", _MISSING)
@@ -940,10 +940,7 @@ def _safe_segment(value: str) -> str:
     return value
 
 
-def _reject_collections_and_live(
-    metadata: Mapping[str, object],
-    platform: Platform,
-) -> None:
+def _reject_collections_and_live(metadata: Mapping[str, object]) -> None:
     if "entries" in metadata:
         raise _invalid_source_error("collection_entries")
 
@@ -953,9 +950,6 @@ def _reject_collections_and_live(
             raise _metadata_provider_error("invalid_content_type")
         if content_type in _COLLECTION_TYPES:
             raise _invalid_source_error("collection_type")
-
-    if platform is Platform.YOUTUBE:
-        return
 
     is_live = metadata.get("is_live", _MISSING)
     if is_live is not _MISSING and not isinstance(is_live, bool):

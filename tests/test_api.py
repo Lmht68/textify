@@ -1004,8 +1004,19 @@ def app_config() -> AppConfig:
         environment=Environment.LOCAL,
         log_level="INFO",
         host="127.0.0.1",
-        port=8000,
+        port=8182,
     )
+
+
+def test_app_config_defaults_to_deployment_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Use the documented deployment port when no environment override exists."""
+    monkeypatch.delenv("TEXTIFY_PORT", raising=False)
+
+    settings = AppConfig(_env_file=None)  # type: ignore[call-arg]
+
+    assert settings.port == 8182
 
 
 def transcription_config(temporary_media_root: Path) -> TranscriptionConfig:
@@ -1560,6 +1571,45 @@ async def test_api_rejects_social_metadata_states_safely(
     assert state.native_calls == []
     assert state.request_directories == []
     assert state.prepared_directories == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "metadata_updates",
+    (
+        {"is_live": True},
+        {"is_upcoming": True},
+        {"live_status": "is_live"},
+    ),
+)
+async def test_api_rejects_youtube_live_metadata_safely(
+    tmp_path: Path,
+    metadata_updates: Mapping[str, object],
+) -> None:
+    """Reject live or upcoming YouTube metadata before caption acquisition."""
+    metadata = _controlled_youtube_metadata()
+    metadata.update(metadata_updates)
+    state = ControlledAdapterState(metadata_override=metadata)
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path),
+        ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post("/api/transcripts", json={"url": YOUTUBE_URL})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_url"
+    assert state.metadata_calls == [YOUTUBE_URL]
+    assert state.caption_list_calls == []
+    assert state.caption_fetch_calls == []
+    assert state.caption_translation_calls == []
+    assert state.download_calls == []
+    assert state.native_calls == []
 
 
 @pytest.mark.asyncio

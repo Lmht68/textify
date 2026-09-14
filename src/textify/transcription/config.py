@@ -1,6 +1,7 @@
 """Transcription service environment configuration."""
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -21,7 +22,7 @@ class TranscriptionConfig(BaseSettings):
         default="0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf",
         min_length=1,
     )
-    whisper_device: str = Field(default="cuda", min_length=1)
+    whisper_device: Literal["cuda"] = "cuda"
     whisper_device_index: int = Field(default=0, ge=0)
     whisper_compute_type: str = Field(default="float16", min_length=1)
     max_duration_seconds: int = Field(default=1800, gt=0)

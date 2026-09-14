@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import shutil
+import tempfile
 import time
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
@@ -175,6 +176,25 @@ def _validate_temporary_media_capacity(
         )
 
 
+def _ensure_writable_temporary_media_root(root: Path) -> None:
+    """Create and verify the temporary media root is writable.
+
+    Args:
+        root: Directory reserved for request-scoped media.
+
+    Raises:
+        RuntimeError: If the directory cannot be created or used for a temporary file.
+    """
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=root):
+            pass
+    except OSError as exc:
+        raise RuntimeError(
+            "Temporary media root must be a writable directory."
+        ) from exc
+
+
 def create_app(
     app_config: AppConfig | None = None,
     transcription_config: TranscriptionConfig | None = None,
@@ -205,9 +225,8 @@ def create_app(
     async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
         """Create process-lifetime state before accepting traffic."""
         configure_logging(resolved_app_config.log_level)
-        resolved_transcription_config.temporary_media_root.mkdir(
-            parents=True,
-            exist_ok=True,
+        _ensure_writable_temporary_media_root(
+            resolved_transcription_config.temporary_media_root
         )
         _validate_temporary_media_capacity(
             resolved_transcription_config,
@@ -228,8 +247,28 @@ def create_app(
 
     application = FastAPI(
         title="Textify",
-        description="Synchronous transcripts for supported public source videos.",
+        description=(
+            "Synchronous normalized transcripts for eligible public YouTube, "
+            "Facebook, Instagram, TikTok, and X videos. Requests are processed "
+            "within the response lifecycle and require a model-loaded CUDA worker."
+        ),
         version="0.1.0",
+        openapi_tags=[
+            {
+                "name": "health",
+                "description": (
+                    "Readiness after the lifespan has loaded process-owned "
+                    "transcription dependencies."
+                ),
+            },
+            {
+                "name": "transcripts",
+                "description": (
+                    "Synchronous public-video transcript creation with canonical "
+                    "source metadata and normalized timed segments."
+                ),
+            },
+        ],
         lifespan=lifespan,
     )
     application.state.ready = False
