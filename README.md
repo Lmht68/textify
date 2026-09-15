@@ -35,6 +35,15 @@ Build distributable artifacts with:
 uv build
 ```
 
+## GitHub CI/CD
+
+`.github/workflows/ci-cd.yml` validates pull requests targeting `main`, `main` pushes, and `v*` tag pushes with locked dependencies, Ruff format and lint checks, mypy, non-live pytest, and an `uv build`.
+Pull requests also build the CUDA container without publishing it.
+Validated pushes to `main` publish `main`, `latest`, and immutable `sha-<commit>` images to `ghcr.io/lmht68/textify`.
+A `v<package-version>` tag must match `pyproject.toml` and publishes a release-tagged image.
+Published images include build provenance and an SBOM attestation.
+Use `docker pull ghcr.io/lmht68/textify:latest` to retrieve the current main image.
+
 ## CUDA container
 
 The `Dockerfile` pins CUDA 12.9.2 with the cuDNN 9 runtime and uv 0.12.1.
@@ -172,16 +181,17 @@ Content-Type: application/json
 ### `POST /api/transcripts`
 
 `POST /api/transcripts` processes one source synchronously.
-It accepts one strict JSON object with only the `url` string field, limited to 2048 characters.
+It accepts a strict JSON object with a `url` string from 1 through 2048 characters and an optional `exclude` list.
 
 ```http
 POST /api/transcripts HTTP/1.1
 Host: 127.0.0.1:8182
 Content-Type: application/json
 
-{"url":"https://www.youtube.com/watch?v=AbCdEf12345"}
+{"url":"https://www.youtube.com/watch?v=AbCdEf12345","exclude":[]}
 ```
 
+Omitting `exclude` or sending an empty list returns the complete response.
 A successful response contains canonical source metadata and a normalized transcript.
 The response transcript `text` is the exact space-joined text of the ordered `segments`.
 
@@ -207,6 +217,58 @@ The response transcript `text` is the exact space-joined text of the ordered `se
   }
 }
 ```
+
+#### Excluding response fields
+
+`exclude` accepts only these exact case-sensitive dotted leaf paths:
+
+- `source.platform`
+- `source.video_id`
+- `source.url`
+- `source.title`
+- `source.description`
+- `source.channel`
+- `source.duration_seconds`
+- `transcript.method`
+- `transcript.language`
+- `transcript.text`
+- `transcript.segments`
+
+`transcript.segments` is atomic.
+Paths for individual segment members, such as `transcript.segments.start`, are invalid.
+Duplicate, unknown, structural, and deeper paths return the HTTP 422 `invalid_request` envelope.
+Projected responses omit excluded keys instead of returning `null`.
+The `source` and `transcript` objects always remain and each contains at least one direct field.
+
+For example, a text-only response can omit provider description and timed segments:
+
+```http
+POST /api/transcripts HTTP/1.1
+Host: 127.0.0.1:8182
+Content-Type: application/json
+
+{"url":"https://www.youtube.com/watch?v=AbCdEf12345","exclude":["source.description","transcript.segments"]}
+```
+
+```json
+{
+  "source": {
+    "platform": "youtube",
+    "video_id": "AbCdEf12345",
+    "url": "https://www.youtube.com/watch?v=AbCdEf12345",
+    "title": "Synthetic example video",
+    "channel": "Synthetic channel",
+    "duration_seconds": 42
+  },
+  "transcript": {
+    "method": "youtube_captions",
+    "language": "en",
+    "text": "First synthetic segment. Second synthetic segment."
+  }
+}
+```
+
+The text is identical to the corresponding complete response even though normalized timed segment objects are not retained.
 
 Failures use the safe error envelope.
 Messages are safe for display but are not byte-stable contracts.
