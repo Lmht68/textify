@@ -61,6 +61,7 @@ class FakeWhisperModel:
         """
         self._segments = segments
         self._language = language
+        self.consumed_segments: list[FakeWhisperSegment] = []
 
     def transcribe(
         self,
@@ -93,7 +94,13 @@ class FakeWhisperModel:
             condition_on_previous_text,
             initial_prompt,
         )
-        return iter(self._segments), FakeWhisperInfo(self._language)
+        return self._iterate_segments(), FakeWhisperInfo(self._language)
+
+    def _iterate_segments(self) -> Iterable[FakeWhisperSegment]:
+        """Yield configured lazy segments while recording full consumption."""
+        for segment in self._segments:
+            self.consumed_segments.append(segment)
+            yield segment
 
 
 class FakeCaptionTrack:
@@ -450,6 +457,34 @@ def test_acquire_transcript_preserves_provider_order_for_equal_rank_tracks() -> 
     assert (first_track.fetch_calls, second_track.fetch_calls) == (1, 1)
 
 
+def test_acquire_transcript_returns_text_only_caption_when_segments_are_excluded() -> (
+    None
+):
+    """Caption projection preserves usable text without a segments attribute."""
+    track = FakeCaptionTrack(
+        "caption",
+        "en-US",
+        False,
+        ((2.0, 3.0, " second "), (0.0, 1.0, " first ")),
+    )
+    provider = FakeCaptionProvider((track,))
+
+    transcript = acquire_transcript(
+        provider,
+        "dQw4w9WgXcQ",
+        "en-US",
+        include_segments=False,
+    )
+
+    assert transcript is not None
+    assert transcript.method is TranscriptMethod.YOUTUBE_CAPTIONS
+    assert transcript.language == "en-US"
+    assert transcript.text == "first second"
+    assert not hasattr(transcript, "segments")
+    assert provider.list_calls == ["dQw4w9WgXcQ"]
+    assert track.fetch_calls == 1
+
+
 @pytest.mark.parametrize(
     "declared_language",
     (None, "und", "not a language tag", "x-private"),
@@ -633,6 +668,28 @@ def test_faster_whisper_adapter_normalizes_timed_external_segments(
         (0.0, 1.0),
         (2.0, 3.0),
     ]
+
+
+def test_faster_whisper_adapter_returns_text_only_transcript_when_segments_are_excluded(
+    tmp_path: Path,
+) -> None:
+    """Text-only native output fully consumes lazy segments without retaining them."""
+    audio_path = tmp_path / "audio.webm"
+    audio_path.touch()
+    segments = (
+        FakeWhisperSegment(2.0, 3.0, " second "),
+        FakeWhisperSegment(0.0, 1.0, "first"),
+    )
+    model = FakeWhisperModel(segments, "en_us")
+    adapter = FasterWhisperTranscriber(model, isolated_transcription_config())
+
+    transcript = adapter.transcribe(audio_path, include_segments=False)
+
+    assert transcript.method is TranscriptMethod.FASTER_WHISPER
+    assert transcript.language == "en-US"
+    assert transcript.text == "first second"
+    assert not hasattr(transcript, "segments")
+    assert model.consumed_segments == list(segments)
 
 
 def test_faster_whisper_adapter_accepts_silent_media(tmp_path: Path) -> None:

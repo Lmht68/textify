@@ -151,14 +151,20 @@ class TranscriptService:
             raise RuntimeError("Transcription admission counter underflow.")
         self._admitted_transcriptions -= 1
 
-    async def transcribe(self, submitted_url: str) -> TranscriptionResult:
+    async def transcribe(
+        self,
+        submitted_url: str,
+        *,
+        include_segments: bool = True,
+    ) -> TranscriptionResult:
         """Retrieve one normalized Supported Platform Source and Transcript.
 
         Args:
             submitted_url: URL supplied by the API caller.
+            include_segments: Whether to retain normalized timed segments.
 
         Returns:
-            Canonical source metadata paired with a normalized timed transcript.
+            Canonical source metadata paired with a normalized transcript.
 
         Raises:
             TranscriptionError: If URL, provider, capacity, media, or work fails.
@@ -214,6 +220,7 @@ class TranscriptService:
                     caption_transcript = await self._acquire_youtube_caption(
                         video_id,
                         normalized_metadata.declared_language,
+                        include_segments=include_segments,
                     )
                     if caption_transcript is not None:
                         bind_request_log_fields(
@@ -230,6 +237,7 @@ class TranscriptService:
             transcript = await self._whisper_acquirer.acquire(
                 submitted.provider_url,
                 ownership,
+                include_segments=include_segments,
             )
             bind_request_log_fields(method=transcript.method.value)
             return TranscriptionResult(source, transcript)
@@ -256,6 +264,8 @@ class TranscriptService:
         self,
         video_id: str,
         declared_language: str | None,
+        *,
+        include_segments: bool = True,
     ) -> Transcript | None:
         """Acquire optional YouTube captions without blocking the event loop."""
         try:
@@ -264,6 +274,7 @@ class TranscriptService:
                 self._caption_provider,
                 video_id,
                 declared_language,
+                include_segments=include_segments,
             )
         except acquisition._CaptionProviderTimeout:
             return None

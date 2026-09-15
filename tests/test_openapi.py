@@ -25,6 +25,19 @@ EXPECTED_ERROR_CODES = {
 EXPECTED_PLATFORMS = {"youtube", "instagram", "facebook", "tiktok", "x"}
 EXPECTED_TRANSCRIPT_METHODS = {"youtube_captions", "faster_whisper"}
 DOCUMENTED_ERROR_STATUSES = {"400", "422", "500", "502", "503", "504"}
+EXPECTED_RESPONSE_FIELD_PATHS = {
+    "source.platform",
+    "source.video_id",
+    "source.url",
+    "source.title",
+    "source.description",
+    "source.channel",
+    "source.duration_seconds",
+    "transcript.method",
+    "transcript.language",
+    "transcript.text",
+    "transcript.segments",
+}
 
 
 async def test_openapi_describes_public_transcript_contract() -> None:
@@ -58,6 +71,31 @@ async def test_openapi_describes_public_transcript_contract() -> None:
     assert success_schema == {"$ref": "#/components/schemas/TranscriptionResponse"}
     assert components["TranscriptRequest"]["examples"]
     assert components["TranscriptionResponse"]["examples"]
+    request_component = components["TranscriptRequest"]
+    assert "exclude" not in request_component["required"]
+    assert (
+        set(request_component["properties"]["exclude"]["items"]["enum"])
+        == EXPECTED_RESPONSE_FIELD_PATHS
+    )
+
+    response_component = components["TranscriptionResponse"]
+    source_component = components["SourceResponse"]
+    transcript_component = components["TranscriptResponse"]
+    segment_component = components["SegmentResponse"]
+    assert response_component["required"] == ["source", "transcript"]
+    for component in (source_component, transcript_component):
+        assert component["minProperties"] == 1
+        assert "required" not in component
+        assert all(
+            property_schema.get("type") != "null"
+            for property_schema in component["properties"].values()
+        )
+    assert segment_component["required"] == ["start", "end", "text"]
+    assert segment_component["properties"]["text"]["minLength"] == 1
+    full_example, projected_example = response_component["examples"]
+    assert "segments" in full_example["transcript"]
+    assert "segments" not in projected_example["transcript"]
+    assert "description" not in projected_example["source"]
 
     assert set(components["Platform"]["enum"]) == EXPECTED_PLATFORMS
     assert set(components["TranscriptMethod"]["enum"]) == EXPECTED_TRANSCRIPT_METHODS

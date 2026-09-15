@@ -23,6 +23,7 @@ from textify.transcription.service import TranscriptionAdapters, TranscriptServi
 from textify.transcription.types import (
     RawSegment,
     Segment,
+    TimedTranscript,
     Transcript,
     TranscriptMethod,
 )
@@ -242,29 +243,43 @@ class FixedTranscriber:
             failure: Optional provider failure to raise.
         """
         self.calls: list[Path] = []
+        self.include_segments_calls: list[bool] = []
         self._failure = failure
 
-    def transcribe(self, audio_path: Path) -> Transcript:
+    def transcribe(
+        self,
+        audio_path: Path,
+        *,
+        include_segments: bool = True,
+    ) -> Transcript:
         """Return a normalized transcript for the supplied audio.
 
         Args:
             audio_path: Request-owned local audio path.
+            include_segments: Whether to retain normalized timed segments.
 
         Returns:
-            Deterministic timed Transcript.
+            Deterministic text-only or timed Transcript.
 
         Raises:
             Exception: Configured inference failure.
         """
         self.calls.append(audio_path)
+        self.include_segments_calls.append(include_segments)
         if self._failure is not None:
             raise self._failure
+        if not include_segments:
+            return Transcript(
+                method=TranscriptMethod.FASTER_WHISPER,
+                language="en",
+                text="Transcript",
+            )
         segment = Segment(0.0, 1.0, "Transcript")
-        return Transcript(
-            TranscriptMethod.FASTER_WHISPER,
-            "en",
-            (segment,),
-            "Transcript",
+        return TimedTranscript(
+            method=TranscriptMethod.FASTER_WHISPER,
+            language="en",
+            text="Transcript",
+            segments=(segment,),
         )
 
 
@@ -372,6 +387,30 @@ async def test_transcribe_allows_the_inclusive_duration_and_cleans_media(
     assert result.source.duration_seconds == 1800
     assert result.transcript.text == "Transcript"
     assert downloader.calls == [DIRECT_TIKTOK_URL]
+    assert all(not directory.exists() for directory in downloader.request_directories)
+
+
+@pytest.mark.asyncio
+async def test_transcribe_forwards_text_only_selection_to_native_inference(
+    tmp_path: Path,
+) -> None:
+    """Text-only native requests retain provider calls and media cleanup."""
+    downloader = RecordingAudioDownloader()
+    transcriber = FixedTranscriber()
+    service = build_service(
+        tmp_path,
+        RecordingMetadataExtractor(tiktok_metadata()),
+        downloader,
+        transcriber,
+    )
+
+    result = await service.transcribe(DIRECT_TIKTOK_URL, include_segments=False)
+
+    assert result.transcript.method is TranscriptMethod.FASTER_WHISPER
+    assert result.transcript.text == "Transcript"
+    assert not hasattr(result.transcript, "segments")
+    assert downloader.calls == [DIRECT_TIKTOK_URL]
+    assert transcriber.include_segments_calls == [False]
     assert all(not directory.exists() for directory in downloader.request_directories)
 
 
@@ -587,6 +626,46 @@ async def test_transcribe_returns_youtube_captions_without_native_work(
     assert caption_provider.calls == ["dQw4w9WgXcQ"]
     assert downloader.calls == []
     assert transcriber.calls == []
+
+
+@pytest.mark.asyncio
+async def test_transcribe_forwards_text_only_selection_to_youtube_captions(
+    tmp_path: Path,
+) -> None:
+    """Text-only caption requests retain provider calls and prepared-media cleanup."""
+    prepared_directory = tmp_path / "inspection"
+    prepared_directory.mkdir()
+    prepared_path = prepared_directory / "audio.webm"
+    prepared_path.touch()
+    caption_track = RecordingCaptionTrack(
+        "en-US",
+        False,
+        ((0.0, 1.0, "caption"),),
+    )
+    caption_provider = RecordingCaptionProvider((caption_track,))
+    downloader = RecordingAudioDownloader()
+    transcriber = FixedTranscriber()
+    service = build_service(
+        tmp_path,
+        RecordingMetadataExtractor(
+            youtube_metadata(),
+            PreparedAudio(prepared_path, prepared_directory),
+        ),
+        downloader,
+        transcriber,
+        caption_provider,
+    )
+
+    result = await service.transcribe(YOUTUBE_URL, include_segments=False)
+
+    assert result.transcript.method is TranscriptMethod.YOUTUBE_CAPTIONS
+    assert result.transcript.text == "caption"
+    assert not hasattr(result.transcript, "segments")
+    assert caption_provider.calls == ["dQw4w9WgXcQ"]
+    assert caption_track.fetch_calls == 1
+    assert downloader.calls == []
+    assert transcriber.calls == []
+    assert not prepared_directory.exists()
 
 
 @pytest.mark.asyncio

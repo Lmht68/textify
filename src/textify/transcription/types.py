@@ -105,28 +105,47 @@ class Segment:
 
 @dataclass(frozen=True, slots=True)
 class Transcript:
-    """Contain a normalized transcript and its acquisition method.
+    """Contain normalized transcript text and its acquisition method.
 
     Attributes:
         method: Provider-independent method that produced the transcript.
         language: Canonical BCP 47 language tag, or ``und`` when unknown.
-        segments: Start-sorted normalized transcript segments.
-        text: Exact one-space concatenation of segment text.
+        text: Whitespace-normalized transcript text.
     """
 
     method: TranscriptMethod
     language: str
-    segments: tuple[Segment, ...]
     text: str
 
     def __post_init__(self) -> None:
-        """Validate transcript composition and canonical language."""
+        """Validate transcript text and canonical language."""
         if not isinstance(self.method, TranscriptMethod):
             raise TypeError("method must be a TranscriptMethod.")
         if not isinstance(
             self.language, str
         ) or self.language != normalize_language_tag(self.language):
             raise ValueError("language must be a canonical BCP 47 tag.")
+        if not isinstance(self.text, str):
+            raise TypeError("text must be a string.")
+        if self.text != _collapse_whitespace(self.text):
+            raise ValueError("text must be whitespace-normalized.")
+        if not self.text and self.language != "und":
+            raise ValueError("silent media must use the und language tag.")
+
+
+@dataclass(frozen=True, slots=True)
+class TimedTranscript(Transcript):
+    """Contain normalized transcript text with its timed segments.
+
+    Attributes:
+        segments: Start-sorted normalized transcript segments.
+    """
+
+    segments: tuple[Segment, ...]
+
+    def __post_init__(self) -> None:
+        """Validate segment ordering and exact text composition."""
+        Transcript.__post_init__(self)
         if not isinstance(self.segments, tuple) or not all(
             isinstance(segment, Segment) for segment in self.segments
         ):
@@ -136,13 +155,9 @@ class Transcript:
             for earlier, later in zip(self.segments, self.segments[1:])
         ):
             raise ValueError("segments must be sorted by start time.")
-        if not isinstance(self.text, str):
-            raise TypeError("text must be a string.")
         expected_text = " ".join(segment.text for segment in self.segments)
         if self.text != expected_text:
             raise ValueError("text must exactly join the segment text.")
-        if not self.segments and self.language != "und":
-            raise ValueError("silent media must use the und language tag.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,22 +184,25 @@ def normalize_transcript(
     method: TranscriptMethod,
     language: object,
     raw_segments: Iterable[RawSegment],
+    *,
+    include_segments: bool = True,
 ) -> Transcript:
-    """Normalize raw provider segments into a valid Transcript.
+    """Normalize raw provider segments into a valid transcript.
 
     Args:
         method: Provider-independent acquisition method.
         language: Provider-reported language tag.
         raw_segments: ``(start, end, text)`` values from a provider.
+        include_segments: Whether to retain normalized timed segments.
 
     Returns:
-        A start-sorted Transcript with collapsed segment whitespace.
+        A text-only Transcript or TimedTranscript with collapsed whitespace.
 
     Raises:
         TypeError: If a raw segment has an invalid shape, time, or text type.
         ValueError: If a raw segment has invalid timing.
     """
-    normalized_segments: list[Segment] = []
+    normalized_records: list[tuple[float, float, str]] = []
     for raw_segment in raw_segments:
         if not isinstance(raw_segment, tuple) or len(raw_segment) != 3:
             raise TypeError("raw segments must contain start, end, and text.")
@@ -197,20 +215,30 @@ def normalize_transcript(
             raise TypeError("raw segment text must be a string.")
         normalized_text = _collapse_whitespace(text)
         if normalized_text:
-            normalized_segments.append(
-                Segment(normalized_start, normalized_end, normalized_text)
+            normalized_records.append(
+                (normalized_start, normalized_end, normalized_text)
             )
 
-    normalized_segments.sort(key=lambda segment: segment.start)
-    if not normalized_segments:
-        return Transcript(method, "und", (), "")
+    normalized_records.sort(key=lambda record: record[0])
+    normalized_language = normalize_language_tag(language)
+    if not normalized_records:
+        normalized_language = "und"
+    normalized_text = " ".join(record[2] for record in normalized_records)
 
-    segments = tuple(normalized_segments)
-    return Transcript(
-        method,
-        normalize_language_tag(language),
-        segments,
-        " ".join(segment.text for segment in segments),
+    if not include_segments:
+        return Transcript(
+            method=method,
+            language=normalized_language,
+            text=normalized_text,
+        )
+
+    return TimedTranscript(
+        method=method,
+        language=normalized_language,
+        text=normalized_text,
+        segments=tuple(
+            Segment(start, end, text) for start, end, text in normalized_records
+        ),
     )
 
 

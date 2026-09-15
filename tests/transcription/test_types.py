@@ -9,6 +9,7 @@ from textify.transcription.types import (
     Platform,
     Segment,
     Source,
+    TimedTranscript,
     Transcript,
     TranscriptMethod,
     normalize_language_tag,
@@ -53,17 +54,71 @@ def test_normalize_transcript_sorts_and_collapses_segments() -> None:
     )
 
 
-def test_normalize_transcript_handles_invalid_language_and_silence() -> None:
-    """Invalid language tags and silent media have the documented und form."""
+@pytest.mark.parametrize("include_segments", (True, False))
+def test_normalize_transcript_handles_invalid_language_and_silence(
+    include_segments: bool,
+) -> None:
+    """Invalid language tags and silent media retain canonical output forms."""
     unknown_language = normalize_transcript(
         TranscriptMethod.FASTER_WHISPER,
         "not a language tag",
         ((0.0, 1.0, "text"),),
+        include_segments=include_segments,
     )
-    silent = normalize_transcript(TranscriptMethod.FASTER_WHISPER, "en", ())
+    silent = normalize_transcript(
+        TranscriptMethod.FASTER_WHISPER,
+        "en",
+        (),
+        include_segments=include_segments,
+    )
 
     assert unknown_language.language == "und"
-    assert silent == Transcript(TranscriptMethod.FASTER_WHISPER, "und", (), "")
+    if include_segments:
+        assert silent == TimedTranscript(
+            method=TranscriptMethod.FASTER_WHISPER,
+            language="und",
+            text="",
+            segments=(),
+        )
+    else:
+        assert silent == Transcript(
+            method=TranscriptMethod.FASTER_WHISPER,
+            language="und",
+            text="",
+        )
+
+
+def test_normalize_transcript_omits_segment_construction_when_not_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Text-only normalization retains sorted text without constructing Segments."""
+
+    def fail_segment_construction(*args: object, **kwargs: object) -> None:
+        """Fail when text-only normalization tries to construct a Segment."""
+        del args, kwargs
+        raise AssertionError("text-only normalization constructed a Segment")
+
+    monkeypatch.setattr(
+        "textify.transcription.types.Segment",
+        fail_segment_construction,
+    )
+
+    transcript = normalize_transcript(
+        TranscriptMethod.FASTER_WHISPER,
+        "EN_us",
+        (
+            (2.0, 3.0, "  second   segment "),
+            (1.0, 1.0, " first "),
+            (2.0, 2.5, " overlapping "),
+            (4.0, 4.0, "\t"),
+        ),
+        include_segments=False,
+    )
+
+    assert type(transcript) is Transcript
+    assert transcript.language == "en-US"
+    assert transcript.text == "first second segment overlapping"
+    assert not hasattr(transcript, "segments")
 
 
 @pytest.mark.parametrize(
@@ -92,9 +147,16 @@ def test_normalize_language_tag_handles_provider_values(
         (0.0, 1.0, 1),
     ),
 )
+@pytest.mark.parametrize("include_segments", (True, False))
 def test_normalize_transcript_rejects_invalid_segment_values(
     raw_segment: tuple[object, object, object],
+    include_segments: bool,
 ) -> None:
-    """Provider timing and text violations cannot enter the domain model."""
+    """Provider timing and text violations cannot enter either transcript form."""
     with pytest.raises((TypeError, ValueError)):
-        normalize_transcript(TranscriptMethod.FASTER_WHISPER, "en", (raw_segment,))
+        normalize_transcript(
+            TranscriptMethod.FASTER_WHISPER,
+            "en",
+            (raw_segment,),
+            include_segments=include_segments,
+        )

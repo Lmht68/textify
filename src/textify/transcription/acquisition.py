@@ -188,14 +188,20 @@ class AudioDownloader(Protocol):
 class WhisperTranscriber(Protocol):
     """Transcribe one local audio file with a preloaded model."""
 
-    def transcribe(self, audio_path: Path) -> Transcript:
+    def transcribe(
+        self,
+        audio_path: Path,
+        *,
+        include_segments: bool = True,
+    ) -> Transcript:
         """Transcribe the provided local audio file.
 
         Args:
             audio_path: Validated completed audio file.
+            include_segments: Whether to retain normalized timed segments.
 
         Returns:
-            Normalized timed Transcript.
+            Normalized Transcript.
         """
         ...
 
@@ -531,11 +537,17 @@ class FasterWhisperTranscriber:
         self._model = model
         self._settings = settings
 
-    def transcribe(self, audio_path: Path) -> Transcript:
-        """Transcribe one local audio file into normalized timed segments.
+    def transcribe(
+        self,
+        audio_path: Path,
+        *,
+        include_segments: bool = True,
+    ) -> Transcript:
+        """Transcribe one local audio file into normalized transcript data.
 
         Args:
             audio_path: Validated completed audio file.
+            include_segments: Whether to retain normalized timed segments.
 
         Returns:
             Normalized Transcript, including successful silent media.
@@ -557,6 +569,7 @@ class FasterWhisperTranscriber:
                 TranscriptMethod.FASTER_WHISPER,
                 info.language,
                 ((segment.start, segment.end, segment.text) for segment in segments),
+                include_segments=include_segments,
             )
         except _TRANSCRIPTION_EXTERNAL_FAILURES as exc:
             _log_acquisition_error(
@@ -777,6 +790,8 @@ def acquire_transcript(
     provider: CaptionProvider,
     video_id: str,
     declared_language: str | None,
+    *,
+    include_segments: bool = True,
 ) -> Transcript | None:
     """Acquire the first usable original YouTube caption Transcript.
 
@@ -784,6 +799,7 @@ def acquire_transcript(
         provider: Caption provider boundary.
         video_id: Stable YouTube video identity.
         declared_language: Source's canonical provider-declared language.
+        include_segments: Whether to retain normalized timed segments.
 
     Returns:
         The first usable normalized caption Transcript, or None when the
@@ -825,6 +841,7 @@ def acquire_transcript(
                 TranscriptMethod.YOUTUBE_CAPTIONS,
                 track.language_code,
                 track.fetch_segments(),
+                include_segments=include_segments,
             )
         except _CaptionProviderTimeout:
             raise
@@ -854,7 +871,7 @@ def acquire_transcript(
             )
             continue
 
-        if not transcript.segments:
+        if not transcript.text:
             continue
         logger.debug(
             "transcript acquired",
@@ -902,12 +919,15 @@ class WhisperAcquirer:
         self,
         source_url: str,
         ownership: TranscriptionOwnership,
+        *,
+        include_segments: bool = True,
     ) -> Transcript:
         """Acquire source audio and transcribe it under the native permit.
 
         Args:
             source_url: Validated provider URL for yt-dlp.
             ownership: Request ownership retained when native work outlives a response.
+            include_segments: Whether to retain normalized timed segments.
 
         Returns:
             Normalized Transcript, including successful silent media.
@@ -942,6 +962,7 @@ class WhisperAcquirer:
                         _transcribe_audio,
                         audio_path,
                         self._transcriber,
+                        include_segments=include_segments,
                     ),
                     name="native-transcription",
                 )
@@ -1178,10 +1199,15 @@ class WhisperAcquirer:
 def _transcribe_audio(
     audio_path: Path,
     transcriber: WhisperTranscriber,
+    *,
+    include_segments: bool = True,
 ) -> Transcript:
     """Run native inference against one validated audio file."""
     try:
-        transcript = transcriber.transcribe(audio_path)
+        transcript = transcriber.transcribe(
+            audio_path,
+            include_segments=include_segments,
+        )
     except _TranscriptionProviderTimeout:
         raise
     except _TranscriptionProviderFailure:

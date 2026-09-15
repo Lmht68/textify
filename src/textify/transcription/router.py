@@ -9,6 +9,7 @@ from textify.transcription.schemas import (
     ErrorResponse,
     TranscriptionResponse,
     TranscriptRequest,
+    build_transcription_response,
 )
 from textify.transcription.service import TranscriptService
 
@@ -68,8 +69,8 @@ async def _cancel_and_await[T](task: asyncio.Task[T]) -> None:
     response_model=TranscriptionResponse,
     summary="Create a transcript",
     description=(
-        "Synchronously retrieve a normalized timed transcript for one public "
-        "Facebook, Instagram, TikTok, X, or YouTube video."
+        "Synchronously retrieve a normalized transcript for one public Facebook, "
+        "Instagram, TikTok, X, or YouTube video."
     ),
     response_description="Canonical source metadata and its normalized transcript.",
     tags=["transcripts"],
@@ -187,15 +188,19 @@ async def create_transcript(
     """Create one synchronous Supported Platform transcript.
 
     Args:
-        payload: Strictly validated submitted source URL.
+        payload: Strictly validated submitted URL and response exclusions.
         http_request: HTTP request whose disconnect signal cancels the lifecycle.
         transcript_service: Lifespan-owned application service.
 
     Returns:
-        Canonical source metadata and a normalized timed transcript.
+        Canonical projected source metadata and normalized transcript.
     """
+    excluded_fields = frozenset(payload.exclude)
     service_task = asyncio.create_task(
-        transcript_service.transcribe(payload.url),
+        transcript_service.transcribe(
+            payload.url,
+            include_segments="transcript.segments" not in excluded_fields,
+        ),
         name="transcript-service",
     )
     disconnect_task = asyncio.create_task(
@@ -210,7 +215,7 @@ async def create_transcript(
         if service_task in completed:
             await _cancel_and_await(disconnect_task)
             result = service_task.result()
-            return TranscriptionResponse.from_result(result)
+            return build_transcription_response(result, excluded_fields)
 
         await _cancel_and_await(service_task)
         raise asyncio.CancelledError

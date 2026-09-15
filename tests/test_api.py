@@ -43,6 +43,7 @@ from textify.transcription.types import (
     Platform,
     RawSegment,
     Segment,
+    TimedTranscript,
     Transcript,
     TranscriptionResult,
     TranscriptMethod,
@@ -632,18 +633,35 @@ class ApiAudioDownloader:
 class ApiTranscriber:
     """Return a deterministic normalized Transcript."""
 
-    def transcribe(self, audio_path: Path) -> Transcript:
+    def transcribe(
+        self,
+        audio_path: Path,
+        *,
+        include_segments: bool = True,
+    ) -> Transcript:
         """Return one normalized transcript for test audio.
 
         Args:
             audio_path: Request-owned audio path.
+            include_segments: Whether to retain normalized timed segments.
 
         Returns:
-            Deterministic timed Transcript.
+            Deterministic text-only or timed Transcript.
         """
         assert audio_path.is_file()
+        if not include_segments:
+            return Transcript(
+                method=TranscriptMethod.FASTER_WHISPER,
+                language="en",
+                text="One",
+            )
         segment = Segment(0.0, 1.0, "One")
-        return Transcript(TranscriptMethod.FASTER_WHISPER, "en", (segment,), "One")
+        return TimedTranscript(
+            method=TranscriptMethod.FASTER_WHISPER,
+            language="en",
+            text="One",
+            segments=(segment,),
+        )
 
 
 class CountingAdaptersFactory:
@@ -701,6 +719,7 @@ class ControlledAdapterState:
     download_calls: list[str] = field(default_factory=list)
     download_deadlines: list[float] = field(default_factory=list)
     native_calls: list[Path] = field(default_factory=list)
+    native_include_segments: list[bool] = field(default_factory=list)
     caption_list_calls: list[str] = field(default_factory=list)
     caption_fetch_calls: list[str] = field(default_factory=list)
     caption_translation_calls: list[str] = field(default_factory=list)
@@ -909,11 +928,17 @@ class ControlledTranscriber:
         """Initialize shared native-stage state."""
         self._state = state
 
-    def transcribe(self, audio_path: Path) -> Transcript:
+    def transcribe(
+        self,
+        audio_path: Path,
+        *,
+        include_segments: bool = True,
+    ) -> Transcript:
         """Return a transcript after any configured non-cancellable wait."""
         assert audio_path.is_file()
         call_index = len(self._state.native_calls)
         self._state.native_calls.append(audio_path)
+        self._state.native_include_segments.append(include_segments)
         self._state.call_order.append("native")
         self._state.native_entered.set()
         try:
@@ -926,8 +951,19 @@ class ControlledTranscriber:
                 if call_index < len(self._state.native_result_texts)
                 else "One"
             )
+            if not include_segments:
+                return Transcript(
+                    method=TranscriptMethod.FASTER_WHISPER,
+                    language="en",
+                    text=text,
+                )
             segment = Segment(0.0, 1.0, text)
-            return Transcript(TranscriptMethod.FASTER_WHISPER, "en", (segment,), text)
+            return TimedTranscript(
+                method=TranscriptMethod.FASTER_WHISPER,
+                language="en",
+                text=text,
+                segments=(segment,),
+            )
         finally:
             self._state.native_completed.set()
 
@@ -981,16 +1017,22 @@ class ErrorService:
         """
         self._error = error
 
-    async def transcribe(self, submitted_url: str) -> TranscriptionResult:
+    async def transcribe(
+        self,
+        submitted_url: str,
+        *,
+        include_segments: bool = True,
+    ) -> TranscriptionResult:
         """Raise the configured exception.
 
         Args:
             submitted_url: Submitted URL intentionally ignored by the fake.
+            include_segments: Segment retention intentionally ignored by the fake.
 
         Raises:
             Exception: Configured exception.
         """
-        del submitted_url
+        del submitted_url, include_segments
         raise self._error
 
 
@@ -1277,6 +1319,316 @@ async def test_api_transcribes_every_supported_tiktok_form(
         not directory.exists()
         for directory in factory.audio_downloaders[0].request_directories
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "excluded_path",
+    (
+        "source.platform",
+        "source.video_id",
+        "source.url",
+        "source.title",
+        "source.description",
+        "source.channel",
+        "source.duration_seconds",
+        "transcript.method",
+        "transcript.language",
+        "transcript.text",
+        "transcript.segments",
+    ),
+)
+async def test_api_excludes_each_requested_response_field(
+    tmp_path: Path,
+    excluded_path: str,
+) -> None:
+    """Each allowed exclusion omits exactly its requested response leaf."""
+    state = ControlledAdapterState()
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path),
+        ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/transcripts",
+                json={"url": DIRECT_TIKTOK_URL, "exclude": [excluded_path]},
+            )
+
+    response_body = response.json()
+    response_root, field_name = excluded_path.split(".")
+    assert response.status_code == 200
+    assert field_name not in response_body[response_root]
+    assert response_body["source"]
+    assert response_body["transcript"]
+    assert state.native_include_segments == [excluded_path != "transcript.segments"]
+
+
+@pytest.mark.asyncio
+async def test_api_accepts_minimum_nonempty_projection(tmp_path: Path) -> None:
+    """A projection retaining one source and transcript leaf remains valid."""
+    state = ControlledAdapterState()
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path),
+        ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
+    )
+    excluded_paths = [
+        "source.video_id",
+        "source.url",
+        "source.title",
+        "source.description",
+        "source.channel",
+        "source.duration_seconds",
+        "transcript.method",
+        "transcript.language",
+        "transcript.segments",
+    ]
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/transcripts",
+                json={"url": DIRECT_TIKTOK_URL, "exclude": excluded_paths},
+            )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "source": {"platform": "tiktok"},
+        "transcript": {"text": "One"},
+    }
+    assert state.native_include_segments == [False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("_description", "exclude"),
+    (
+        ("duplicate", ["source.description", "source.description"]),
+        ("case mismatch", ["Source.description"]),
+        ("empty path", [""]),
+        ("unknown path", ["source.unknown"]),
+        ("source root", ["source"]),
+        ("transcript root", ["transcript"]),
+        ("deeper start path", ["transcript.segments.start"]),
+        ("deeper end path", ["transcript.segments.end"]),
+        ("deeper text path", ["transcript.segments.text"]),
+        (
+            "all source paths",
+            [
+                "source.platform",
+                "source.video_id",
+                "source.url",
+                "source.title",
+                "source.description",
+                "source.channel",
+                "source.duration_seconds",
+            ],
+        ),
+        (
+            "all transcript paths",
+            [
+                "transcript.method",
+                "transcript.language",
+                "transcript.text",
+                "transcript.segments",
+            ],
+        ),
+        (
+            "all response paths",
+            [
+                "source.platform",
+                "source.video_id",
+                "source.url",
+                "source.title",
+                "source.description",
+                "source.channel",
+                "source.duration_seconds",
+                "transcript.method",
+                "transcript.language",
+                "transcript.text",
+                "transcript.segments",
+            ],
+        ),
+        ("scalar", "source.description"),
+        ("null", None),
+        ("non-string path", [1]),
+    ),
+)
+async def test_api_rejects_invalid_response_exclusions_before_provider_work(
+    tmp_path: Path,
+    _description: str,
+    exclude: object,
+) -> None:
+    """Invalid projection paths return invalid_request before provider work."""
+    state = ControlledAdapterState()
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path),
+        ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/transcripts",
+                json={"url": DIRECT_TIKTOK_URL, "exclude": exclude},
+            )
+
+    _assert_safe_error(response, 422, "invalid_request")
+    assert state.metadata_calls == []
+    assert state.caption_list_calls == []
+    assert state.caption_fetch_calls == []
+    assert state.caption_translation_calls == []
+    assert state.download_calls == []
+    assert state.native_calls == []
+    assert state.native_include_segments == []
+    assert state.request_directories == []
+    assert state.prepared_directories == []
+
+
+@pytest.mark.asyncio
+async def test_api_empty_exclusions_preserve_the_default_response(
+    tmp_path: Path,
+) -> None:
+    """An explicit empty exclusion list preserves full default behavior."""
+    state = ControlledAdapterState()
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path),
+        ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            default_response = await client.post(
+                "/api/transcripts",
+                json={"url": DIRECT_TIKTOK_URL},
+            )
+            empty_response = await client.post(
+                "/api/transcripts",
+                json={"url": DIRECT_TIKTOK_URL, "exclude": []},
+            )
+
+    assert default_response.status_code == empty_response.status_code == 200
+    assert empty_response.json() == default_response.json()
+    assert state.native_include_segments == [True, True]
+
+
+@pytest.mark.asyncio
+async def test_api_excludes_native_segments_without_segment_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native text-only projection constructs neither domain nor wire segments."""
+
+    def fail_segment_construction(*args: object, **kwargs: object) -> None:
+        """Fail when a segments-excluded request constructs a segment value."""
+        del args, kwargs
+        raise AssertionError("segments were constructed")
+
+    monkeypatch.setattr(
+        "textify.transcription.types.Segment",
+        fail_segment_construction,
+    )
+    monkeypatch.setattr(
+        "textify.transcription.schemas.SegmentResponse",
+        fail_segment_construction,
+    )
+    state = ControlledAdapterState()
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path),
+        ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/transcripts",
+                json={
+                    "url": DIRECT_TIKTOK_URL,
+                    "exclude": ["transcript.segments"],
+                },
+            )
+
+    assert response.status_code == 200
+    assert response.json()["transcript"] == {
+        "method": "faster_whisper",
+        "language": "en",
+        "text": "One",
+    }
+    assert state.native_include_segments == [False]
+
+
+@pytest.mark.asyncio
+async def test_api_excludes_caption_segments_without_segment_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Caption text-only projection constructs neither domain nor wire segments."""
+
+    def fail_segment_construction(*args: object, **kwargs: object) -> None:
+        """Fail when a segments-excluded request constructs a segment value."""
+        del args, kwargs
+        raise AssertionError("segments were constructed")
+
+    monkeypatch.setattr(
+        "textify.transcription.types.Segment",
+        fail_segment_construction,
+    )
+    monkeypatch.setattr(
+        "textify.transcription.schemas.SegmentResponse",
+        fail_segment_construction,
+    )
+    state = ControlledAdapterState()
+    state.youtube_caption_tracks = (
+        ControlledCaptionTrack(
+            state,
+            "original",
+            "en-US",
+            False,
+            ((0.0, 1.0, "caption"),),
+        ),
+    )
+    application = create_app(
+        app_config(),
+        transcription_config(tmp_path),
+        ControlledAdaptersFactory(state),
+        available_temporary_media_bytes=_sufficient_temporary_media_bytes,
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/transcripts",
+                json={
+                    "url": YOUTUBE_URL,
+                    "exclude": ["transcript.segments"],
+                },
+            )
+
+    assert response.status_code == 200
+    assert response.json()["transcript"] == {
+        "method": "youtube_captions",
+        "language": "en-US",
+        "text": "caption",
+    }
+    assert state.caption_fetch_calls == ["original"]
+    assert state.native_calls == []
 
 
 @pytest.mark.asyncio
