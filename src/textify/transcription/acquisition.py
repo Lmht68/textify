@@ -625,20 +625,26 @@ def load_whisper_transcriber(
 
 
 class TranscriptionOwnership:
-    """Own request admission and inspection media across native inference."""
+    """Own inspection-prepared media and caller resources across native inference."""
 
     def __init__(
         self,
         prepared_audio: PreparedAudio | None,
         cancellation_event: threading.Event,
-        release_admission: Callable[[], None],
+        on_resources_released: Callable[[], None],
     ) -> None:
-        """Initialize request-scoped ownership before native work can begin."""
+        """Initialize caller-scoped ownership before native work can begin.
+
+        Args:
+            prepared_audio: Inspection-stage media this ownership must clean.
+            cancellation_event: Cooperative signal shared with provider work.
+            on_resources_released: Callback invoked once after every owner ends.
+        """
         self._prepared_audio = prepared_audio
         self._cancellation_event = cancellation_event
-        self._release_admission = release_admission
+        self._on_resources_released = on_resources_released
         self._native_retained = False
-        self._request_finished = False
+        self._caller_finished = False
         self._native_completed = False
         self._released = False
 
@@ -653,13 +659,13 @@ class TranscriptionOwnership:
         return self._cancellation_event
 
     def retain_native_work(self) -> None:
-        """Transfer cleanup and admission release to native-work completion."""
+        """Transfer media cleanup and resource release to native work completion."""
         self._native_retained = True
         self._release_when_finished()
 
-    def finish_request(self) -> None:
-        """Mark the HTTP request finished and stop interruptible provider work."""
-        self._request_finished = True
+    def finish_caller(self) -> None:
+        """Mark caller work finished and stop interruptible provider work."""
+        self._caller_finished = True
         self._cancellation_event.set()
         self._release_when_finished()
 
@@ -669,15 +675,15 @@ class TranscriptionOwnership:
         self._release_when_finished()
 
     def _release_when_finished(self) -> None:
-        """Clean request resources and admission only after every owner finishes."""
-        if self._released or not self._request_finished:
+        """Clean prepared media and release resources after every owner finishes."""
+        if self._released or not self._caller_finished:
             return
         if self._native_retained and not self._native_completed:
             return
         self._released = True
         if self._prepared_audio is not None:
             self._prepared_audio.cleanup()
-        self._release_admission()
+        self._on_resources_released()
 
 
 async def _finish_cancelled_download(worker: asyncio.Task[Path]) -> None:

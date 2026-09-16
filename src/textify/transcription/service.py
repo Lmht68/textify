@@ -112,15 +112,20 @@ async def _finish_cancelled_metadata(
         extracted_metadata.prepared_audio.cleanup()
 
 
-class TranscriptService:
-    """Transcribe one submitted Supported Platform URL through the lifecycle."""
+class TranscriptionExecutor:
+    """Execute one validated transcription lifecycle outside HTTP concerns.
+
+    Callers must supply a supported SubmittedSource produced by URL inspection,
+    a cooperative cancellation event they own, and a callback that releases
+    caller-owned resources exactly once after all retained native work ends.
+    """
 
     def __init__(
         self,
         adapters: TranscriptionAdapters,
         settings: TranscriptionConfig,
     ) -> None:
-        """Initialize process-lifetime request admission and provider resources.
+        """Initialize process-lifetime provider execution resources.
 
         Args:
             adapters: Complete bundle of provider boundaries.
@@ -129,59 +134,37 @@ class TranscriptService:
         self._metadata_extractor = adapters.metadata_extractor
         self._caption_provider = adapters.caption_provider
         self._settings = settings
-        self._admission_limit = (
-            settings.transcription_concurrency + settings.max_pending_transcriptions
-        )
-        self._admitted_transcriptions = 0
         self._whisper_acquirer = acquisition.WhisperAcquirer(
             adapters.audio_downloader,
             adapters.whisper_transcriber,
             settings,
         )
 
-    def _admit(self) -> None:
-        """Reserve request capacity before provider work can create media."""
-        if self._admitted_transcriptions >= self._admission_limit:
-            raise TranscriptionCapacityExceededError()
-        self._admitted_transcriptions += 1
-
-    def _release_admission(self) -> None:
-        """Release one prior request-capacity reservation."""
-        if self._admitted_transcriptions == 0:
-            raise RuntimeError("Transcription admission counter underflow.")
-        self._admitted_transcriptions -= 1
-
-    async def transcribe(
+    async def execute(
         self,
-        submitted_url: str,
+        submitted: inspection.SubmittedSource,
         *,
+        cancellation_event: threading.Event,
+        on_resources_released: Callable[[], None],
         include_segments: bool = True,
     ) -> TranscriptionResult:
-        """Retrieve one normalized Supported Platform Source and Transcript.
+        """Execute one validated supported source through transcript composition.
 
         Args:
-            submitted_url: URL supplied by the API caller.
+            submitted: Supported SubmittedSource produced by URL inspection.
+            cancellation_event: Caller-owned event set when cooperative provider
+                cancellation must begin.
+            on_resources_released: Callback invoked exactly once after caller work
+                and any retained native work have released their resources.
             include_segments: Whether to retain normalized timed segments.
 
         Returns:
             Canonical source metadata paired with a normalized transcript.
 
         Raises:
-            TranscriptionError: If URL, provider, capacity, media, or work fails.
+            TranscriptionError: If provider, media, or native work fails safely.
+            asyncio.CancelledError: If the caller cancels execution.
         """
-        submitted = inspection.classify_submitted_url(submitted_url)
-        bind_request_log_fields(platform=submitted.platform.value)
-        if submitted.platform not in (
-            Platform.TIKTOK,
-            Platform.YOUTUBE,
-            Platform.INSTAGRAM,
-            Platform.FACEBOOK,
-            Platform.X,
-        ):
-            raise UnsupportedPlatformError()
-
-        self._admit()
-        cancellation_event = threading.Event()
         prepared_audio: inspection.PreparedAudio | None = None
         ownership: acquisition.TranscriptionOwnership | None = None
         try:
@@ -231,7 +214,7 @@ class TranscriptService:
             ownership = acquisition.TranscriptionOwnership(
                 prepared_audio,
                 cancellation_event,
-                self._release_admission,
+                on_resources_released,
             )
             prepared_audio = None
             transcript = await self._whisper_acquirer.acquire(
@@ -252,12 +235,16 @@ class TranscriptService:
                 cancellation_event.set()
                 if prepared_audio is not None:
                     prepared_audio.cleanup()
-                self._release_admission()
+                on_resources_released()
             else:
-                ownership.finish_request()
+                ownership.finish_caller()
 
     async def shutdown(self) -> None:
-        """Wait for retained native inference and its request-media cleanup."""
+        """Drain retained native work and its caller-owned media cleanup.
+
+        Returns:
+            None after every retained native finalizer has completed.
+        """
         await self._whisper_acquirer.shutdown()
 
     async def _acquire_youtube_caption(
@@ -354,3 +341,82 @@ class TranscriptService:
         if not isinstance(extracted_metadata, inspection.ExtractedMetadata):
             raise MetadataRetrievalFailedError()
         return extracted_metadata
+
+
+class TranscriptService:
+    """Adapt synchronous request admission to transcription execution."""
+
+    def __init__(
+        self,
+        executor: TranscriptionExecutor,
+        settings: TranscriptionConfig,
+    ) -> None:
+        """Initialize process-lifetime request admission.
+
+        Args:
+            executor: Process-lifetime provider execution interface.
+            settings: Validated transcription configuration.
+        """
+        self._executor = executor
+        self._admission_limit = (
+            settings.transcription_concurrency + settings.max_pending_transcriptions
+        )
+        self._admitted_transcriptions = 0
+
+    def _admit(self) -> None:
+        """Reserve request capacity before provider work can create media."""
+        if self._admitted_transcriptions >= self._admission_limit:
+            raise TranscriptionCapacityExceededError()
+        self._admitted_transcriptions += 1
+
+    def _release_admission(self) -> None:
+        """Release one prior request-capacity reservation."""
+        if self._admitted_transcriptions == 0:
+            raise RuntimeError("Transcription admission counter underflow.")
+        self._admitted_transcriptions -= 1
+
+    async def transcribe(
+        self,
+        submitted_url: str,
+        *,
+        include_segments: bool = True,
+    ) -> TranscriptionResult:
+        """Retrieve one normalized Supported Platform Source and Transcript.
+
+        Args:
+            submitted_url: URL supplied by the API caller.
+            include_segments: Whether to retain normalized timed segments.
+
+        Returns:
+            Canonical source metadata paired with a normalized transcript.
+
+        Raises:
+            TranscriptionError: If URL, provider, capacity, media, or work fails.
+        """
+        submitted = inspection.classify_submitted_url(submitted_url)
+        bind_request_log_fields(platform=submitted.platform.value)
+        if submitted.platform not in (
+            Platform.TIKTOK,
+            Platform.YOUTUBE,
+            Platform.INSTAGRAM,
+            Platform.FACEBOOK,
+            Platform.X,
+        ):
+            raise UnsupportedPlatformError()
+
+        self._admit()
+        cancellation_event = threading.Event()
+        return await self._executor.execute(
+            submitted,
+            cancellation_event=cancellation_event,
+            on_resources_released=self._release_admission,
+            include_segments=include_segments,
+        )
+
+    async def shutdown(self) -> None:
+        """Drain retained native execution through the executor.
+
+        Returns:
+            None after the executor's retained native work has completed.
+        """
+        await self._executor.shutdown()

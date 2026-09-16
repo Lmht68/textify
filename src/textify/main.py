@@ -33,6 +33,7 @@ from textify.transcription.exceptions import (
 from textify.transcription.router import router as transcription_router
 from textify.transcription.service import (
     TranscriptionAdaptersFactory,
+    TranscriptionExecutor,
     TranscriptService,
     build_transcription_adapters,
 )
@@ -233,10 +234,8 @@ def create_app(
             available_bytes=available_temporary_media_bytes,
         )
         adapters = adapters_factory(resolved_transcription_config)
-        service = TranscriptService(
-            adapters,
-            resolved_transcription_config,
-        )
+        executor = TranscriptionExecutor(adapters, resolved_transcription_config)
+        service = TranscriptService(executor, resolved_transcription_config)
         application.state.transcript_service = service
         application.state.ready = True
         try:

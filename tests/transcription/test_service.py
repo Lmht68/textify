@@ -1,12 +1,13 @@
 """Tests for the application-facing TranscriptService lifecycle."""
 
+import asyncio
 import threading
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
 
-from textify.transcription import acquisition
+from textify.transcription import acquisition, inspection
 from textify.transcription.acquisition import CaptionTrack
 from textify.transcription.config import TranscriptionConfig
 from textify.transcription.exceptions import (
@@ -19,7 +20,11 @@ from textify.transcription.exceptions import (
     VideoTooLongError,
 )
 from textify.transcription.inspection import ExtractedMetadata, PreparedAudio
-from textify.transcription.service import TranscriptionAdapters, TranscriptService
+from textify.transcription.service import (
+    TranscriptionAdapters,
+    TranscriptionExecutor,
+    TranscriptService,
+)
 from textify.transcription.types import (
     RawSegment,
     Segment,
@@ -283,6 +288,189 @@ class FixedTranscriber:
         )
 
 
+class BlockingMetadataExtractor:
+    """Block metadata extraction until the caller cancellation event is set."""
+
+    def __init__(self, temporary_media_root: Path, *, block: bool) -> None:
+        """Initialize one controllable metadata boundary.
+
+        Args:
+            temporary_media_root: Root where late inspection media is created.
+            block: Whether extraction waits for cooperative cancellation.
+        """
+        self._temporary_media_root = temporary_media_root
+        self._block = block
+        self.calls: list[str] = []
+        self.entered = threading.Event()
+        self.prepared_directories: list[Path] = []
+
+    def extract(
+        self,
+        provider_url: str,
+        *,
+        deadline: float,
+        cancellation_event: threading.Event,
+    ) -> ExtractedMetadata:
+        """Return valid metadata after an optional cancellation handshake.
+
+        Args:
+            provider_url: Validated provider URL passed to metadata inspection.
+            deadline: Monotonic metadata deadline ignored by this test boundary.
+            cancellation_event: Cooperative cancellation signal supplied by caller.
+
+        Returns:
+            Valid TikTok metadata and late inspection media when blocked.
+        """
+        del deadline
+        self.calls.append(provider_url)
+        if not self._block:
+            return ExtractedMetadata(tiktok_metadata())
+
+        self.entered.set()
+        cancellation_event.wait()
+        prepared_directory = self._temporary_media_root / "late-inspection"
+        prepared_directory.mkdir(parents=True)
+        prepared_path = prepared_directory / "audio.webm"
+        prepared_path.touch()
+        self.prepared_directories.append(prepared_directory)
+        return ExtractedMetadata(
+            tiktok_metadata(),
+            PreparedAudio(prepared_path, prepared_directory),
+        )
+
+
+class BlockingAudioDownloader:
+    """Block a partial audio download until caller cancellation is set."""
+
+    def __init__(self, *, block: bool) -> None:
+        """Initialize one controllable audio-download boundary.
+
+        Args:
+            block: Whether audio completion waits for cooperative cancellation.
+        """
+        self._block = block
+        self.calls: list[str] = []
+        self.entered = threading.Event()
+        self.request_directories: list[Path] = []
+
+    def download(
+        self,
+        source_url: str,
+        destination: Path,
+        *,
+        deadline: float,
+        cancellation_event: threading.Event,
+    ) -> Path:
+        """Create partial audio and optionally wait for cooperative cancellation.
+
+        Args:
+            source_url: Validated provider URL passed to audio acquisition.
+            destination: Request-owned output directory.
+            deadline: Monotonic audio-download deadline ignored by this boundary.
+            cancellation_event: Cooperative cancellation signal supplied by caller.
+
+        Returns:
+            Completed local audio path after the optional cancellation handshake.
+        """
+        del deadline
+        self.calls.append(source_url)
+        self.request_directories.append(destination)
+        audio_path = destination / "audio.webm"
+        audio_path.touch()
+        if self._block:
+            self.entered.set()
+            cancellation_event.wait()
+        return audio_path
+
+
+def build_transcription_config(temporary_media_root: Path) -> TranscriptionConfig:
+    """Build deterministic transcription configuration for service tests.
+
+    Args:
+        temporary_media_root: Root for request-scoped test media.
+
+    Returns:
+        Configuration with one native inference permit and stable limits.
+    """
+    return TranscriptionConfig(
+        max_duration_seconds=1800,
+        temporary_media_root=temporary_media_root,
+        beam_size=1,
+        vad_filter=True,
+        temperature=0.0,
+        condition_on_previous_text=True,
+        transcription_concurrency=1,
+        max_pending_transcriptions=2,
+        max_media_bytes=1024,
+        metadata_timeout_seconds=30.0,
+        audio_download_timeout_seconds=300.0,
+        transcription_queue_timeout_seconds=300.0,
+        transcription_timeout_seconds=1800.0,
+        initial_prompt="test prompt",
+        hf_token=None,
+    )
+
+
+def build_execution(
+    config: TranscriptionConfig,
+    metadata_extractor: inspection.MetadataExtractor,
+    audio_downloader: acquisition.AudioDownloader,
+    transcriber: acquisition.WhisperTranscriber,
+    caption_provider: acquisition.CaptionProvider | None = None,
+) -> TranscriptionExecutor:
+    """Build request-independent execution from deterministic provider boundaries.
+
+    Args:
+        config: Shared validated execution configuration.
+        metadata_extractor: Deterministic metadata provider.
+        audio_downloader: Deterministic audio provider.
+        transcriber: Deterministic native inference provider.
+        caption_provider: Optional deterministic YouTube captions provider.
+
+    Returns:
+        Fully wired execution interface under one inference permit.
+    """
+    adapters = TranscriptionAdapters(
+        metadata_extractor=metadata_extractor,
+        caption_provider=(
+            caption_provider if caption_provider is not None else EmptyCaptionProvider()
+        ),
+        audio_downloader=audio_downloader,
+        whisper_transcriber=transcriber,
+    )
+    return TranscriptionExecutor(adapters, config)
+
+
+def build_service(
+    temporary_media_root: Path,
+    metadata_extractor: RecordingMetadataExtractor,
+    audio_downloader: RecordingAudioDownloader,
+    transcriber: FixedTranscriber,
+    caption_provider: acquisition.CaptionProvider | None = None,
+) -> TranscriptService:
+    """Build a TranscriptService from deterministic provider boundaries.
+
+    Args:
+        temporary_media_root: Root for request-scoped test media.
+        metadata_extractor: Deterministic metadata provider.
+        audio_downloader: Deterministic audio provider.
+        transcriber: Deterministic native inference provider.
+        caption_provider: Optional deterministic YouTube captions provider.
+
+    Returns:
+        Fully wired service under one inference permit.
+    """
+    config = build_transcription_config(temporary_media_root)
+    executor = build_execution(
+        config,
+        metadata_extractor,
+        audio_downloader,
+        transcriber,
+        caption_provider,
+    )
+    return TranscriptService(executor, config)
+
+
 def tiktok_metadata(duration: object = 1800) -> Mapping[str, object]:
     """Return an external-shaped valid TikTok metadata mapping.
 
@@ -324,53 +512,6 @@ def youtube_metadata(language: object = "en-US") -> Mapping[str, object]:
     if language is not None:
         metadata["language"] = language
     return metadata
-
-
-def build_service(
-    temporary_media_root: Path,
-    metadata_extractor: RecordingMetadataExtractor,
-    audio_downloader: RecordingAudioDownloader,
-    transcriber: FixedTranscriber,
-    caption_provider: acquisition.CaptionProvider | None = None,
-) -> TranscriptService:
-    """Build a TranscriptService from deterministic provider boundaries.
-
-    Args:
-        temporary_media_root: Root for request-scoped test media.
-        metadata_extractor: Deterministic metadata provider.
-        audio_downloader: Deterministic audio provider.
-        transcriber: Deterministic native inference provider.
-        caption_provider: Optional deterministic YouTube captions provider.
-
-    Returns:
-        Fully wired service under one inference permit.
-    """
-    config = TranscriptionConfig(
-        max_duration_seconds=1800,
-        temporary_media_root=temporary_media_root,
-        beam_size=1,
-        vad_filter=True,
-        temperature=0.0,
-        condition_on_previous_text=True,
-        transcription_concurrency=1,
-        max_pending_transcriptions=2,
-        max_media_bytes=1024,
-        metadata_timeout_seconds=30.0,
-        audio_download_timeout_seconds=300.0,
-        transcription_queue_timeout_seconds=300.0,
-        transcription_timeout_seconds=1800.0,
-        initial_prompt="test prompt",
-        hf_token=None,
-    )
-    adapters = TranscriptionAdapters(
-        metadata_extractor=metadata_extractor,
-        caption_provider=(
-            caption_provider if caption_provider is not None else EmptyCaptionProvider()
-        ),
-        audio_downloader=audio_downloader,
-        whisper_transcriber=transcriber,
-    )
-    return TranscriptService(adapters, config)
 
 
 @pytest.mark.asyncio
@@ -797,3 +938,140 @@ async def test_transcribe_preserves_native_failure_after_caption_failure(
     assert caption_provider.calls == ["dQw4w9WgXcQ"]
     assert downloader.calls == [YOUTUBE_URL]
     assert all(not directory.exists() for directory in downloader.request_directories)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("caption_provider", "expected_method", "expected_text"),
+    (
+        (
+            RecordingCaptionProvider(
+                (
+                    RecordingCaptionTrack(
+                        "en-US",
+                        False,
+                        ((0.0, 1.0, "caption"),),
+                    ),
+                )
+            ),
+            TranscriptMethod.YOUTUBE_CAPTIONS,
+            "caption",
+        ),
+        (
+            RecordingCaptionProvider(),
+            TranscriptMethod.FASTER_WHISPER,
+            "Transcript",
+        ),
+    ),
+    ids=("caption_bypass", "native_fallback"),
+)
+async def test_transcription_execution_runs_caption_bypass_and_native_fallback_without_http_request(
+    tmp_path: Path,
+    caption_provider: RecordingCaptionProvider,
+    expected_method: TranscriptMethod,
+    expected_text: str,
+) -> None:
+    """Direct execution bypasses HTTP while retaining caption and native branches."""
+    prepared_directory: Path | None = None
+    prepared_audio: PreparedAudio | None = None
+    if expected_method is TranscriptMethod.YOUTUBE_CAPTIONS:
+        prepared_directory = tmp_path / "caption-inspection"
+        prepared_directory.mkdir()
+        prepared_path = prepared_directory / "audio.webm"
+        prepared_path.touch()
+        prepared_audio = PreparedAudio(prepared_path, prepared_directory)
+
+    downloader = RecordingAudioDownloader()
+    transcriber = FixedTranscriber()
+    executor = build_execution(
+        build_transcription_config(tmp_path),
+        RecordingMetadataExtractor(youtube_metadata(), prepared_audio),
+        downloader,
+        transcriber,
+        caption_provider,
+    )
+    resource_releases: list[None] = []
+
+    result = await executor.execute(
+        inspection.classify_submitted_url(YOUTUBE_URL),
+        cancellation_event=threading.Event(),
+        on_resources_released=lambda: resource_releases.append(None),
+    )
+
+    assert result.source.video_id == "dQw4w9WgXcQ"
+    assert result.source.url == YOUTUBE_URL
+    assert result.transcript.method is expected_method
+    assert result.transcript.text == expected_text
+    assert caption_provider.calls == ["dQw4w9WgXcQ"]
+    assert resource_releases == [None]
+    if expected_method is TranscriptMethod.YOUTUBE_CAPTIONS:
+        assert downloader.calls == []
+        assert transcriber.calls == []
+        assert prepared_directory is not None
+        assert not prepared_directory.exists()
+    else:
+        assert downloader.calls == [YOUTUBE_URL]
+        assert len(transcriber.calls) == 1
+        assert all(
+            not directory.exists() for directory in downloader.request_directories
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ("metadata", "audio_download"))
+async def test_transcription_execution_uses_caller_cancellation_for_pre_native_work(
+    tmp_path: Path,
+    stage: str,
+) -> None:
+    """Direct execution exposes one caller-owned pre-native cancellation signal."""
+    metadata_extractor = BlockingMetadataExtractor(
+        tmp_path,
+        block=stage == "metadata",
+    )
+    audio_downloader = BlockingAudioDownloader(
+        block=stage == "audio_download",
+    )
+    caption_provider = RecordingCaptionProvider()
+    transcriber = FixedTranscriber()
+    executor = build_execution(
+        build_transcription_config(tmp_path),
+        metadata_extractor,
+        audio_downloader,
+        transcriber,
+        caption_provider,
+    )
+    cancellation_event = threading.Event()
+    resource_releases: list[None] = []
+    task = asyncio.create_task(
+        executor.execute(
+            inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
+            cancellation_event=cancellation_event,
+            on_resources_released=lambda: resource_releases.append(None),
+        )
+    )
+    stage_entered = (
+        metadata_extractor.entered if stage == "metadata" else audio_downloader.entered
+    )
+
+    assert await asyncio.to_thread(stage_entered.wait, 1.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert cancellation_event.is_set()
+    assert caption_provider.calls == []
+    assert transcriber.calls == []
+    assert resource_releases == [None]
+    if stage == "metadata":
+        assert audio_downloader.calls == []
+        assert len(metadata_extractor.calls) == 1
+        assert all(
+            not directory.exists()
+            for directory in metadata_extractor.prepared_directories
+        )
+    else:
+        assert metadata_extractor.calls == [DIRECT_TIKTOK_URL]
+        assert audio_downloader.calls == [DIRECT_TIKTOK_URL]
+        assert all(
+            not directory.exists() for directory in audio_downloader.request_directories
+        )
