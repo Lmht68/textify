@@ -7,6 +7,7 @@ import tempfile
 import time
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -18,6 +19,7 @@ from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from textify.config import AppConfig
+from textify.database import create_application_engine, verify_application_database
 from textify.logging import (
     bind_request_log_fields,
     configure_logging,
@@ -30,6 +32,9 @@ from textify.transcription.exceptions import (
     transcription_error_handler,
     unhandled_error_handler,
 )
+from textify.transcription.job_repository import SqliteTranscriptionJobRepository
+from textify.transcription.job_router import router as transcription_job_router
+from textify.transcription.jobs import TranscriptionJobCoordinator, utc_now
 from textify.transcription.router import router as transcription_router
 from textify.transcription.service import (
     TranscriptionAdaptersFactory,
@@ -120,19 +125,26 @@ class _RequestObservabilityMiddleware:
 
 
 async def request_validation_error_handler(
-    _request: Request,
+    request: Request,
     _exc: Exception,
 ) -> JSONResponse:
     """Return a safe response for malformed HTTP request payloads.
 
     Args:
-        _request: Request that failed FastAPI validation.
+        request: Request that failed FastAPI validation.
         _exc: Validation details intentionally excluded from the response.
 
     Returns:
         Stable invalid-request response without rejected input values.
     """
     bind_request_log_fields(code="invalid_request")
+    path = request.url.path
+    headers = (
+        {"Cache-Control": "no-store"}
+        if path == "/api/transcription-jobs"
+        or path.startswith("/api/transcription-jobs/")
+        else {}
+    )
     return JSONResponse(
         status_code=422,
         content={
@@ -141,6 +153,7 @@ async def request_validation_error_handler(
                 "message": "The request is invalid.",
             }
         },
+        headers=headers,
     )
 
 
@@ -233,23 +246,41 @@ def create_app(
             resolved_transcription_config,
             available_bytes=available_temporary_media_bytes,
         )
-        adapters = adapters_factory(resolved_transcription_config)
-        executor = TranscriptionExecutor(adapters, resolved_transcription_config)
-        service = TranscriptService(executor, resolved_transcription_config)
-        application.state.transcript_service = service
-        application.state.ready = True
+        database_path = resolved_app_config.database_path
+        if database_path is None:
+            raise RuntimeError("TEXTIFY_DATABASE_PATH must be configured.")
+        engine = create_application_engine(database_path)
         try:
-            yield
+            await verify_application_database(engine)
+            repository = SqliteTranscriptionJobRepository(
+                engine=engine,
+                maximum_outstanding_jobs=resolved_transcription_config.max_outstanding_jobs,
+                queue_timeout=timedelta(
+                    seconds=resolved_transcription_config.job_queue_timeout_seconds
+                ),
+                clock=utc_now,
+            )
+            coordinator = TranscriptionJobCoordinator(repository)
+            adapters = adapters_factory(resolved_transcription_config)
+            executor = TranscriptionExecutor(adapters, resolved_transcription_config)
+            service = TranscriptService(executor, resolved_transcription_config)
+            application.state.transcription_job_coordinator = coordinator
+            application.state.transcript_service = service
+            application.state.ready = True
+            try:
+                yield
+            finally:
+                application.state.ready = False
+                await service.shutdown()
         finally:
-            application.state.ready = False
-            await service.shutdown()
+            await engine.dispose()
 
     application = FastAPI(
         title="Textify",
         description=(
             "Synchronous normalized transcripts for eligible public YouTube, "
-            "Facebook, Instagram, TikTok, and X videos. Requests are processed "
-            "within the response lifecycle and require a model-loaded CUDA worker."
+            "Facebook, Instagram, TikTok, and X videos, plus durable queued "
+            "Transcription Jobs for later processing."
         ),
         version="0.1.0",
         openapi_tags=[
@@ -267,6 +298,13 @@ def create_app(
                     "source metadata and normalized timed segments."
                 ),
             },
+            {
+                "name": "transcription-jobs",
+                "description": (
+                    "Durable queued Transcription Job acceptance and "
+                    "bearer-capability status inspection."
+                ),
+            },
         ],
         lifespan=lifespan,
     )
@@ -278,6 +316,7 @@ def create_app(
     )
     application.include_router(operations_router)
     application.include_router(transcription_router)
+    application.include_router(transcription_job_router)
     return application
 
 
@@ -292,4 +331,5 @@ def main() -> None:
         host=config.host,
         port=config.port,
         workers=1,
+        access_log=False,
     )

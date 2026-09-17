@@ -114,6 +114,30 @@ class TranscriptionCapacityExceededError(TranscriptionError):
     message = "Transcription capacity is currently unavailable."
 
 
+class JobNotFoundError(TranscriptionError):
+    """Indicate that a Transcription Job bearer capability is unavailable."""
+
+    status_code = 404
+    code = "job_not_found"
+    message = "The transcription job was not found."
+
+
+class JobStoreUnavailableError(TranscriptionError):
+    """Indicate that durable Transcription Job storage is unavailable."""
+
+    status_code = 503
+    code = "job_store_unavailable"
+    message = "Transcription job storage is currently unavailable."
+
+
+def _job_cache_headers(request: Request) -> dict[str, str]:
+    """Return no-store headers for routes that contain bearer capabilities."""
+    path = request.url.path
+    if path == "/api/transcription-jobs" or path.startswith("/api/transcription-jobs/"):
+        return {"Cache-Control": "no-store"}
+    return {}
+
+
 class MetadataTimeoutError(TranscriptionError):
     """Indicate metadata retrieval timing out."""
 
@@ -139,13 +163,13 @@ class TranscriptionTimeoutError(TranscriptionError):
 
 
 async def transcription_error_handler(
-    _request: Request,
+    request: Request,
     exc: Exception,
 ) -> JSONResponse:
     """Convert a domain error to its stable safe HTTP response.
 
     Args:
-        _request: Request that triggered the domain error.
+        request: Request that triggered the domain error.
         exc: Exception registered as a ``TranscriptionError`` handler.
 
     Returns:
@@ -156,14 +180,15 @@ async def transcription_error_handler(
     return JSONResponse(
         status_code=error.status_code,
         content={"error": {"code": error.code, "message": error.message}},
+        headers=_job_cache_headers(request),
     )
 
 
-async def unhandled_error_handler(_request: Request, _exc: Exception) -> JSONResponse:
+async def unhandled_error_handler(request: Request, _exc: Exception) -> JSONResponse:
     """Return a generic safe response for unexpected failures.
 
     Args:
-        _request: Request that triggered the unexpected error.
+        request: Request that triggered the unexpected error.
         _exc: Unexpected exception raised while handling the request.
 
     Returns:
@@ -178,4 +203,5 @@ async def unhandled_error_handler(_request: Request, _exc: Exception) -> JSONRes
                 "message": "An unexpected error occurred.",
             }
         },
+        headers=_job_cache_headers(request),
     )

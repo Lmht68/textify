@@ -6,11 +6,26 @@ from decimal import Decimal
 from enum import StrEnum
 from math import isfinite
 from numbers import Real
+from typing import Literal
 
 from langcodes import standardize_tag
 from langcodes.tag_parser import LanguageTagError
 
 RawSegment = tuple[object, object, object]
+
+ResponseFieldPath = Literal[
+    "source.platform",
+    "source.video_id",
+    "source.url",
+    "source.title",
+    "source.description",
+    "source.channel",
+    "source.duration_seconds",
+    "transcript.method",
+    "transcript.language",
+    "transcript.text",
+    "transcript.segments",
+]
 
 
 class Platform(StrEnum):

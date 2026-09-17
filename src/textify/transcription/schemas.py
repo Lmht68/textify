@@ -6,26 +6,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from textify.transcription.types import (
     Platform,
+    ResponseFieldPath,
     Source,
     TimedTranscript,
     Transcript,
     TranscriptionResult,
     TranscriptMethod,
 )
-
-ResponseFieldPath = Literal[
-    "source.platform",
-    "source.video_id",
-    "source.url",
-    "source.title",
-    "source.description",
-    "source.channel",
-    "source.duration_seconds",
-    "transcript.method",
-    "transcript.language",
-    "transcript.text",
-    "transcript.segments",
-]
 
 
 class TranscriptRequest(BaseModel):
@@ -376,6 +363,8 @@ PublicErrorCode = Literal[
     "audio_download_failed",
     "transcription_failed",
     "transcription_capacity_exceeded",
+    "job_not_found",
+    "job_store_unavailable",
     "metadata_timeout",
     "audio_download_timeout",
     "transcription_timeout",

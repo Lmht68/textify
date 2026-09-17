@@ -33,6 +33,8 @@ class TranscriptionConfig(BaseSettings):
     condition_on_previous_text: bool = True
     transcription_concurrency: int = Field(default=1, gt=0)
     max_pending_transcriptions: int = Field(default=2, ge=0)
+    max_outstanding_jobs: int = Field(default=8, gt=0)
+    job_queue_timeout_seconds: int = Field(default=20, gt=0)
     max_media_bytes: int = Field(default=536_870_912, gt=0)
     metadata_timeout_seconds: float = Field(
         default=30.0,

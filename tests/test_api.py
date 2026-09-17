@@ -1036,8 +1036,11 @@ class ErrorService:
         raise self._error
 
 
-def app_config() -> AppConfig:
+def app_config(database_path: Path) -> AppConfig:
     """Create isolated application configuration for ASGI tests.
+
+    Args:
+        database_path: Per-test SQLite database upgraded through Alembic.
 
     Returns:
         Configuration independent of local environment files.
@@ -1047,6 +1050,7 @@ def app_config() -> AppConfig:
         log_level="INFO",
         host="127.0.0.1",
         port=8182,
+        database_path=database_path,
     )
 
 
@@ -1220,7 +1224,9 @@ def test_temporary_media_capacity_translates_disk_usage_failure(
 
 
 @pytest.mark.asyncio
-async def test_api_starts_at_exact_temporary_media_capacity(tmp_path: Path) -> None:
+async def test_api_starts_at_exact_temporary_media_capacity(
+    migrated_database_path: Path, tmp_path: Path
+) -> None:
     """Startup succeeds when free space equals the configured media quota."""
     settings = transcription_config(tmp_path).model_copy(
         update={
@@ -1230,7 +1236,7 @@ async def test_api_starts_at_exact_temporary_media_capacity(tmp_path: Path) -> N
         }
     )
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         settings,
         CountingAdaptersFactory(),
         available_temporary_media_bytes=lambda _root: 600,
@@ -1246,6 +1252,7 @@ async def test_api_starts_at_exact_temporary_media_capacity(tmp_path: Path) -> N
 
 @pytest.mark.asyncio
 async def test_api_fails_startup_before_model_when_temporary_media_capacity_is_low(
+    migrated_database_path: Path,
     tmp_path: Path,
 ) -> None:
     """Low capacity aborts startup after root creation but before adapters load."""
@@ -1259,7 +1266,7 @@ async def test_api_fails_startup_before_model_when_temporary_media_capacity_is_l
     )
     factory = CountingAdaptersFactory()
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         settings,
         factory,
         available_temporary_media_bytes=lambda _root: 599,
@@ -1280,6 +1287,7 @@ async def test_api_fails_startup_before_model_when_temporary_media_capacity_is_l
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("submitted_url", "expected_provider_url"), TIKTOK_URL_CASES)
 async def test_api_transcribes_every_supported_tiktok_form(
+    migrated_database_path: Path,
     tmp_path: Path,
     submitted_url: str,
     expected_provider_url: str,
@@ -1287,7 +1295,7 @@ async def test_api_transcribes_every_supported_tiktok_form(
     """Every documented TikTok form reaches native transcription."""
     factory = CountingAdaptersFactory()
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path),
         factory,
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
@@ -1339,13 +1347,14 @@ async def test_api_transcribes_every_supported_tiktok_form(
     ),
 )
 async def test_api_excludes_each_requested_response_field(
+    migrated_database_path: Path,
     tmp_path: Path,
     excluded_path: str,
 ) -> None:
     """Each allowed exclusion omits exactly its requested response leaf."""
     state = ControlledAdapterState()
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path),
         ControlledAdaptersFactory(state),
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
@@ -1369,11 +1378,13 @@ async def test_api_excludes_each_requested_response_field(
 
 
 @pytest.mark.asyncio
-async def test_api_accepts_minimum_nonempty_projection(tmp_path: Path) -> None:
+async def test_api_accepts_minimum_nonempty_projection(
+    migrated_database_path: Path, tmp_path: Path
+) -> None:
     """A projection retaining one source and transcript leaf remains valid."""
     state = ControlledAdapterState()
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path),
         ControlledAdaptersFactory(state),
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
@@ -1462,6 +1473,7 @@ async def test_api_accepts_minimum_nonempty_projection(tmp_path: Path) -> None:
     ),
 )
 async def test_api_rejects_invalid_response_exclusions_before_provider_work(
+    migrated_database_path: Path,
     tmp_path: Path,
     _description: str,
     exclude: object,
@@ -1469,7 +1481,7 @@ async def test_api_rejects_invalid_response_exclusions_before_provider_work(
     """Invalid projection paths return invalid_request before provider work."""
     state = ControlledAdapterState()
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path),
         ControlledAdaptersFactory(state),
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
@@ -1497,12 +1509,13 @@ async def test_api_rejects_invalid_response_exclusions_before_provider_work(
 
 @pytest.mark.asyncio
 async def test_api_empty_exclusions_preserve_the_default_response(
+    migrated_database_path: Path,
     tmp_path: Path,
 ) -> None:
     """An explicit empty exclusion list preserves full default behavior."""
     state = ControlledAdapterState()
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path),
         ControlledAdaptersFactory(state),
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
@@ -1527,6 +1540,7 @@ async def test_api_empty_exclusions_preserve_the_default_response(
 
 @pytest.mark.asyncio
 async def test_api_excludes_native_segments_without_segment_construction(
+    migrated_database_path: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1547,7 +1561,7 @@ async def test_api_excludes_native_segments_without_segment_construction(
     )
     state = ControlledAdapterState()
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path),
         ControlledAdaptersFactory(state),
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
@@ -1575,6 +1589,7 @@ async def test_api_excludes_native_segments_without_segment_construction(
 
 @pytest.mark.asyncio
 async def test_api_excludes_caption_segments_without_segment_construction(
+    migrated_database_path: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1604,7 +1619,7 @@ async def test_api_excludes_caption_segments_without_segment_construction(
         ),
     )
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path),
         ControlledAdaptersFactory(state),
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
@@ -1643,6 +1658,7 @@ async def test_api_excludes_caption_segments_without_segment_construction(
     SOCIAL_URL_CASES,
 )
 async def test_api_transcribes_every_supported_social_form_with_faster_whisper(
+    migrated_database_path: Path,
     tmp_path: Path,
     platform: Platform,
     submitted_url: str,
@@ -1671,7 +1687,7 @@ async def test_api_transcribes_every_supported_social_form_with_faster_whisper(
     )
     factory = ControlledAdaptersFactory(state)
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path),
         factory,
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
@@ -1744,6 +1760,7 @@ async def test_api_transcribes_every_supported_social_form_with_faster_whisper(
     ),
 )
 async def test_api_transcribes_social_urls_with_single_trailing_slash(
+    migrated_database_path: Path,
     tmp_path: Path,
     platform: Platform,
     submitted_url: str,
@@ -1760,7 +1777,7 @@ async def test_api_transcribes_social_urls_with_single_trailing_slash(
         )
     )
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path),
         ControlledAdaptersFactory(state),
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
@@ -1840,6 +1857,7 @@ async def test_api_transcribes_social_urls_with_single_trailing_slash(
     ),
 )
 async def test_api_rejects_out_of_policy_url_before_provider_access(
+    migrated_database_path: Path,
     tmp_path: Path,
     submitted_url: str,
     expected_status: int,
@@ -1848,7 +1866,7 @@ async def test_api_rejects_out_of_policy_url_before_provider_access(
     """Rejected URLs never reach a provider boundary or create request media."""
     state = ControlledAdapterState()
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path),
         ControlledAdaptersFactory(state),
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
@@ -1888,6 +1906,7 @@ async def test_api_rejects_out_of_policy_url_before_provider_access(
     SOCIAL_METADATA_STATE_CASES,
 )
 async def test_api_rejects_social_metadata_states_safely(
+    migrated_database_path: Path,
     tmp_path: Path,
     platform: Platform,
     submitted_url: str,
@@ -1900,7 +1919,7 @@ async def test_api_rejects_social_metadata_states_safely(
     metadata.update(metadata_updates)
     state = ControlledAdapterState(metadata_override=metadata)
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path),
         ControlledAdaptersFactory(state),
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
@@ -1935,6 +1954,7 @@ async def test_api_rejects_social_metadata_states_safely(
     ),
 )
 async def test_api_rejects_youtube_live_metadata_safely(
+    migrated_database_path: Path,
     tmp_path: Path,
     metadata_updates: Mapping[str, object],
 ) -> None:
@@ -1943,7 +1963,7 @@ async def test_api_rejects_youtube_live_metadata_safely(
     metadata.update(metadata_updates)
     state = ControlledAdapterState(metadata_override=metadata)
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path),
         ControlledAdaptersFactory(state),
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
@@ -1976,6 +1996,7 @@ async def test_api_rejects_youtube_live_metadata_safely(
     PROVIDER_FAILURE_CASES,
 )
 async def test_api_maps_provider_failures_without_leaking_details(
+    migrated_database_path: Path,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     platform: Platform,
@@ -1989,7 +2010,7 @@ async def test_api_maps_provider_failures_without_leaking_details(
         metadata_failure=YoutubeDLError(provider_message),
     )
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path),
         ControlledAdaptersFactory(state),
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
@@ -2024,10 +2045,12 @@ async def test_api_maps_provider_failures_without_leaking_details(
 
 
 @pytest.mark.asyncio
-async def test_api_returns_safe_request_validation_error(tmp_path: Path) -> None:
+async def test_api_returns_safe_request_validation_error(
+    migrated_database_path: Path, tmp_path: Path
+) -> None:
     """Malformed payloads return invalid_request without echoing their value."""
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path),
         CountingAdaptersFactory(),
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
@@ -2047,7 +2070,9 @@ async def test_api_returns_safe_request_validation_error(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_api_maps_all_target_domain_errors(tmp_path: Path) -> None:
+async def test_api_maps_all_target_domain_errors(
+    migrated_database_path: Path, tmp_path: Path
+) -> None:
     """Each target domain status and code pair is observable through HTTP."""
     error_cases = (
         (InvalidUrlError(), 400, "invalid_url"),
@@ -2066,7 +2091,7 @@ async def test_api_maps_all_target_domain_errors(tmp_path: Path) -> None:
         (TranscriptionCapacityExceededError(), 503, "transcription_capacity_exceeded"),
     )
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path),
         CountingAdaptersFactory(),
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
@@ -2085,10 +2110,12 @@ async def test_api_maps_all_target_domain_errors(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_api_maps_unexpected_error_to_internal_error(tmp_path: Path) -> None:
+async def test_api_maps_unexpected_error_to_internal_error(
+    migrated_database_path: Path, tmp_path: Path
+) -> None:
     """Unexpected route failures produce only the stable internal error."""
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path),
         CountingAdaptersFactory(),
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
@@ -2112,11 +2139,12 @@ async def test_api_maps_unexpected_error_to_internal_error(tmp_path: Path) -> No
 
 @pytest.mark.asyncio
 async def test_api_fails_startup_before_readiness_when_adapter_factory_fails(
+    migrated_database_path: Path,
     tmp_path: Path,
 ) -> None:
     """Native construction failures abort lifespan before the app is ready."""
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path),
         StartupFailureFactory(),
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
@@ -2131,12 +2159,13 @@ async def test_api_fails_startup_before_readiness_when_adapter_factory_fails(
 
 @pytest.mark.asyncio
 async def test_api_rejects_oversized_completed_audio_before_native(
+    migrated_database_path: Path,
     tmp_path: Path,
 ) -> None:
     """A completed audio file above the cap never reaches native inference."""
     state = ControlledAdapterState(download_size_bytes=1025)
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path),
         ControlledAdaptersFactory(state),
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
@@ -2158,13 +2187,14 @@ async def test_api_rejects_oversized_completed_audio_before_native(
 
 @pytest.mark.asyncio
 async def test_api_rejects_work_beyond_active_and_pending_capacity_before_download(
+    migrated_database_path: Path,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Reject a third request before it can invoke metadata or create media."""
     state = ControlledAdapterState(native_waits_for_release=True)
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path).model_copy(
             update={
                 "transcription_concurrency": 1,
@@ -2218,13 +2248,14 @@ async def test_api_rejects_work_beyond_active_and_pending_capacity_before_downlo
 
 @pytest.mark.asyncio
 async def test_api_expires_the_inference_queue_and_cleans_waiting_media(
+    migrated_database_path: Path,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Expire queue waiting without allowing a second native call to start."""
     state = ControlledAdapterState(native_waits_for_release=True)
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path).model_copy(
             update={
                 "transcription_concurrency": 1,
@@ -2272,6 +2303,7 @@ async def test_api_expires_the_inference_queue_and_cleans_waiting_media(
 
 @pytest.mark.asyncio
 async def test_api_expires_metadata_deadline_and_cleans_late_prepared_media(
+    migrated_database_path: Path,
     tmp_path: Path,
 ) -> None:
     """Bound metadata retries and reclaim duration-fallback media after timeout."""
@@ -2280,7 +2312,7 @@ async def test_api_expires_metadata_deadline_and_cleans_late_prepared_media(
         metadata_prepares_audio_after_cancellation=True,
     )
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path).model_copy(
             update={"metadata_timeout_seconds": 0.05}
         ),
@@ -2309,12 +2341,13 @@ async def test_api_expires_metadata_deadline_and_cleans_late_prepared_media(
 
 @pytest.mark.asyncio
 async def test_api_expires_download_deadline_and_cleans_request_media(
+    migrated_database_path: Path,
     tmp_path: Path,
 ) -> None:
     """Bound normal-download retries and remove their request-owned media."""
     state = ControlledAdapterState(download_waits_for_cancellation=True)
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path).model_copy(
             update={"audio_download_timeout_seconds": 0.05}
         ),
@@ -2346,6 +2379,7 @@ async def test_api_expires_download_deadline_and_cleans_request_media(
     NATIVE_TIMEOUT_CASES,
 )
 async def test_api_returns_native_timeout_before_abandoned_work_completes(
+    migrated_database_path: Path,
     tmp_path: Path,
     platform: Platform,
     submitted_url: str,
@@ -2358,7 +2392,7 @@ async def test_api_returns_native_timeout_before_abandoned_work_completes(
         metadata_override=metadata_override,
     )
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path).model_copy(
             update={
                 "transcription_timeout_seconds": 0.05,
@@ -2421,14 +2455,16 @@ async def test_api_returns_native_timeout_before_abandoned_work_completes(
 
 
 @pytest.mark.asyncio
-async def test_api_consumes_abandoned_native_failure(tmp_path: Path) -> None:
+async def test_api_consumes_abandoned_native_failure(
+    migrated_database_path: Path, tmp_path: Path
+) -> None:
     """A failed abandoned worker is consumed without an event-loop task warning."""
     state = ControlledAdapterState(
         native_waits_for_release=True,
         native_failure=Exception("native failure"),
     )
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path).model_copy(
             update={"transcription_timeout_seconds": 0.05}
         ),
@@ -2474,11 +2510,13 @@ async def test_api_consumes_abandoned_native_failure(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_api_shutdown_drains_abandoned_native_work(tmp_path: Path) -> None:
+async def test_api_shutdown_drains_abandoned_native_work(
+    migrated_database_path: Path, tmp_path: Path
+) -> None:
     """Lifespan exit waits for retained native work and its media cleanup."""
     state = ControlledAdapterState(native_waits_for_release=True)
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path).model_copy(
             update={"transcription_timeout_seconds": 0.05}
         ),
@@ -2521,14 +2559,16 @@ async def test_api_shutdown_drains_abandoned_native_work(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_api_applies_each_stage_deadline_independently(tmp_path: Path) -> None:
+async def test_api_applies_each_stage_deadline_independently(
+    migrated_database_path: Path, tmp_path: Path
+) -> None:
     """Allow adjacent stages that each finish below their own deadline."""
     state = ControlledAdapterState(
         metadata_delay_seconds=0.04,
         download_delay_seconds=0.04,
     )
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path).model_copy(
             update={
                 "metadata_timeout_seconds": 0.06,
@@ -2557,6 +2597,7 @@ async def test_api_applies_each_stage_deadline_independently(tmp_path: Path) -> 
 
 @pytest.mark.asyncio
 async def test_api_disconnect_returns_before_native_work_completes(
+    migrated_database_path: Path,
     tmp_path: Path,
 ) -> None:
     """A native disconnect returns while its prepared media remains retained."""
@@ -2565,7 +2606,7 @@ async def test_api_disconnect_returns_before_native_work_completes(
         native_waits_for_release=True,
     )
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path).model_copy(
             update={
                 "transcription_concurrency": 1,
@@ -2620,6 +2661,7 @@ async def test_api_disconnect_returns_before_native_work_completes(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ("metadata", "download", "queue"))
 async def test_api_disconnect_cancels_interruptible_pre_native_work(
+    migrated_database_path: Path,
     tmp_path: Path,
     stage: str,
 ) -> None:
@@ -2643,7 +2685,7 @@ async def test_api_disconnect_cancels_interruptible_pre_native_work(
         stage_entry = state.download_second_entered
 
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         config,
         ControlledAdaptersFactory(state),
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
@@ -2705,6 +2747,7 @@ async def test_api_disconnect_cancels_interruptible_pre_native_work(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("submitted_url", YOUTUBE_URL_FORMS)
 async def test_api_transcribes_every_supported_youtube_form_with_captions(
+    migrated_database_path: Path,
     tmp_path: Path,
     submitted_url: str,
 ) -> None:
@@ -2723,7 +2766,7 @@ async def test_api_transcribes_every_supported_youtube_form_with_captions(
         ),
     )
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path),
         ControlledAdaptersFactory(state),
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
@@ -2772,6 +2815,7 @@ async def test_api_transcribes_every_supported_youtube_form_with_captions(
 
 @pytest.mark.asyncio
 async def test_api_youtube_captions_bypass_busy_native_permit_and_release_admission(
+    migrated_database_path: Path,
     tmp_path: Path,
 ) -> None:
     """Caption requests bypass inference and release broad admission immediately."""
@@ -2786,7 +2830,7 @@ async def test_api_youtube_captions_bypass_busy_native_permit_and_release_admiss
         ),
     )
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path).model_copy(
             update={
                 "transcription_concurrency": 1,
@@ -2827,6 +2871,7 @@ async def test_api_youtube_captions_bypass_busy_native_permit_and_release_admiss
 
 @pytest.mark.asyncio
 async def test_api_youtube_falls_back_without_translating_unrelated_caption(
+    migrated_database_path: Path,
     tmp_path: Path,
 ) -> None:
     """An unrelated translatable track reaches native fallback without translation."""
@@ -2841,7 +2886,7 @@ async def test_api_youtube_falls_back_without_translating_unrelated_caption(
         ),
     )
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path),
         ControlledAdaptersFactory(state),
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
@@ -2863,6 +2908,7 @@ async def test_api_youtube_falls_back_without_translating_unrelated_caption(
 
 @pytest.mark.asyncio
 async def test_api_returns_native_safe_error_after_caption_listing_failure(
+    migrated_database_path: Path,
     tmp_path: Path,
 ) -> None:
     """Caption failure never changes the native terminal safe error envelope."""
@@ -2871,7 +2917,7 @@ async def test_api_returns_native_safe_error_after_caption_listing_failure(
         native_failure=RuntimeError("native provider failed"),
     )
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path),
         ControlledAdaptersFactory(state),
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
@@ -2891,13 +2937,14 @@ async def test_api_returns_native_safe_error_after_caption_listing_failure(
 
 @pytest.mark.asyncio
 async def test_api_success_request_id_is_safely_correlated(
+    migrated_database_path: Path,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Successful transcripts emit one request-correlated terminal record."""
     factory = CountingAdaptersFactory()
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path),
         factory,
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
@@ -2948,6 +2995,7 @@ async def test_api_success_request_id_is_safely_correlated(
 
 @pytest.mark.asyncio
 async def test_api_native_failure_is_safe_correlated(
+    migrated_database_path: Path,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -2984,7 +3032,7 @@ async def test_api_native_failure_is_safe_correlated(
         native_failure=RuntimeError(model_exception_text),
     )
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path),
         ControlledAdaptersFactory(state),
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
@@ -3037,12 +3085,13 @@ async def test_api_native_failure_is_safe_correlated(
 
 @pytest.mark.asyncio
 async def test_api_adds_fresh_request_ids_to_all_response_outcomes(
+    migrated_database_path: Path,
     tmp_path: Path,
 ) -> None:
     """Health, success, validation, and unmatched routes get fresh UUIDv4 IDs."""
     inbound_request_id = "inbound-request-id-sentinel"
     application = create_app(
-        app_config(),
+        app_config(migrated_database_path),
         transcription_config(tmp_path),
         CountingAdaptersFactory(),
         available_temporary_media_bytes=_sufficient_temporary_media_bytes,
