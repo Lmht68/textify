@@ -107,7 +107,7 @@ class TranscriptionFailedError(TranscriptionError):
 
 
 class TranscriptionCapacityExceededError(TranscriptionError):
-    """Indicate exhausted admission or native inference queue capacity."""
+    """Indicate exhausted durable Transcription Job admission capacity."""
 
     status_code = 503
     code = "transcription_capacity_exceeded"

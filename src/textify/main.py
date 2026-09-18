@@ -35,11 +35,9 @@ from textify.transcription.exceptions import (
 from textify.transcription.job_repository import SqliteTranscriptionJobRepository
 from textify.transcription.job_router import router as transcription_job_router
 from textify.transcription.jobs import TranscriptionJobCoordinator, utc_now
-from textify.transcription.router import router as transcription_router
 from textify.transcription.service import (
     TranscriptionAdaptersFactory,
     TranscriptionExecutor,
-    TranscriptService,
     build_transcription_adapters,
 )
 
@@ -174,7 +172,7 @@ def _validate_temporary_media_capacity(
 ) -> None:
     """Reject startup when temporary media cannot hold the configured quota."""
     required_bytes = (
-        settings.max_pending_transcriptions + settings.transcription_concurrency + 1
+        settings.job_worker_count + settings.transcription_concurrency + 1
     ) * settings.max_media_bytes
     try:
         available_media_bytes = available_bytes(settings.temporary_media_root)
@@ -260,27 +258,29 @@ def create_app(
                 ),
                 clock=utc_now,
             )
-            coordinator = TranscriptionJobCoordinator(repository)
             adapters = adapters_factory(resolved_transcription_config)
             executor = TranscriptionExecutor(adapters, resolved_transcription_config)
-            service = TranscriptService(executor, resolved_transcription_config)
+            coordinator = TranscriptionJobCoordinator(
+                repository,
+                executor,
+                resolved_transcription_config.job_worker_count,
+            )
             application.state.transcription_job_coordinator = coordinator
-            application.state.transcript_service = service
+            await coordinator.start()
             application.state.ready = True
             try:
                 yield
             finally:
                 application.state.ready = False
-                await service.shutdown()
+                await coordinator.shutdown()
         finally:
             await engine.dispose()
 
     application = FastAPI(
         title="Textify",
         description=(
-            "Synchronous normalized transcripts for eligible public YouTube, "
-            "Facebook, Instagram, TikTok, and X videos, plus durable queued "
-            "Transcription Jobs for later processing."
+            "Durable Transcription Job acceptance and status inspection for eligible "
+            "public YouTube, Facebook, Instagram, TikTok, and X videos."
         ),
         version="0.1.0",
         openapi_tags=[
@@ -289,13 +289,6 @@ def create_app(
                 "description": (
                     "Readiness after the lifespan has loaded process-owned "
                     "transcription dependencies."
-                ),
-            },
-            {
-                "name": "transcripts",
-                "description": (
-                    "Synchronous public-video transcript creation with canonical "
-                    "source metadata and normalized timed segments."
                 ),
             },
             {
@@ -315,7 +308,6 @@ def create_app(
         RequestValidationError, request_validation_error_handler
     )
     application.include_router(operations_router)
-    application.include_router(transcription_router)
     application.include_router(transcription_job_router)
     return application
 

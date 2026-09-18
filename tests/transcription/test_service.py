@@ -1,4 +1,4 @@
-"""Tests for the application-facing TranscriptService lifecycle."""
+"""Tests for the application-facing TranscriptionExecutor lifecycle."""
 
 import asyncio
 import threading
@@ -16,14 +16,12 @@ from textify.transcription.exceptions import (
     MetadataTimeoutError,
     TranscriptionFailedError,
     UnsupportedMediaError,
-    UnsupportedPlatformError,
     VideoTooLongError,
 )
 from textify.transcription.inspection import ExtractedMetadata, PreparedAudio
 from textify.transcription.service import (
     TranscriptionAdapters,
     TranscriptionExecutor,
-    TranscriptService,
 )
 from textify.transcription.types import (
     RawSegment,
@@ -384,7 +382,7 @@ class BlockingAudioDownloader:
 
 
 def build_transcription_config(temporary_media_root: Path) -> TranscriptionConfig:
-    """Build deterministic transcription configuration for service tests.
+    """Build deterministic transcription configuration for executor tests.
 
     Args:
         temporary_media_root: Root for request-scoped test media.
@@ -400,11 +398,12 @@ def build_transcription_config(temporary_media_root: Path) -> TranscriptionConfi
         temperature=0.0,
         condition_on_previous_text=True,
         transcription_concurrency=1,
-        max_pending_transcriptions=2,
+        max_outstanding_jobs=8,
+        job_queue_timeout_seconds=20,
+        job_worker_count=1,
         max_media_bytes=1024,
         metadata_timeout_seconds=30.0,
         audio_download_timeout_seconds=300.0,
-        transcription_queue_timeout_seconds=300.0,
         transcription_timeout_seconds=1800.0,
         initial_prompt="test prompt",
         hf_token=None,
@@ -439,36 +438,6 @@ def build_execution(
         whisper_transcriber=transcriber,
     )
     return TranscriptionExecutor(adapters, config)
-
-
-def build_service(
-    temporary_media_root: Path,
-    metadata_extractor: RecordingMetadataExtractor,
-    audio_downloader: RecordingAudioDownloader,
-    transcriber: FixedTranscriber,
-    caption_provider: acquisition.CaptionProvider | None = None,
-) -> TranscriptService:
-    """Build a TranscriptService from deterministic provider boundaries.
-
-    Args:
-        temporary_media_root: Root for request-scoped test media.
-        metadata_extractor: Deterministic metadata provider.
-        audio_downloader: Deterministic audio provider.
-        transcriber: Deterministic native inference provider.
-        caption_provider: Optional deterministic YouTube captions provider.
-
-    Returns:
-        Fully wired service under one inference permit.
-    """
-    config = build_transcription_config(temporary_media_root)
-    executor = build_execution(
-        config,
-        metadata_extractor,
-        audio_downloader,
-        transcriber,
-        caption_provider,
-    )
-    return TranscriptService(executor, config)
 
 
 def tiktok_metadata(duration: object = 1800) -> Mapping[str, object]:
@@ -521,9 +490,14 @@ async def test_transcribe_allows_the_inclusive_duration_and_cleans_media(
     """A 1800-second source succeeds and leaves no request media behind."""
     extractor = RecordingMetadataExtractor(tiktok_metadata(1800))
     downloader = RecordingAudioDownloader()
-    service = build_service(tmp_path, extractor, downloader, FixedTranscriber())
+    service = build_execution(
+        build_transcription_config(tmp_path), extractor, downloader, FixedTranscriber()
+    )
 
-    result = await service.transcribe(DIRECT_TIKTOK_URL)
+    result = await service.execute(
+        inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
+        cancellation_event=threading.Event(),
+    )
 
     assert result.source.duration_seconds == 1800
     assert result.transcript.text == "Transcript"
@@ -538,14 +512,18 @@ async def test_transcribe_forwards_text_only_selection_to_native_inference(
     """Text-only native requests retain provider calls and media cleanup."""
     downloader = RecordingAudioDownloader()
     transcriber = FixedTranscriber()
-    service = build_service(
-        tmp_path,
+    service = build_execution(
+        build_transcription_config(tmp_path),
         RecordingMetadataExtractor(tiktok_metadata()),
         downloader,
         transcriber,
     )
 
-    result = await service.transcribe(DIRECT_TIKTOK_URL, include_segments=False)
+    result = await service.execute(
+        inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
+        cancellation_event=threading.Event(),
+        include_segments=False,
+    )
 
     assert result.transcript.method is TranscriptMethod.FASTER_WHISPER
     assert result.transcript.text == "Transcript"
@@ -567,9 +545,14 @@ async def test_transcribe_preserves_validated_provider_parameters(
     submitted_url = f"{provider_url}#fragment"
     extractor = RecordingMetadataExtractor(tiktok_metadata())
     downloader = RecordingAudioDownloader()
-    service = build_service(tmp_path, extractor, downloader, FixedTranscriber())
+    service = build_execution(
+        build_transcription_config(tmp_path), extractor, downloader, FixedTranscriber()
+    )
 
-    await service.transcribe(submitted_url)
+    await service.execute(
+        inspection.classify_submitted_url(submitted_url),
+        cancellation_event=threading.Event(),
+    )
 
     assert extractor.calls == [provider_url]
     assert downloader.calls == [provider_url]
@@ -583,9 +566,14 @@ async def test_transcribe_accepts_completed_audio_at_byte_limit(
     extractor = RecordingMetadataExtractor(tiktok_metadata())
     downloader = RecordingAudioDownloader(size_bytes=1024)
     transcriber = FixedTranscriber()
-    service = build_service(tmp_path, extractor, downloader, transcriber)
+    service = build_execution(
+        build_transcription_config(tmp_path), extractor, downloader, transcriber
+    )
 
-    result = await service.transcribe(DIRECT_TIKTOK_URL)
+    result = await service.execute(
+        inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
+        cancellation_event=threading.Event(),
+    )
 
     assert result.transcript.text == "Transcript"
     assert len(transcriber.calls) == 1
@@ -600,10 +588,15 @@ async def test_transcribe_rejects_oversized_injected_metadata(tmp_path: Path) ->
     extractor = RecordingMetadataExtractor(metadata)
     downloader = RecordingAudioDownloader()
     transcriber = FixedTranscriber()
-    service = build_service(tmp_path, extractor, downloader, transcriber)
+    service = build_execution(
+        build_transcription_config(tmp_path), extractor, downloader, transcriber
+    )
 
     with pytest.raises(UnsupportedMediaError):
-        await service.transcribe(DIRECT_TIKTOK_URL)
+        await service.execute(
+            inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
+            cancellation_event=threading.Event(),
+        )
 
     assert downloader.calls == []
     assert transcriber.calls == []
@@ -622,10 +615,15 @@ async def test_transcribe_rejects_oversized_prepared_audio(tmp_path: Path) -> No
     )
     downloader = RecordingAudioDownloader()
     transcriber = FixedTranscriber()
-    service = build_service(tmp_path, extractor, downloader, transcriber)
+    service = build_execution(
+        build_transcription_config(tmp_path), extractor, downloader, transcriber
+    )
 
     with pytest.raises(UnsupportedMediaError):
-        await service.transcribe(DIRECT_TIKTOK_URL)
+        await service.execute(
+            inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
+            cancellation_event=threading.Event(),
+        )
 
     assert downloader.calls == []
     assert transcriber.calls == []
@@ -639,10 +637,15 @@ async def test_transcribe_rejects_duration_above_the_inclusive_ceiling(
     """A rounded duration above the configured ceiling never downloads audio."""
     extractor = RecordingMetadataExtractor(tiktok_metadata(1800.1))
     downloader = RecordingAudioDownloader()
-    service = build_service(tmp_path, extractor, downloader, FixedTranscriber())
+    service = build_execution(
+        build_transcription_config(tmp_path), extractor, downloader, FixedTranscriber()
+    )
 
     with pytest.raises(VideoTooLongError):
-        await service.transcribe(DIRECT_TIKTOK_URL)
+        await service.execute(
+            inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
+            cancellation_event=threading.Event(),
+        )
 
     assert downloader.calls == []
 
@@ -659,82 +662,69 @@ async def test_transcribe_cleans_inspection_audio_after_inference_failure(
     prepared_audio = PreparedAudio(prepared_path, prepared_directory)
     extractor = RecordingMetadataExtractor(tiktok_metadata(), prepared_audio)
     downloader = RecordingAudioDownloader()
-    service = build_service(
-        tmp_path,
+    service = build_execution(
+        build_transcription_config(tmp_path),
         extractor,
         downloader,
         FixedTranscriber(RuntimeError("native provider failed")),
     )
 
     with pytest.raises(TranscriptionFailedError):
-        await service.transcribe(DIRECT_TIKTOK_URL)
+        await service.execute(
+            inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
+            cancellation_event=threading.Event(),
+        )
 
     assert not prepared_directory.exists()
     assert downloader.calls == []
 
 
 @pytest.mark.asyncio
-async def test_transcribe_rejects_unknown_platform_before_provider_calls(
-    tmp_path: Path,
-) -> None:
-    """An unknown-platform URL does not reach any provider boundary."""
-    extractor = RecordingMetadataExtractor(tiktok_metadata())
-    caption_provider = RecordingCaptionProvider()
-    downloader = RecordingAudioDownloader()
-    transcriber = FixedTranscriber()
-    service = build_service(
-        tmp_path,
-        extractor,
-        downloader,
-        transcriber,
-        caption_provider,
-    )
-
-    with pytest.raises(UnsupportedPlatformError):
-        await service.transcribe(UNKNOWN_PLATFORM_URL)
-
-    assert extractor.calls == []
-    assert caption_provider.calls == []
-    assert downloader.calls == []
-    assert transcriber.calls == []
-
-
 @pytest.mark.asyncio
 async def test_transcribe_translates_metadata_and_download_timeouts(
     tmp_path: Path,
 ) -> None:
     """Metadata and audio stages retain distinct safe domain failure types."""
-    metadata_timeout_service = build_service(
-        tmp_path,
+    metadata_timeout_service = build_execution(
+        build_transcription_config(tmp_path),
         RecordingMetadataExtractor(tiktok_metadata(), failure=TimeoutError()),
         RecordingAudioDownloader(),
         FixedTranscriber(),
     )
-    download_timeout_service = build_service(
-        tmp_path,
+    download_timeout_service = build_execution(
+        build_transcription_config(tmp_path),
         RecordingMetadataExtractor(tiktok_metadata()),
         RecordingAudioDownloader(TimeoutError()),
         FixedTranscriber(),
     )
 
     with pytest.raises(MetadataTimeoutError):
-        await metadata_timeout_service.transcribe(DIRECT_TIKTOK_URL)
+        await metadata_timeout_service.execute(
+            inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
+            cancellation_event=threading.Event(),
+        )
     with pytest.raises(AudioDownloadTimeoutError):
-        await download_timeout_service.transcribe(DIRECT_TIKTOK_URL)
+        await download_timeout_service.execute(
+            inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
+            cancellation_event=threading.Event(),
+        )
 
 
 @pytest.mark.asyncio
 async def test_transcribe_translates_ordinary_metadata_failures(tmp_path: Path) -> None:
     """Ordinary metadata exceptions become a safe metadata stage error."""
-    service = build_service(
-        tmp_path,
+    service = build_execution(
+        build_transcription_config(tmp_path),
         RecordingMetadataExtractor(tiktok_metadata(), failure=RuntimeError("failed")),
         RecordingAudioDownloader(),
         FixedTranscriber(),
     )
 
     with pytest.raises(MetadataRetrievalFailedError):
-        await service.transcribe(DIRECT_TIKTOK_URL)
+        await service.execute(
+            inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
+            cancellation_event=threading.Event(),
+        )
 
 
 @pytest.mark.asyncio
@@ -750,15 +740,18 @@ async def test_transcribe_returns_youtube_captions_without_native_work(
     caption_provider = RecordingCaptionProvider((caption_track,))
     downloader = RecordingAudioDownloader()
     transcriber = FixedTranscriber()
-    service = build_service(
-        tmp_path,
+    service = build_execution(
+        build_transcription_config(tmp_path),
         RecordingMetadataExtractor(youtube_metadata()),
         downloader,
         transcriber,
         caption_provider,
     )
 
-    result = await service.transcribe(YOUTUBE_URL)
+    result = await service.execute(
+        inspection.classify_submitted_url(YOUTUBE_URL),
+        cancellation_event=threading.Event(),
+    )
 
     assert result.source.video_id == "dQw4w9WgXcQ"
     assert result.source.url == YOUTUBE_URL
@@ -786,8 +779,8 @@ async def test_transcribe_forwards_text_only_selection_to_youtube_captions(
     caption_provider = RecordingCaptionProvider((caption_track,))
     downloader = RecordingAudioDownloader()
     transcriber = FixedTranscriber()
-    service = build_service(
-        tmp_path,
+    service = build_execution(
+        build_transcription_config(tmp_path),
         RecordingMetadataExtractor(
             youtube_metadata(),
             PreparedAudio(prepared_path, prepared_directory),
@@ -797,7 +790,11 @@ async def test_transcribe_forwards_text_only_selection_to_youtube_captions(
         caption_provider,
     )
 
-    result = await service.transcribe(YOUTUBE_URL, include_segments=False)
+    result = await service.execute(
+        inspection.classify_submitted_url(YOUTUBE_URL),
+        cancellation_event=threading.Event(),
+        include_segments=False,
+    )
 
     assert result.transcript.method is TranscriptMethod.YOUTUBE_CAPTIONS
     assert result.transcript.text == "caption"
@@ -836,15 +833,18 @@ async def test_transcribe_falls_back_after_unusable_youtube_captions(
     caption_provider = RecordingCaptionProvider(tracks, failure)
     downloader = RecordingAudioDownloader()
     transcriber = FixedTranscriber()
-    service = build_service(
-        tmp_path,
+    service = build_execution(
+        build_transcription_config(tmp_path),
         RecordingMetadataExtractor(youtube_metadata(metadata_language)),
         downloader,
         transcriber,
         caption_provider,
     )
 
-    result = await service.transcribe(YOUTUBE_URL)
+    result = await service.execute(
+        inspection.classify_submitted_url(YOUTUBE_URL),
+        cancellation_event=threading.Event(),
+    )
 
     assert result.transcript.method is TranscriptMethod.FASTER_WHISPER
     assert len(caption_provider.calls) == expected_caption_calls
@@ -856,7 +856,7 @@ async def test_transcribe_falls_back_after_unusable_youtube_captions(
 async def test_transcribe_cleans_prepared_audio_after_youtube_caption_success(
     tmp_path: Path,
 ) -> None:
-    """Caption success cleans metadata-stage audio before releasing admission."""
+    """Caption success cleans metadata-stage audio before caller work ends."""
     prepared_directory = tmp_path / "inspection"
     prepared_directory.mkdir()
     prepared_path = prepared_directory / "audio.webm"
@@ -866,8 +866,8 @@ async def test_transcribe_cleans_prepared_audio_after_youtube_caption_success(
     )
     downloader = RecordingAudioDownloader()
     transcriber = FixedTranscriber()
-    service = build_service(
-        tmp_path,
+    service = build_execution(
+        build_transcription_config(tmp_path),
         RecordingMetadataExtractor(
             youtube_metadata(),
             PreparedAudio(prepared_path, prepared_directory),
@@ -877,7 +877,10 @@ async def test_transcribe_cleans_prepared_audio_after_youtube_caption_success(
         caption_provider,
     )
 
-    result = await service.transcribe(YOUTUBE_URL)
+    result = await service.execute(
+        inspection.classify_submitted_url(YOUTUBE_URL),
+        cancellation_event=threading.Event(),
+    )
 
     assert result.transcript.method is TranscriptMethod.YOUTUBE_CAPTIONS
     assert not prepared_directory.exists()
@@ -896,8 +899,8 @@ async def test_transcribe_reuses_prepared_audio_after_youtube_caption_miss(
     prepared_path.touch()
     downloader = RecordingAudioDownloader()
     transcriber = FixedTranscriber()
-    service = build_service(
-        tmp_path,
+    service = build_execution(
+        build_transcription_config(tmp_path),
         RecordingMetadataExtractor(
             youtube_metadata(),
             PreparedAudio(prepared_path, prepared_directory),
@@ -907,7 +910,10 @@ async def test_transcribe_reuses_prepared_audio_after_youtube_caption_miss(
         RecordingCaptionProvider(),
     )
 
-    result = await service.transcribe(YOUTUBE_URL)
+    result = await service.execute(
+        inspection.classify_submitted_url(YOUTUBE_URL),
+        cancellation_event=threading.Event(),
+    )
 
     assert result.transcript.method is TranscriptMethod.FASTER_WHISPER
     assert downloader.calls == []
@@ -924,8 +930,8 @@ async def test_transcribe_preserves_native_failure_after_caption_failure(
         failure=acquisition._CaptionProviderFailure()
     )
     downloader = RecordingAudioDownloader()
-    service = build_service(
-        tmp_path,
+    service = build_execution(
+        build_transcription_config(tmp_path),
         RecordingMetadataExtractor(youtube_metadata()),
         downloader,
         FixedTranscriber(RuntimeError("native provider failed")),
@@ -933,7 +939,10 @@ async def test_transcribe_preserves_native_failure_after_caption_failure(
     )
 
     with pytest.raises(TranscriptionFailedError):
-        await service.transcribe(YOUTUBE_URL)
+        await service.execute(
+            inspection.classify_submitted_url(YOUTUBE_URL),
+            cancellation_event=threading.Event(),
+        )
 
     assert caption_provider.calls == ["dQw4w9WgXcQ"]
     assert downloader.calls == [YOUTUBE_URL]
@@ -990,12 +999,10 @@ async def test_transcription_execution_runs_caption_bypass_and_native_fallback_w
         transcriber,
         caption_provider,
     )
-    resource_releases: list[None] = []
 
     result = await executor.execute(
         inspection.classify_submitted_url(YOUTUBE_URL),
         cancellation_event=threading.Event(),
-        on_resources_released=lambda: resource_releases.append(None),
     )
 
     assert result.source.video_id == "dQw4w9WgXcQ"
@@ -1003,7 +1010,6 @@ async def test_transcription_execution_runs_caption_bypass_and_native_fallback_w
     assert result.transcript.method is expected_method
     assert result.transcript.text == expected_text
     assert caption_provider.calls == ["dQw4w9WgXcQ"]
-    assert resource_releases == [None]
     if expected_method is TranscriptMethod.YOUTUBE_CAPTIONS:
         assert downloader.calls == []
         assert transcriber.calls == []
@@ -1041,12 +1047,10 @@ async def test_transcription_execution_uses_caller_cancellation_for_pre_native_w
         caption_provider,
     )
     cancellation_event = threading.Event()
-    resource_releases: list[None] = []
     task = asyncio.create_task(
         executor.execute(
             inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
             cancellation_event=cancellation_event,
-            on_resources_released=lambda: resource_releases.append(None),
         )
     )
     stage_entered = (
@@ -1061,7 +1065,6 @@ async def test_transcription_execution_uses_caller_cancellation_for_pre_native_w
     assert cancellation_event.is_set()
     assert caption_provider.calls == []
     assert transcriber.calls == []
-    assert resource_releases == [None]
     if stage == "metadata":
         assert audio_downloader.calls == []
         assert len(metadata_extractor.calls) == 1

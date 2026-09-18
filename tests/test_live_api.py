@@ -1,10 +1,11 @@
 """Opt-in checks against an operator-configured running Textify API."""
 
+import asyncio
 import math
 import os
 
 import pytest
-from httpx import AsyncClient, Timeout
+from httpx import AsyncClient, Response, Timeout
 
 LIVE_BASE_URL = os.environ.get("TEXTIFY_LIVE_BASE_URL")
 LIVE_SOURCES = tuple(
@@ -31,8 +32,46 @@ pytestmark = [
 ]
 
 
-async def test_configured_public_videos_match_transcript_contract() -> None:
-    """Exercise each configured public video through the running API."""
+async def _poll_until_succeeded(
+    client: AsyncClient,
+    location: str,
+) -> Response:
+    """Poll a job capability until it reaches the successful terminal state.
+
+    Args:
+        client: Connected live API client.
+        location: Relative job capability URL returned at submission.
+
+    Returns:
+        The terminal successful polling response.
+
+    Raises:
+        AssertionError: If the API returns an invalid lifecycle representation.
+    """
+    for _ in range(1250):
+        response = await client.get(location)
+        assert response.status_code == 200
+        assert response.headers.get("X-Request-ID")
+        assert response.headers["Cache-Control"] == "no-store"
+        payload = response.json()
+        if payload["status"] in {"queued", "processing"}:
+            retry_after = response.headers["Retry-After"]
+            assert retry_after.isdecimal()
+            await asyncio.sleep(int(retry_after))
+            continue
+
+        assert payload["status"] == "finished"
+        assert payload["outcome"] == "succeeded"
+        assert "Retry-After" not in response.headers
+        return response
+
+    raise AssertionError(
+        "Transcription Job did not finish within the live polling limit."
+    )
+
+
+async def test_configured_public_videos_match_transcription_job_contract() -> None:
+    """Exercise each configured public video through submission and polling."""
     assert LIVE_BASE_URL is not None
     async with AsyncClient(
         base_url=LIVE_BASE_URL,
@@ -44,13 +83,21 @@ async def test_configured_public_videos_match_transcript_contract() -> None:
         assert health_response.headers.get("X-Request-ID")
 
         for expected_platform, source_url in LIVE_SOURCES:
-            response = await client.post("/api/transcripts", json={"url": source_url})
-            assert response.status_code == 200
-            assert response.headers.get("X-Request-ID")
+            submission = await client.post(
+                "/api/transcription-jobs",
+                json={"url": source_url},
+            )
+            assert submission.status_code == 202
+            assert submission.headers.get("X-Request-ID")
+            assert submission.headers["Cache-Control"] == "no-store"
+            assert submission.headers["Retry-After"] == "2"
+            location = submission.headers["Location"]
+            assert submission.json()["links"]["self"] == location
 
-            payload = response.json()
-            source = payload["source"]
-            transcript = payload["transcript"]
+            response = await _poll_until_succeeded(client, location)
+            result = response.json()["result"]
+            source = result["source"]
+            transcript = result["transcript"]
             segments = transcript["segments"]
 
             assert source["platform"] == expected_platform

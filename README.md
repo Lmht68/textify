@@ -1,7 +1,7 @@
 # Textify
 
-Textify is a synchronous HTTP API that returns normalized transcripts for eligible public YouTube, Facebook, Instagram, TikTok, and X videos.
-It uses an eligible YouTube caption track when available and Faster-Whisper for audio transcription when needed.
+Textify is an asynchronous HTTP API for normalized transcripts from eligible public YouTube, Facebook, Instagram, TikTok, and X videos.
+It accepts durable Transcription Jobs, uses an eligible YouTube caption track when available, and otherwise uses Faster-Whisper for audio transcription.
 Inference requires an NVIDIA CUDA GPU.
 
 ## What you need
@@ -49,20 +49,21 @@ Check that the service is ready.
 curl http://127.0.0.1:8182/health
 ```
 
-Request a transcript by replacing the example URL with an eligible public video URL.
+Submit a Transcription Job by replacing the example URL with an eligible public video URL.
 
 ```shell
-curl -X POST http://127.0.0.1:8182/api/transcripts \
+curl -i -X POST http://127.0.0.1:8182/api/transcription-jobs \
   -H 'Content-Type: application/json' \
   --data '{"url":"https://www.youtube.com/watch?v=YOUR_VIDEO_ID"}'
 ```
 
-A successful response contains source metadata and a transcript with plain text and timed segments.
+The `202 Accepted` response contains a `Location` header and a capability link in `links.self`.
+Poll that location after the response's `Retry-After` interval until it returns `status: "finished"` and `outcome: "succeeded"`.
+The terminal response nests source metadata and a transcript with plain text and timed segments under `result`.
 Interactive API documentation is available at `http://127.0.0.1:8182/docs`.
 
 Textify accepts supported public video URLs only.
-It rejects unavailable, private, live, non-video, oversized, and over-duration sources.
-Requests run synchronously, so keep client timeouts appropriate for the source duration and transcription workload.
+It rejects unavailable, private, live, non-video, oversized, and over-duration sources before execution.
 
 ## Configuration
 
@@ -76,9 +77,11 @@ Keep `.env` private, especially `TEXTIFY_HF_TOKEN` when model access requires it
 | `TEXTIFY_TEMPORARY_MEDIA_ROOT` | Writable directory for request media. |
 | `TEXTIFY_WHISPER_MODEL`, `TEXTIFY_WHISPER_REVISION` | Whisper model and pinned revision to load. |
 | `TEXTIFY_WHISPER_DEVICE_INDEX` | CUDA device visible to the process. |
-| `TEXTIFY_TRANSCRIPTION_CONCURRENCY`, `TEXTIFY_MAX_PENDING_TRANSCRIPTIONS` | Active and queued transcription capacity. |
+| `TEXTIFY_TRANSCRIPTION_CONCURRENCY` | Maximum concurrent native inference operations. |
+| `TEXTIFY_JOB_WORKER_COUNT` | Number of application-owned durable job consumers. |
+| `TEXTIFY_MAX_OUTSTANDING_JOBS`, `TEXTIFY_JOB_QUEUE_TIMEOUT_SECONDS` | Durable admission capacity and database queue-lock deadline. |
 | `TEXTIFY_MAX_MEDIA_BYTES` | Maximum downloaded media size. |
 | `TEXTIFY_HF_TOKEN` | Optional Hugging Face credential for restricted models. |
 
-The temporary media directory needs enough free space for concurrent work.
+The temporary media directory needs enough free space for configured job workers, native inference, and one cleanup reserve.
 See `.env.example` for the remaining inference and timeout settings.

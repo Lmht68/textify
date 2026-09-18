@@ -39,12 +39,15 @@ def test_database_path_loads_explicit_filesystem_value(
     assert settings.database_path == Path("textify.sqlite3")
 
 
-def test_queued_job_settings_use_bounded_defaults() -> None:
-    """Default durable admission to eight jobs and a 20-second queue deadline."""
+def test_durable_job_settings_use_bounded_defaults() -> None:
+    """Default durable admission, worker ownership, and polling cadence."""
     settings = TranscriptionConfig(_env_file=None)  # type: ignore[call-arg]
 
     assert settings.max_outstanding_jobs == 8
     assert settings.job_queue_timeout_seconds == 20
+    assert settings.job_worker_count == 1
+    assert "max_pending_transcriptions" not in TranscriptionConfig.model_fields
+    assert "transcription_queue_timeout_seconds" not in TranscriptionConfig.model_fields
 
 
 @pytest.mark.parametrize(
@@ -54,6 +57,8 @@ def test_queued_job_settings_use_bounded_defaults() -> None:
         ("TEXTIFY_MAX_OUTSTANDING_JOBS", "-1"),
         ("TEXTIFY_JOB_QUEUE_TIMEOUT_SECONDS", "0"),
         ("TEXTIFY_JOB_QUEUE_TIMEOUT_SECONDS", "-1"),
+        ("TEXTIFY_JOB_WORKER_COUNT", "0"),
+        ("TEXTIFY_JOB_WORKER_COUNT", "-1"),
     ),
 )
 def test_nonpositive_queued_job_settings_are_rejected(

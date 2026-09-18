@@ -5,7 +5,7 @@ import logging
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from decimal import Decimal
 from numbers import Real
 from pathlib import Path
@@ -26,7 +26,6 @@ from textify.transcription.config import TranscriptionConfig
 from textify.transcription.exceptions import (
     AudioDownloadFailedError,
     AudioDownloadTimeoutError,
-    TranscriptionCapacityExceededError,
     TranscriptionFailedError,
     TranscriptionTimeoutError,
     UnsupportedMediaError,
@@ -625,24 +624,21 @@ def load_whisper_transcriber(
 
 
 class TranscriptionOwnership:
-    """Own inspection-prepared media and caller resources across native inference."""
+    """Own inspection-prepared media across caller and retained native work."""
 
     def __init__(
         self,
         prepared_audio: PreparedAudio | None,
         cancellation_event: threading.Event,
-        on_resources_released: Callable[[], None],
     ) -> None:
         """Initialize caller-scoped ownership before native work can begin.
 
         Args:
             prepared_audio: Inspection-stage media this ownership must clean.
             cancellation_event: Cooperative signal shared with provider work.
-            on_resources_released: Callback invoked once after every owner ends.
         """
         self._prepared_audio = prepared_audio
         self._cancellation_event = cancellation_event
-        self._on_resources_released = on_resources_released
         self._native_retained = False
         self._caller_finished = False
         self._native_completed = False
@@ -659,7 +655,7 @@ class TranscriptionOwnership:
         return self._cancellation_event
 
     def retain_native_work(self) -> None:
-        """Transfer media cleanup and resource release to native work completion."""
+        """Transfer media cleanup to native work completion."""
         self._native_retained = True
         self._release_when_finished()
 
@@ -670,12 +666,12 @@ class TranscriptionOwnership:
         self._release_when_finished()
 
     def complete_native_work(self) -> None:
-        """Mark retained native work complete and release owned resources."""
+        """Mark retained native work complete and release owned media."""
         self._native_completed = True
         self._release_when_finished()
 
     def _release_when_finished(self) -> None:
-        """Clean prepared media and release resources after every owner finishes."""
+        """Clean prepared media after every owner has finished."""
         if self._released or not self._caller_finished:
             return
         if self._native_retained and not self._native_completed:
@@ -683,7 +679,6 @@ class TranscriptionOwnership:
         self._released = True
         if self._prepared_audio is not None:
             self._prepared_audio.cleanup()
-        self._on_resources_released()
 
 
 async def _finish_cancelled_download(worker: asyncio.Task[Path]) -> None:
@@ -911,9 +906,6 @@ class WhisperAcquirer:
         self._transcriber = transcriber
         self._temporary_media_root = settings.temporary_media_root
         self._audio_download_timeout_seconds = settings.audio_download_timeout_seconds
-        self._transcription_queue_timeout_seconds = (
-            settings.transcription_queue_timeout_seconds
-        )
         self._transcription_timeout_seconds = settings.transcription_timeout_seconds
         self._max_media_bytes = settings.max_media_bytes
         self._inference_semaphore = asyncio.Semaphore(
@@ -932,7 +924,8 @@ class WhisperAcquirer:
 
         Args:
             source_url: Validated provider URL for yt-dlp.
-            ownership: Request ownership retained when native work outlives a response.
+            ownership: Execution ownership retained when native work outlives the
+                coordinator task.
             include_segments: Whether to retain normalized timed segments.
 
         Returns:
@@ -941,7 +934,6 @@ class WhisperAcquirer:
         Raises:
             AudioDownloadFailedError: If the audio download is unusable.
             AudioDownloadTimeoutError: If the audio download times out.
-            TranscriptionCapacityExceededError: If native queue capacity expires.
             TranscriptionFailedError: If native inference is unusable.
             TranscriptionTimeoutError: If native inference does not respond in time.
         """
@@ -955,13 +947,7 @@ class WhisperAcquirer:
                 cancellation_event,
             )
             try:
-                try:
-                    async with asyncio.timeout(
-                        self._transcription_queue_timeout_seconds
-                    ):
-                        await self._inference_semaphore.acquire()
-                except TimeoutError as exc:
-                    raise TranscriptionCapacityExceededError() from exc
+                await self._inference_semaphore.acquire()
                 inference_permit_acquired = True
                 worker = asyncio.create_task(
                     asyncio.to_thread(
