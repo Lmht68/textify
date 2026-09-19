@@ -50,12 +50,217 @@ class QueuedJobPayload(TypedDict):
 
 
 @dataclass
+class ConcurrencyProbe:
+    """Coordinate and observe concurrent controlled provider calls."""
+
+    gated_metadata_urls: frozenset[str] = frozenset()
+    gate_native_calls: bool = False
+    _condition: threading.Condition = field(
+        default_factory=threading.Condition,
+        init=False,
+        repr=False,
+    )
+    _metadata_gate: threading.Semaphore = field(
+        default_factory=lambda: threading.Semaphore(0),
+        init=False,
+        repr=False,
+    )
+    _native_gate: threading.Semaphore = field(
+        default_factory=lambda: threading.Semaphore(0),
+        init=False,
+        repr=False,
+    )
+    _metadata_urls: list[str] = field(default_factory=list, init=False)
+    _native_source_urls: list[str] = field(default_factory=list, init=False)
+    _audio_source_urls: dict[Path, str] = field(default_factory=dict, init=False)
+    _active_metadata_calls: int = field(default=0, init=False)
+    _peak_metadata_calls: int = field(default=0, init=False)
+    _active_native_calls: int = field(default=0, init=False)
+    _peak_native_calls: int = field(default=0, init=False)
+
+    @property
+    def metadata_urls(self) -> tuple[str, ...]:
+        """Return metadata provider URLs in entry order."""
+        with self._condition:
+            return tuple(self._metadata_urls)
+
+    @property
+    def native_source_urls(self) -> tuple[str, ...]:
+        """Return native source URLs in entry order."""
+        with self._condition:
+            return tuple(self._native_source_urls)
+
+    @property
+    def active_metadata_calls(self) -> int:
+        """Return the number of metadata calls currently executing."""
+        with self._condition:
+            return self._active_metadata_calls
+
+    @property
+    def peak_metadata_calls(self) -> int:
+        """Return the peak number of concurrent metadata calls."""
+        with self._condition:
+            return self._peak_metadata_calls
+
+    @property
+    def active_native_calls(self) -> int:
+        """Return the number of native calls currently executing."""
+        with self._condition:
+            return self._active_native_calls
+
+    @property
+    def peak_native_calls(self) -> int:
+        """Return the peak number of concurrent native calls."""
+        with self._condition:
+            return self._peak_native_calls
+
+    def enter_metadata(self, provider_url: str) -> None:
+        """Record a metadata call and block configured provider URLs.
+
+        Args:
+            provider_url: Provider URL about to enter metadata extraction.
+        """
+        with self._condition:
+            self._metadata_urls.append(provider_url)
+            self._active_metadata_calls += 1
+            self._peak_metadata_calls = max(
+                self._peak_metadata_calls,
+                self._active_metadata_calls,
+            )
+            self._condition.notify_all()
+            should_block = provider_url in self.gated_metadata_urls
+        if should_block:
+            self._metadata_gate.acquire()
+
+    def leave_metadata(self) -> None:
+        """Record completion of one metadata call."""
+        with self._condition:
+            self._active_metadata_calls -= 1
+            self._condition.notify_all()
+
+    def register_audio_source(self, audio_path: Path, source_url: str) -> None:
+        """Map a downloaded audio file to the provider source URL.
+
+        Args:
+            audio_path: Completed temporary media file.
+            source_url: Provider URL supplied to the downloader.
+        """
+        with self._condition:
+            self._audio_source_urls[audio_path] = source_url
+            self._condition.notify_all()
+
+    def enter_native(self, audio_path: Path) -> None:
+        """Record a native call and block it when configured.
+
+        Args:
+            audio_path: Temporary media file supplied to native inference.
+
+        Raises:
+            AssertionError: If native inference receives an untracked audio file.
+        """
+        with self._condition:
+            try:
+                source_url = self._audio_source_urls[audio_path]
+            except KeyError as exc:
+                raise AssertionError(
+                    "Native inference received untracked audio."
+                ) from exc
+            self._native_source_urls.append(source_url)
+            self._active_native_calls += 1
+            self._peak_native_calls = max(
+                self._peak_native_calls,
+                self._active_native_calls,
+            )
+            self._condition.notify_all()
+            should_block = self.gate_native_calls
+        if should_block:
+            self._native_gate.acquire()
+
+    def leave_native(self) -> None:
+        """Record completion of one native inference call."""
+        with self._condition:
+            self._active_native_calls -= 1
+            self._condition.notify_all()
+
+    def release_metadata(self, count: int = 1) -> None:
+        """Release configured metadata calls.
+
+        Args:
+            count: Number of metadata calls to release.
+
+        Raises:
+            ValueError: If ``count`` is not positive.
+        """
+        self._release(self._metadata_gate, count)
+
+    def release_native(self, count: int = 1) -> None:
+        """Release configured native calls.
+
+        Args:
+            count: Number of native calls to release.
+
+        Raises:
+            ValueError: If ``count`` is not positive.
+        """
+        self._release(self._native_gate, count)
+
+    async def wait_for_metadata_calls(self, expected_count: int) -> None:
+        """Wait asynchronously until metadata calls reach a target count.
+
+        Args:
+            expected_count: Minimum number of entered metadata calls.
+        """
+        await asyncio.to_thread(
+            self._wait_for_call_count,
+            expected_count,
+            self._metadata_urls,
+            "metadata",
+        )
+
+    async def wait_for_native_calls(self, expected_count: int) -> None:
+        """Wait asynchronously until native calls reach a target count.
+
+        Args:
+            expected_count: Minimum number of entered native calls.
+        """
+        await asyncio.to_thread(
+            self._wait_for_call_count,
+            expected_count,
+            self._native_source_urls,
+            "native",
+        )
+
+    def _release(self, gate: threading.Semaphore, count: int) -> None:
+        if count <= 0:
+            raise ValueError("release count must be positive.")
+        for _ in range(count):
+            gate.release()
+
+    def _wait_for_call_count(
+        self,
+        expected_count: int,
+        calls: list[str],
+        call_type: str,
+    ) -> None:
+        with self._condition:
+            completed = self._condition.wait_for(
+                lambda: len(calls) >= expected_count,
+                timeout=2.0,
+            )
+            if not completed:
+                raise AssertionError(
+                    f"Timed out waiting for {expected_count} {call_type} calls."
+                )
+
+
+@dataclass
 class ControlledAdapterState:
     """Coordinate deterministic provider work for Transcription Job ASGI tests."""
 
     block_metadata: bool = False
     caption_segments: tuple[tuple[float, float, str], ...] = ()
     caption_language: str = "en-US"
+    probe: ConcurrencyProbe | None = None
     metadata_calls: list[str] = field(default_factory=list)
     download_calls: list[str] = field(default_factory=list)
     native_include_segments: list[bool] = field(default_factory=list)
@@ -150,12 +355,19 @@ class ControlledMetadataExtractor:
             Valid metadata accepted by the production normalization boundary.
         """
         del deadline
-        self._state.metadata_calls.append(provider_url)
-        self._state.metadata_entered.set()
-        if self._state.block_metadata:
-            while not self._state.metadata_release.wait(0.01):
-                assert not cancellation_event.is_set()
-        return inspection.ExtractedMetadata(_metadata_for(provider_url))
+        probe = self._state.probe
+        if probe is not None:
+            probe.enter_metadata(provider_url)
+        try:
+            self._state.metadata_calls.append(provider_url)
+            self._state.metadata_entered.set()
+            if self._state.block_metadata:
+                while not self._state.metadata_release.wait(0.01):
+                    assert not cancellation_event.is_set()
+            return inspection.ExtractedMetadata(_metadata_for(provider_url))
+        finally:
+            if probe is not None:
+                probe.leave_metadata()
 
 
 class ControlledAudioDownloader:
@@ -193,6 +405,8 @@ class ControlledAudioDownloader:
         self._state.download_calls.append(source_url)
         audio_path = destination / "audio.webm"
         audio_path.write_bytes(b"audio")
+        if self._state.probe is not None:
+            self._state.probe.register_audio_source(audio_path, source_url)
         return audio_path
 
 
@@ -220,16 +434,23 @@ class ControlledTranscriber:
             A valid normalized transcript.
         """
         assert audio_path.is_file()
-        self._state.native_include_segments.append(include_segments)
-        self._state.native_completed.set()
-        if not include_segments:
-            return Transcript(TranscriptMethod.FASTER_WHISPER, "en", "One")
-        return TimedTranscript(
-            TranscriptMethod.FASTER_WHISPER,
-            "en",
-            "One",
-            (Segment(0.0, 1.0, "One"),),
-        )
+        probe = self._state.probe
+        if probe is not None:
+            probe.enter_native(audio_path)
+        try:
+            self._state.native_include_segments.append(include_segments)
+            self._state.native_completed.set()
+            if not include_segments:
+                return Transcript(TranscriptMethod.FASTER_WHISPER, "en", "One")
+            return TimedTranscript(
+                TranscriptMethod.FASTER_WHISPER,
+                "en",
+                "One",
+                (Segment(0.0, 1.0, "One"),),
+            )
+        finally:
+            if probe is not None:
+                probe.leave_native()
 
 
 class ControlledAdaptersFactory:
@@ -330,14 +551,22 @@ def _app_config(database_path: Path | None) -> AppConfig:
     )
 
 
-def _transcription_config(temporary_media_root: Path) -> TranscriptionConfig:
-    """Create bounded one-consumer settings for durable-job tests."""
+def _transcription_config(
+    temporary_media_root: Path,
+    *,
+    transcription_concurrency: int = 1,
+    job_worker_count: int = 1,
+    transcription_timeout_seconds: float = 1800.0,
+) -> TranscriptionConfig:
+    """Create bounded worker and native capacity settings for durable-job tests."""
     return TranscriptionConfig(
         temporary_media_root=temporary_media_root,
         max_media_bytes=1024,
         max_outstanding_jobs=8,
         job_queue_timeout_seconds=20,
-        job_worker_count=1,
+        transcription_concurrency=transcription_concurrency,
+        job_worker_count=job_worker_count,
+        transcription_timeout_seconds=transcription_timeout_seconds,
     )
 
 
@@ -964,3 +1193,275 @@ async def test_api_fails_startup_before_adapter_construction_for_invalid_storage
 
     assert factory.calls == 0
     assert application.state.ready is False
+
+
+async def test_api_claims_each_job_once_in_fifo_order_with_four_consumers(
+    migrated_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Claim queued caption jobs once and in FIFO order across four consumers."""
+    provider_urls = tuple(
+        f"{YOUTUBE_URL}&queue_position={position}" for position in range(8)
+    )
+    probe = ConcurrencyProbe(gated_metadata_urls=frozenset(provider_urls))
+    state = ControlledAdapterState(
+        caption_segments=((0.0, 1.0, "Caption"),),
+        probe=probe,
+    )
+    factory = ControlledAdaptersFactory(state)
+    settings = _transcription_config(
+        tmp_path / "media",
+        transcription_concurrency=2,
+        job_worker_count=4,
+    )
+    application = _application(
+        migrated_database_path,
+        tmp_path / "media",
+        factory,
+        settings=settings,
+    )
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            try:
+                first_submissions = [
+                    _assert_submission(
+                        await client.post(
+                            "/api/transcription-jobs",
+                            json={"url": provider_url},
+                        )
+                    )
+                    for provider_url in provider_urls[:4]
+                ]
+                await probe.wait_for_metadata_calls(4)
+                second_submissions = [
+                    _assert_submission(
+                        await client.post(
+                            "/api/transcription-jobs",
+                            json={"url": provider_url},
+                        )
+                    )
+                    for provider_url in provider_urls[4:]
+                ]
+                first_locations = [
+                    submission["links"]["self"] for submission in first_submissions
+                ]
+                second_locations = [
+                    submission["links"]["self"] for submission in second_submissions
+                ]
+                processing_responses = await asyncio.gather(
+                    *(client.get(location) for location in first_locations)
+                )
+                for response, location in zip(
+                    processing_responses, first_locations, strict=True
+                ):
+                    _assert_processing(response, location)
+                queued_responses = await asyncio.gather(
+                    *(client.get(location) for location in second_locations)
+                )
+                assert [response.json()["status"] for response in queued_responses] == [
+                    "queued"
+                ] * 4
+                assert frozenset(probe.metadata_urls) == frozenset(provider_urls[:4])
+                assert probe.peak_metadata_calls == 4
+
+                for expected_count, provider_url in enumerate(
+                    provider_urls[4:],
+                    start=5,
+                ):
+                    probe.release_metadata()
+                    await probe.wait_for_metadata_calls(expected_count)
+                    assert probe.metadata_urls[-1] == provider_url
+
+                probe.release_metadata(4)
+                finished_responses = await asyncio.gather(
+                    *(
+                        _poll_until_finished(client, location)
+                        for location in (*first_locations, *second_locations)
+                    )
+                )
+            finally:
+                probe.release_metadata(8)
+
+    for response, location in zip(
+        finished_responses,
+        (*first_locations, *second_locations),
+        strict=True,
+    ):
+        _assert_succeeded(response, location)
+    assert len(probe.metadata_urls) == len(provider_urls)
+    assert frozenset(probe.metadata_urls) == frozenset(provider_urls)
+    assert probe.native_source_urls == ()
+    assert state.download_calls == []
+    assert factory.calls == 1
+
+
+async def test_api_limits_native_inference_to_two_while_captions_bypass_permits(
+    migrated_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Keep native inference at two calls while caption jobs bypass its permits."""
+    native_urls = tuple(
+        f"{TIKTOK_URL}?native_position={position}" for position in range(3)
+    )
+    caption_url = f"{YOUTUBE_URL}&caption_position=1"
+    probe = ConcurrencyProbe(gate_native_calls=True)
+    state = ControlledAdapterState(
+        caption_segments=((0.0, 1.0, "Caption"),),
+        probe=probe,
+    )
+    factory = ControlledAdaptersFactory(state)
+    settings = _transcription_config(
+        tmp_path / "media",
+        transcription_concurrency=2,
+        job_worker_count=4,
+    )
+    application = _application(
+        migrated_database_path,
+        tmp_path / "media",
+        factory,
+        settings=settings,
+    )
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            try:
+                native_submissions = [
+                    _assert_submission(
+                        await client.post(
+                            "/api/transcription-jobs",
+                            json={"url": provider_url},
+                        )
+                    )
+                    for provider_url in native_urls
+                ]
+                await probe.wait_for_native_calls(2)
+                caption_submission = _assert_submission(
+                    await client.post(
+                        "/api/transcription-jobs",
+                        json={"url": caption_url},
+                    )
+                )
+                caption_location = caption_submission["links"]["self"]
+                caption_finished = await _poll_until_finished(client, caption_location)
+                assert probe.active_native_calls == 2
+                assert len(probe.native_source_urls) == 2
+                assert probe.peak_native_calls == 2
+                assert caption_url not in probe.native_source_urls
+                assert caption_url not in state.download_calls
+
+                probe.release_native(3)
+                native_locations = [
+                    submission["links"]["self"] for submission in native_submissions
+                ]
+                native_finished = await asyncio.gather(
+                    *(
+                        _poll_until_finished(client, location)
+                        for location in native_locations
+                    )
+                )
+            finally:
+                probe.release_native(3)
+
+    caption_result = _assert_succeeded(caption_finished, caption_location)["result"]
+    assert isinstance(caption_result, dict)
+    assert caption_result["transcript"]["method"] == "youtube_captions"
+    for response, location in zip(native_finished, native_locations, strict=True):
+        _assert_succeeded(response, location)
+    assert probe.peak_native_calls == 2
+    assert factory.calls == 1
+
+
+async def test_api_retains_timed_out_native_permits_until_underlying_calls_finish(
+    migrated_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Retain timed-out native permits until their underlying threads complete."""
+    native_urls = tuple(
+        f"{TIKTOK_URL}?timeout_position={position}" for position in range(4)
+    )
+    caption_urls = tuple(
+        f"{YOUTUBE_URL}&timeout_caption_position={position}" for position in range(2)
+    )
+    probe = ConcurrencyProbe(
+        gated_metadata_urls=frozenset(caption_urls),
+        gate_native_calls=True,
+    )
+    state = ControlledAdapterState(
+        caption_segments=((0.0, 1.0, "Caption"),),
+        probe=probe,
+    )
+    factory = ControlledAdaptersFactory(state)
+    settings = _transcription_config(
+        tmp_path / "media",
+        transcription_concurrency=2,
+        job_worker_count=4,
+        transcription_timeout_seconds=0.05,
+    )
+    application = _application(
+        migrated_database_path,
+        tmp_path / "media",
+        factory,
+        settings=settings,
+    )
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            try:
+                for provider_url in native_urls:
+                    _assert_submission(
+                        await client.post(
+                            "/api/transcription-jobs",
+                            json={"url": provider_url},
+                        )
+                    )
+                await probe.wait_for_native_calls(2)
+                caption_submissions = [
+                    _assert_submission(
+                        await client.post(
+                            "/api/transcription-jobs",
+                            json={"url": provider_url},
+                        )
+                    )
+                    for provider_url in caption_urls
+                ]
+                await probe.wait_for_metadata_calls(6)
+                assert probe.active_metadata_calls == 2
+                assert frozenset(probe.metadata_urls[-2:]) == frozenset(caption_urls)
+                assert probe.active_native_calls == 2
+                assert len(probe.native_source_urls) == 2
+
+                probe.release_metadata(2)
+                caption_locations = [
+                    submission["links"]["self"] for submission in caption_submissions
+                ]
+                caption_finished = await asyncio.gather(
+                    *(
+                        _poll_until_finished(client, location)
+                        for location in caption_locations
+                    )
+                )
+                assert len(probe.native_source_urls) == 2
+                assert all(
+                    caption_url not in probe.native_source_urls
+                    and caption_url not in state.download_calls
+                    for caption_url in caption_urls
+                )
+
+                probe.release_native()
+                await probe.wait_for_native_calls(3)
+                assert probe.peak_native_calls == 2
+
+                probe.release_native(3)
+            finally:
+                probe.release_metadata(2)
+                probe.release_native(4)
+
+    for response, location in zip(
+        caption_finished,
+        caption_locations,
+        strict=True,
+    ):
+        _assert_succeeded(response, location)
+    assert probe.peak_native_calls == 2
+    assert factory.calls == 1

@@ -32,6 +32,8 @@ from textify.transcription.types import ResponseFieldPath
 
 logger = logging.getLogger(__name__)
 
+_WORKER_WAKE_INTERVAL_SECONDS = 1.0
+
 
 class JobStatus(StrEnum):
     """Represent a Transcription Job's coarse lifecycle position."""
@@ -232,13 +234,12 @@ class TranscriptionJobCoordinator:
         return job
 
     async def _consume_jobs(self) -> None:
-        """Wait for committed work, then drain eligible jobs without polling."""
+        """Wait for committed work, then drain eligible jobs with bounded wakes."""
         try:
             while True:
-                await self._work_available.wait()
+                await self._wait_for_work()
                 if self._stopping:
                     return
-                self._work_available.clear()
                 while True:
                     claimed_job = await self._claim_next()
                     if claimed_job is None:
@@ -246,6 +247,15 @@ class TranscriptionJobCoordinator:
                     await self._execute_claimed_job(claimed_job)
         except TranscriptionJobStoreUnavailableError:
             logger.error("job_store_unavailable")
+
+    async def _wait_for_work(self) -> None:
+        """Wait for work submission or an interval boundary before draining."""
+        try:
+            async with asyncio.timeout(_WORKER_WAKE_INTERVAL_SECONDS):
+                await self._work_available.wait()
+        except TimeoutError:
+            pass
+        self._work_available.clear()
 
     async def _claim_next(self) -> ClaimedTranscriptionJob | None:
         """Return one new claim unless consumer shutdown has started."""

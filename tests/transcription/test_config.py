@@ -45,7 +45,8 @@ def test_durable_job_settings_use_bounded_defaults() -> None:
 
     assert settings.max_outstanding_jobs == 8
     assert settings.job_queue_timeout_seconds == 20
-    assert settings.job_worker_count == 1
+    assert settings.transcription_concurrency == 2
+    assert settings.job_worker_count == 4
     assert "max_pending_transcriptions" not in TranscriptionConfig.model_fields
     assert "transcription_queue_timeout_seconds" not in TranscriptionConfig.model_fields
 
@@ -53,6 +54,8 @@ def test_durable_job_settings_use_bounded_defaults() -> None:
 @pytest.mark.parametrize(
     ("setting_name", "setting_value"),
     (
+        ("TEXTIFY_TRANSCRIPTION_CONCURRENCY", "0"),
+        ("TEXTIFY_TRANSCRIPTION_CONCURRENCY", "-1"),
         ("TEXTIFY_MAX_OUTSTANDING_JOBS", "0"),
         ("TEXTIFY_MAX_OUTSTANDING_JOBS", "-1"),
         ("TEXTIFY_JOB_QUEUE_TIMEOUT_SECONDS", "0"),
@@ -61,7 +64,7 @@ def test_durable_job_settings_use_bounded_defaults() -> None:
         ("TEXTIFY_JOB_WORKER_COUNT", "-1"),
     ),
 )
-def test_nonpositive_queued_job_settings_are_rejected(
+def test_nonpositive_concurrency_and_queue_settings_are_rejected(
     monkeypatch: pytest.MonkeyPatch,
     setting_name: str,
     setting_value: str,

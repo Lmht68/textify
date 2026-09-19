@@ -31,10 +31,10 @@ class TranscriptionConfig(BaseSettings):
     vad_filter: bool = True
     temperature: float = Field(default=0.0, ge=0.0, le=1.0)
     condition_on_previous_text: bool = True
-    transcription_concurrency: int = Field(default=1, gt=0)
+    transcription_concurrency: int = Field(default=2, gt=0)
     max_outstanding_jobs: int = Field(default=8, gt=0)
     job_queue_timeout_seconds: int = Field(default=20, gt=0)
-    job_worker_count: int = Field(default=1, gt=0)
+    job_worker_count: int = Field(default=4, gt=0)
     max_media_bytes: int = Field(default=536_870_912, gt=0)
     metadata_timeout_seconds: float = Field(
         default=30.0,
