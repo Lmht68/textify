@@ -1,6 +1,6 @@
 """HTTP schemas for the Textify transcript API."""
 
-from typing import Annotated, Literal, Self, TypedDict
+from typing import Annotated, Self, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -348,66 +348,3 @@ def _build_transcript_response(
             for segment in transcript.segments
         )
     return response
-
-
-PublicErrorCode = Literal[
-    "invalid_url",
-    "unsupported_platform",
-    "invalid_request",
-    "unsupported_content",
-    "video_too_long",
-    "invalid_media_duration",
-    "unsupported_media",
-    "no_usable_transcript",
-    "metadata_retrieval_failed",
-    "audio_download_failed",
-    "transcription_failed",
-    "transcription_capacity_exceeded",
-    "job_not_found",
-    "job_store_unavailable",
-    "queue_timeout",
-    "metadata_timeout",
-    "audio_download_timeout",
-    "transcription_timeout",
-    "internal_error",
-]
-
-
-class ErrorDetail(BaseModel):
-    """Describe one stable public API failure."""
-
-    model_config = ConfigDict(
-        json_schema_extra={
-            "examples": [
-                {
-                    "code": "invalid_url",
-                    "message": "The submitted URL is invalid.",
-                }
-            ]
-        }
-    )
-
-    code: PublicErrorCode = Field(description="Stable machine-readable error code.")
-    message: str = Field(
-        min_length=1,
-        description="Safe human-readable message that is not byte-stable.",
-    )
-
-
-class ErrorResponse(BaseModel):
-    """Serialize the safe public API error envelope."""
-
-    model_config = ConfigDict(
-        json_schema_extra={
-            "examples": [
-                {
-                    "error": {
-                        "code": "invalid_url",
-                        "message": "The submitted URL is invalid.",
-                    }
-                }
-            ]
-        }
-    )
-
-    error: ErrorDetail = Field(description="Safe stable error detail.")

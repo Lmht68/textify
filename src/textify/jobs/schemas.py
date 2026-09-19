@@ -5,7 +5,8 @@ from typing import Literal
 
 from pydantic import UUID4, BaseModel, ConfigDict
 
-from textify.transcription.schemas import ErrorDetail, TranscriptionResponse
+from textify.errors import ErrorDetail
+from textify.transcription.schemas import TranscriptionResponse
 
 
 class ActiveTranscriptionJobLinks(BaseModel):

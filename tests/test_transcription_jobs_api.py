@@ -18,6 +18,8 @@ from httpx import ASGITransport, AsyncClient, Response
 from starlette.types import Message
 
 from textify.config import AppConfig, Environment
+from textify.jobs.config import JobConfig
+from textify.jobs.service import utc_now
 from textify.main import create_app
 from textify.transcription import inspection
 from textify.transcription.config import TranscriptionConfig
@@ -35,7 +37,6 @@ from textify.transcription.exceptions import (
     UnsupportedMediaError,
     VideoTooLongError,
 )
-from textify.transcription.jobs import utc_now
 from textify.transcription.service import TranscriptionAdapters
 from textify.transcription.types import (
     Platform,
@@ -591,14 +592,28 @@ def _metadata_for(provider_url: str) -> dict[str, object]:
     }
 
 
-def _app_config(database_path: Path | None) -> AppConfig:
+def _app_config() -> AppConfig:
     """Create isolated application configuration for durable-job tests."""
     return AppConfig(
         environment=Environment.LOCAL,
         log_level="INFO",
         host="127.0.0.1",
         port=8182,
+    )
+
+
+def _job_config(
+    database_path: Path | None,
+    *,
+    job_worker_count: int = 1,
+    job_queue_timeout_seconds: int = 20,
+) -> JobConfig:
+    """Create isolated durable-job configuration for durable-job tests."""
+    return JobConfig(
         database_path=database_path,
+        job_worker_count=job_worker_count,
+        max_outstanding_jobs=8,
+        job_queue_timeout_seconds=job_queue_timeout_seconds,
     )
 
 
@@ -606,20 +621,15 @@ def _transcription_config(
     temporary_media_root: Path,
     *,
     transcription_concurrency: int = 1,
-    job_worker_count: int = 1,
-    job_queue_timeout_seconds: int = 20,
     metadata_timeout_seconds: float = 30.0,
     audio_download_timeout_seconds: float = 300.0,
     transcription_timeout_seconds: float = 1800.0,
 ) -> TranscriptionConfig:
-    """Create bounded worker and native capacity settings for durable-job tests."""
+    """Create native-capacity settings for durable-job tests."""
     return TranscriptionConfig(
         temporary_media_root=temporary_media_root,
         max_media_bytes=1024,
-        max_outstanding_jobs=8,
-        job_queue_timeout_seconds=job_queue_timeout_seconds,
         transcription_concurrency=transcription_concurrency,
-        job_worker_count=job_worker_count,
         metadata_timeout_seconds=metadata_timeout_seconds,
         audio_download_timeout_seconds=audio_download_timeout_seconds,
         transcription_timeout_seconds=transcription_timeout_seconds,
@@ -632,16 +642,20 @@ def _application(
     factory: ControlledAdaptersFactory,
     *,
     settings: TranscriptionConfig | None = None,
+    job_config: JobConfig | None = None,
     clock: Callable[[], datetime] = utc_now,
 ) -> FastAPI:
     """Build one application with real durable storage and controlled providers."""
     return create_app(
-        _app_config(database_path),
+        _app_config(),
         settings
         if settings is not None
         else _transcription_config(temporary_media_root),
         factory,
         available_temporary_media_bytes=lambda _root: 1 << 60,
+        job_config=(
+            job_config if job_config is not None else _job_config(database_path)
+        ),
         clock=clock,
     )
 
@@ -1326,13 +1340,13 @@ async def test_api_claims_each_job_once_in_fifo_order_with_four_consumers(
     settings = _transcription_config(
         tmp_path / "media",
         transcription_concurrency=2,
-        job_worker_count=4,
     )
     application = _application(
         migrated_database_path,
         tmp_path / "media",
         factory,
         settings=settings,
+        job_config=_job_config(migrated_database_path, job_worker_count=4),
     )
     async with application.router.lifespan_context(application):
         transport = ASGITransport(app=application)
@@ -1428,13 +1442,13 @@ async def test_api_limits_native_inference_to_two_while_captions_bypass_permits(
     settings = _transcription_config(
         tmp_path / "media",
         transcription_concurrency=2,
-        job_worker_count=4,
     )
     application = _application(
         migrated_database_path,
         tmp_path / "media",
         factory,
         settings=settings,
+        job_config=_job_config(migrated_database_path, job_worker_count=4),
     )
     async with application.router.lifespan_context(application):
         transport = ASGITransport(app=application)
@@ -1509,7 +1523,6 @@ async def test_api_retains_timed_out_native_permits_until_underlying_calls_finis
     settings = _transcription_config(
         tmp_path / "media",
         transcription_concurrency=2,
-        job_worker_count=4,
         transcription_timeout_seconds=0.05,
     )
     application = _application(
@@ -1517,6 +1530,7 @@ async def test_api_retains_timed_out_native_permits_until_underlying_calls_finis
         tmp_path / "media",
         factory,
         settings=settings,
+        job_config=_job_config(migrated_database_path, job_worker_count=4),
     )
     async with application.router.lifespan_context(application):
         transport = ASGITransport(app=application)

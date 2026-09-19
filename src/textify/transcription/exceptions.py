@@ -1,14 +1,9 @@
 """Safe domain errors and HTTP response handlers for transcription."""
 
-from typing import ClassVar, cast
-
-from fastapi import Request
-from fastapi.responses import JSONResponse
-
-from textify.logging import bind_request_log_fields
+from textify.errors import TextifyError
 
 
-class TranscriptionError(Exception):
+class TranscriptionError(TextifyError):
     """Base class for safe, parameterless transcription errors.
 
     Attributes:
@@ -16,14 +11,6 @@ class TranscriptionError(Exception):
         status_code: HTTP status associated with the error code.
         message: Safe nonempty message for API consumers.
     """
-
-    code: ClassVar[str]
-    status_code: ClassVar[int]
-    message: ClassVar[str]
-
-    def __init__(self) -> None:
-        """Initialize the error with its fixed safe message."""
-        super().__init__(self.message)
 
 
 class InvalidUrlError(TranscriptionError):
@@ -106,56 +93,6 @@ class TranscriptionFailedError(TranscriptionError):
     message = "The source could not be transcribed."
 
 
-class TranscriptionCapacityExceededError(TranscriptionError):
-    """Indicate exhausted durable Transcription Job admission capacity."""
-
-    status_code = 503
-    code = "transcription_capacity_exceeded"
-    message = "Transcription capacity is currently unavailable."
-
-
-class JobNotFoundError(TranscriptionError):
-    """Indicate that a Transcription Job bearer capability is unavailable."""
-
-    status_code = 404
-    code = "job_not_found"
-    message = "The transcription job was not found."
-
-
-class JobStoreUnavailableError(TranscriptionError):
-    """Indicate that durable Transcription Job storage is unavailable."""
-
-    status_code = 503
-    code = "job_store_unavailable"
-    message = "Transcription job storage is currently unavailable."
-
-
-class QueueTimeoutError(TranscriptionError):
-    """Indicate a job expiring before a worker claims it."""
-
-    code = "queue_timeout"
-    status_code = 504
-    message = (
-        "The transcription job did not begin processing before its queue deadline."
-    )
-
-
-class InternalTranscriptionError(TranscriptionError):
-    """Indicate an unexpected internal transcription failure."""
-
-    code = "internal_error"
-    status_code = 500
-    message = "An unexpected error occurred."
-
-
-def _job_cache_headers(request: Request) -> dict[str, str]:
-    """Return no-store headers for routes that contain bearer capabilities."""
-    path = request.url.path
-    if path == "/api/transcription-jobs" or path.startswith("/api/transcription-jobs/"):
-        return {"Cache-Control": "no-store"}
-    return {}
-
-
 class MetadataTimeoutError(TranscriptionError):
     """Indicate metadata retrieval timing out."""
 
@@ -178,44 +115,3 @@ class TranscriptionTimeoutError(TranscriptionError):
     code = "transcription_timeout"
     status_code = 504
     message = "Source transcription timed out."
-
-
-async def transcription_error_handler(
-    request: Request,
-    exc: Exception,
-) -> JSONResponse:
-    """Convert a domain error to its stable safe HTTP response.
-
-    Args:
-        request: Request that triggered the domain error.
-        exc: Exception registered as a ``TranscriptionError`` handler.
-
-    Returns:
-        Error response with the domain status and code.
-    """
-    error = cast(TranscriptionError, exc)
-    bind_request_log_fields(code=error.code)
-    return JSONResponse(
-        status_code=error.status_code,
-        content={"error": {"code": error.code, "message": error.message}},
-        headers=_job_cache_headers(request),
-    )
-
-
-async def unhandled_error_handler(request: Request, _exc: Exception) -> JSONResponse:
-    """Return a generic safe response for unexpected failures.
-
-    Args:
-        request: Request that triggered the unexpected error.
-        _exc: Unexpected exception raised while handling the request.
-
-    Returns:
-        Generic internal-error response.
-    """
-    error = InternalTranscriptionError()
-    bind_request_log_fields(code=error.code)
-    return JSONResponse(
-        status_code=error.status_code,
-        content={"error": {"code": error.code, "message": error.message}},
-        headers=_job_cache_headers(request),
-    )

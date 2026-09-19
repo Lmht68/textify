@@ -4,7 +4,8 @@ from typing import Annotated, cast
 
 from fastapi import APIRouter, Depends, Request, Response, status
 
-from textify.transcription.job_schemas import (
+from textify.errors import ErrorDetail, ErrorResponse
+from textify.jobs.schemas import (
     ActiveTranscriptionJobLinks,
     FailedTranscriptionJobResponse,
     FinishedTranscriptionJobLinks,
@@ -13,15 +14,15 @@ from textify.transcription.job_schemas import (
     SucceededTranscriptionJobResponse,
     TranscriptionJobResponse,
 )
-from textify.transcription.jobs import (
+from textify.jobs.service import TranscriptionJobCoordinator
+from textify.jobs.types import (
     FailedTranscriptionJob,
     ProcessingTranscriptionJob,
     QueuedTranscriptionJob,
     SucceededTranscriptionJob,
     TranscriptionJob,
-    TranscriptionJobCoordinator,
 )
-from textify.transcription.schemas import ErrorDetail, ErrorResponse, TranscriptRequest
+from textify.transcription.schemas import TranscriptRequest
 
 router = APIRouter(prefix="/api/transcription-jobs")
 
@@ -116,7 +117,6 @@ async def create_transcription_job(
     queued_response = _queued_response(queued_job)
     response.headers["Location"] = queued_response.links.self
     response.headers["Retry-After"] = "2"
-    response.headers["Cache-Control"] = "no-store"
     return queued_response
 
 
@@ -171,7 +171,6 @@ async def get_transcription_job(
     job_response = _job_response(job)
     if isinstance(job, (QueuedTranscriptionJob, ProcessingTranscriptionJob)):
         response.headers["Retry-After"] = "2"
-    response.headers["Cache-Control"] = "no-store"
     return job_response
 
 

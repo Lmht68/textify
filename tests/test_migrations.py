@@ -9,7 +9,7 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import text
 
-from textify.database import (
+from textify.jobs.database import (
     EXPECTED_DATABASE_REVISION,
     SQLITE_BUSY_TIMEOUT_MS,
     create_application_engine,

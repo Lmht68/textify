@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, cast
+from typing import cast
 from uuid import UUID, uuid4
 
 from pydantic import TypeAdapter, ValidationError
@@ -33,20 +33,21 @@ from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from textify.transcription.exceptions import QueueTimeoutError
-from textify.transcription.schemas import ErrorDetail, TranscriptionResponse
+from textify.errors import ErrorDetail
+from textify.jobs.exceptions import QueueTimeoutError
+from textify.jobs.types import (
+    ClaimedTranscriptionJob,
+    FailedTranscriptionJob,
+    JobOutcome,
+    JobStatus,
+    NewQueuedTranscriptionJob,
+    ProcessingTranscriptionJob,
+    QueuedTranscriptionJob,
+    SucceededTranscriptionJob,
+    TranscriptionJob,
+)
+from textify.transcription.schemas import TranscriptionResponse
 from textify.transcription.types import ResponseFieldPath
-
-if TYPE_CHECKING:
-    from textify.transcription.jobs import (
-        ClaimedTranscriptionJob,
-        FailedTranscriptionJob,
-        NewQueuedTranscriptionJob,
-        ProcessingTranscriptionJob,
-        QueuedTranscriptionJob,
-        SucceededTranscriptionJob,
-        TranscriptionJob,
-    )
 
 metadata = MetaData()
 
@@ -692,7 +693,6 @@ def _claimed_job(
     exclusions: tuple[ResponseFieldPath, ...],
 ) -> ClaimedTranscriptionJob:
     """Construct a private committed claim snapshot."""
-    from textify.transcription.jobs import ClaimedTranscriptionJob
 
     return ClaimedTranscriptionJob(
         internal_id=internal_id,
@@ -722,7 +722,6 @@ def _queued_job(
     queue_deadline_at: datetime,
 ) -> QueuedTranscriptionJob:
     """Construct a queued-job domain snapshot without loading private fields."""
-    from textify.transcription.jobs import JobStatus, QueuedTranscriptionJob
 
     return QueuedTranscriptionJob(
         internal_id=internal_id,
@@ -740,7 +739,6 @@ def _processing_job_from_row(row: RowMapping) -> ProcessingTranscriptionJob:
     cancellation_requested = row["cancellation_requested"]
     if not isinstance(cancellation_requested, bool):
         raise TranscriptionJobStoreUnavailableError()
-    from textify.transcription.jobs import JobStatus, ProcessingTranscriptionJob
 
     return ProcessingTranscriptionJob(
         public_id=_public_id_from_row(row),
@@ -764,11 +762,6 @@ def _succeeded_job_from_rows(
         or job_row["cancellation_requested"] is not False
     ):
         raise TranscriptionJobStoreUnavailableError()
-    from textify.transcription.jobs import (
-        JobOutcome,
-        JobStatus,
-        SucceededTranscriptionJob,
-    )
 
     return SucceededTranscriptionJob(
         public_id=_public_id_from_row(job_row),
@@ -794,11 +787,6 @@ def _failed_job_from_row(row: RowMapping) -> FailedTranscriptionJob:
         None if started_at_value is None else _datetime_from_row(row, "started_at")
     )
     error = _error_detail_from_row(row)
-    from textify.transcription.jobs import (
-        FailedTranscriptionJob,
-        JobOutcome,
-        JobStatus,
-    )
 
     return FailedTranscriptionJob(
         public_id=_public_id_from_row(row),

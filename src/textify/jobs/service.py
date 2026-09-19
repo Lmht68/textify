@@ -5,126 +5,36 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import StrEnum
 from uuid import UUID
 
-from textify.logging import bind_request_log_fields
-from textify.transcription import inspection
-from textify.transcription.exceptions import (
-    InternalTranscriptionError,
+from textify.errors import InternalError
+from textify.jobs.exceptions import (
     JobNotFoundError,
     JobStoreUnavailableError,
     TranscriptionCapacityExceededError,
-    TranscriptionError,
 )
-from textify.transcription.job_repository import (
+from textify.jobs.repository import (
     SqliteTranscriptionJobRepository,
     TranscriptionJobCapacityError,
     TranscriptionJobStoreUnavailableError,
 )
-from textify.transcription.schemas import (
-    PublicErrorCode,
-    TranscriptionResponse,
-    build_transcription_response,
+from textify.jobs.types import (
+    ClaimedTranscriptionJob,
+    NewQueuedTranscriptionJob,
+    QueuedTranscriptionJob,
+    TranscriptionJob,
 )
+from textify.logging import bind_request_log_fields
+from textify.transcription import inspection
+from textify.transcription.exceptions import TranscriptionError
+from textify.transcription.schemas import build_transcription_response
 from textify.transcription.service import TranscriptionExecutor
 from textify.transcription.types import ResponseFieldPath
 
 logger = logging.getLogger(__name__)
 
 _WORKER_WAKE_INTERVAL_SECONDS = 1.0
-
-
-class JobStatus(StrEnum):
-    """Represent a Transcription Job's coarse lifecycle position."""
-
-    QUEUED = "queued"
-    PROCESSING = "processing"
-    FINISHED = "finished"
-
-
-class JobOutcome(StrEnum):
-    """Represent the terminal disposition of a finished Transcription Job."""
-
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-
-
-@dataclass(frozen=True, slots=True)
-class NewQueuedTranscriptionJob:
-    """Hold private data required to persist one newly admitted job."""
-
-    submitted_url: str
-    exclusions: tuple[ResponseFieldPath, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class ClaimedTranscriptionJob:
-    """Hold private execution inputs durably claimed by one consumer."""
-
-    internal_id: int
-    submitted_url: str
-    exclusions: tuple[ResponseFieldPath, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class QueuedTranscriptionJob:
-    """Hold the safe persisted projection of an accepted queued job."""
-
-    internal_id: int
-    public_id: UUID
-    status: JobStatus
-    submitted_at: datetime
-    queue_deadline_at: datetime
-
-
-@dataclass(frozen=True, slots=True)
-class ProcessingTranscriptionJob:
-    """Hold the safe persisted projection of a processing job."""
-
-    public_id: UUID
-    status: JobStatus
-    submitted_at: datetime
-    started_at: datetime
-    cancellation_requested: bool
-
-
-@dataclass(frozen=True, slots=True)
-class SucceededTranscriptionJob:
-    """Hold the safe persisted projection of a successful finished job."""
-
-    public_id: UUID
-    status: JobStatus
-    outcome: JobOutcome
-    submitted_at: datetime
-    started_at: datetime
-    finished_at: datetime
-    result: TranscriptionResponse
-
-
-@dataclass(frozen=True, slots=True)
-class FailedTranscriptionJob:
-    """Hold the safe persisted projection of a failed finished job."""
-
-    public_id: UUID
-    status: JobStatus
-    outcome: JobOutcome
-    submitted_at: datetime
-    started_at: datetime | None
-    finished_at: datetime
-    error_code: PublicErrorCode
-    error_message: str
-
-
-type TranscriptionJob = (
-    QueuedTranscriptionJob
-    | ProcessingTranscriptionJob
-    | SucceededTranscriptionJob
-    | FailedTranscriptionJob
-)
 
 
 def utc_now() -> datetime:
@@ -307,12 +217,12 @@ class TranscriptionJobCoordinator:
         except Exception:  # noqa: BLE001
             logger.error(
                 "transcription job worker failed",
-                extra={"code": InternalTranscriptionError.code},
+                extra={"code": InternalError.code},
             )
             await self._repository.publish_failure(
                 claimed_job.internal_id,
-                InternalTranscriptionError.code,
-                InternalTranscriptionError.message,
+                InternalError.code,
+                InternalError.message,
             )
         else:
             await self._repository.publish_success(

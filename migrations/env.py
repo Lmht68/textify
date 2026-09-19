@@ -8,8 +8,8 @@ from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
-from textify.config import AppConfig
-from textify.transcription.job_repository import metadata
+from textify.jobs.config import JobConfig
+from textify.jobs.repository import metadata
 
 config = context.config
 target_metadata = metadata
@@ -26,7 +26,7 @@ def _database_url(database_path: Path) -> str:
 
 def _configured_database_url() -> str:
     """Load the migration target from application settings."""
-    database_path = AppConfig().database_path
+    database_path = JobConfig().database_path
     if database_path is None:
         raise RuntimeError("TEXTIFY_DATABASE_PATH must be configured for migrations.")
     return _database_url(database_path)

@@ -8,6 +8,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient, Response
 
 from textify.config import AppConfig, Environment
+from textify.jobs.config import JobConfig
 from textify.main import _validate_temporary_media_capacity, create_app
 from textify.transcription import acquisition, inspection
 from textify.transcription.config import TranscriptionConfig
@@ -154,11 +155,8 @@ class StartupAdaptersFactory:
         )
 
 
-def _app_config(database_path: Path) -> AppConfig:
+def _app_config() -> AppConfig:
     """Create isolated application configuration for ASGI tests.
-
-    Args:
-        database_path: Per-test SQLite database upgraded through Alembic.
 
     Returns:
         Configuration independent of local environment files.
@@ -168,7 +166,24 @@ def _app_config(database_path: Path) -> AppConfig:
         log_level="INFO",
         host="127.0.0.1",
         port=8182,
+    )
+
+
+def _job_config(database_path: Path, job_worker_count: int = 1) -> JobConfig:
+    """Create isolated durable-job configuration for ASGI tests.
+
+    Args:
+        database_path: Per-test SQLite database upgraded through Alembic.
+        job_worker_count: Number of durable consumers to start.
+
+    Returns:
+        Configuration independent of local environment files.
+    """
+    return JobConfig(
         database_path=database_path,
+        job_worker_count=job_worker_count,
+        max_outstanding_jobs=8,
+        job_queue_timeout_seconds=20,
     )
 
 
@@ -189,9 +204,6 @@ def _transcription_config(temporary_media_root: Path) -> TranscriptionConfig:
         temperature=0.0,
         condition_on_previous_text=True,
         transcription_concurrency=1,
-        job_worker_count=1,
-        max_outstanding_jobs=8,
-        job_queue_timeout_seconds=20,
         max_media_bytes=1024,
         metadata_timeout_seconds=30.0,
         audio_download_timeout_seconds=300.0,
@@ -232,7 +244,6 @@ def test_temporary_media_capacity_accepts_exact_quota(tmp_path: Path) -> None:
     """The configured quota accepts exactly the required free bytes."""
     settings = _transcription_config(tmp_path).model_copy(
         update={
-            "job_worker_count": 2,
             "transcription_concurrency": 3,
             "max_media_bytes": 100,
         }
@@ -240,6 +251,7 @@ def test_temporary_media_capacity_accepts_exact_quota(tmp_path: Path) -> None:
 
     _validate_temporary_media_capacity(
         settings,
+        2,
         available_bytes=lambda _root: 600,
     )
 
@@ -248,7 +260,6 @@ def test_temporary_media_capacity_rejects_one_byte_short(tmp_path: Path) -> None
     """The configured quota rejects free space below the exact requirement."""
     settings = _transcription_config(tmp_path).model_copy(
         update={
-            "job_worker_count": 2,
             "transcription_concurrency": 3,
             "max_media_bytes": 100,
         }
@@ -260,6 +271,7 @@ def test_temporary_media_capacity_rejects_one_byte_short(tmp_path: Path) -> None
     ):
         _validate_temporary_media_capacity(
             settings,
+            2,
             available_bytes=lambda _root: 599,
         )
 
@@ -285,6 +297,7 @@ def test_temporary_media_capacity_translates_disk_usage_failure(tmp_path: Path) 
     ) as error:
         _validate_temporary_media_capacity(
             settings,
+            1,
             available_bytes=unavailable_capacity_reader,
         )
 
@@ -299,16 +312,16 @@ async def test_api_starts_at_exact_temporary_media_capacity(
     """Startup succeeds when free space equals the configured media quota."""
     settings = _transcription_config(tmp_path).model_copy(
         update={
-            "job_worker_count": 2,
             "transcription_concurrency": 3,
             "max_media_bytes": 100,
         }
     )
     application = create_app(
-        _app_config(migrated_database_path),
+        _app_config(),
         settings,
         StartupAdaptersFactory(),
         available_temporary_media_bytes=lambda _root: 600,
+        job_config=_job_config(migrated_database_path, job_worker_count=2),
     )
 
     async with application.router.lifespan_context(application):
@@ -328,17 +341,17 @@ async def test_api_fails_startup_before_model_when_temporary_media_capacity_is_l
     media_root = tmp_path / "media"
     settings = _transcription_config(media_root).model_copy(
         update={
-            "job_worker_count": 2,
             "transcription_concurrency": 3,
             "max_media_bytes": 100,
         }
     )
     factory = StartupAdaptersFactory()
     application = create_app(
-        _app_config(migrated_database_path),
+        _app_config(),
         settings,
         factory,
         available_temporary_media_bytes=lambda _root: 599,
+        job_config=_job_config(migrated_database_path, job_worker_count=2),
     )
 
     with pytest.raises(
@@ -361,10 +374,11 @@ async def test_api_adds_fresh_request_ids_to_job_route_outcomes(
     """Health, submission, validation, and unmatched routes get fresh UUIDv4 IDs."""
     inbound_request_id = "inbound-request-id-sentinel"
     application = create_app(
-        _app_config(migrated_database_path),
+        _app_config(),
         _transcription_config(tmp_path),
         StartupAdaptersFactory(),
         available_temporary_media_bytes=lambda _root: 1 << 60,
+        job_config=_job_config(migrated_database_path),
     )
 
     async with application.router.lifespan_context(application):
