@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, Request, Response, status
 
 from textify.transcription.job_schemas import (
     ActiveTranscriptionJobLinks,
+    FailedTranscriptionJobResponse,
     FinishedTranscriptionJobLinks,
     ProcessingTranscriptionJobResponse,
     QueuedTranscriptionJobResponse,
@@ -13,13 +14,14 @@ from textify.transcription.job_schemas import (
     TranscriptionJobResponse,
 )
 from textify.transcription.jobs import (
+    FailedTranscriptionJob,
     ProcessingTranscriptionJob,
     QueuedTranscriptionJob,
     SucceededTranscriptionJob,
     TranscriptionJob,
     TranscriptionJobCoordinator,
 )
-from textify.transcription.schemas import ErrorResponse, TranscriptRequest
+from textify.transcription.schemas import ErrorDetail, ErrorResponse, TranscriptRequest
 
 router = APIRouter(prefix="/api/transcription-jobs")
 
@@ -181,6 +183,8 @@ def _job_response(job: TranscriptionJob) -> TranscriptionJobResponse:
         return _processing_response(job)
     if isinstance(job, SucceededTranscriptionJob):
         return _succeeded_response(job)
+    if isinstance(job, FailedTranscriptionJob):
+        return _failed_response(job)
     raise RuntimeError("Unknown Transcription Job snapshot.")
 
 
@@ -231,6 +235,26 @@ def _succeeded_response(
         started_at=succeeded_job.started_at,
         finished_at=succeeded_job.finished_at,
         result=succeeded_job.result,
+        links=FinishedTranscriptionJobLinks(self=self_link),
+    )
+
+
+def _failed_response(
+    failed_job: FailedTranscriptionJob,
+) -> FailedTranscriptionJobResponse:
+    """Build a safe public representation of a failed finished job."""
+    self_link = _self_link(failed_job.public_id)
+    return FailedTranscriptionJobResponse(
+        id=failed_job.public_id,
+        status="finished",
+        outcome="failed",
+        submitted_at=failed_job.submitted_at,
+        started_at=failed_job.started_at,
+        finished_at=failed_job.finished_at,
+        error=ErrorDetail(
+            code=failed_job.error_code,
+            message=failed_job.error_message,
+        ),
         links=FinishedTranscriptionJobLinks(self=self_link),
     )
 

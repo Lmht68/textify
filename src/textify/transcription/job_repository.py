@@ -33,12 +33,14 @@ from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from textify.transcription.schemas import TranscriptionResponse
+from textify.transcription.exceptions import QueueTimeoutError
+from textify.transcription.schemas import ErrorDetail, TranscriptionResponse
 from textify.transcription.types import ResponseFieldPath
 
 if TYPE_CHECKING:
     from textify.transcription.jobs import (
         ClaimedTranscriptionJob,
+        FailedTranscriptionJob,
         NewQueuedTranscriptionJob,
         ProcessingTranscriptionJob,
         QueuedTranscriptionJob,
@@ -378,6 +380,20 @@ class SqliteTranscriptionJobRepository:
                 try:
                     await connection.execute(text("BEGIN IMMEDIATE"))
                     now = _as_utc(self._clock())
+                    await connection.execute(
+                        update(transcription_job)
+                        .where(
+                            transcription_job.c.status == "queued",
+                            transcription_job.c.queue_deadline_at <= now,
+                        )
+                        .values(
+                            status="finished",
+                            outcome="failed",
+                            finished_at=now,
+                            error_code=QueueTimeoutError.code,
+                            error_message=QueueTimeoutError.message,
+                        )
+                    )
                     candidate = (
                         (
                             await connection.execute(
@@ -400,7 +416,7 @@ class SqliteTranscriptionJobRepository:
                         .one_or_none()
                     )
                     if candidate is None:
-                        await connection.rollback()
+                        await connection.commit()
                         return None
 
                     internal_id, submitted_url = _claimed_input_from_row(candidate)
@@ -497,6 +513,67 @@ class SqliteTranscriptionJobRepository:
             raise TranscriptionJobStoreUnavailableError() from exc
         return True
 
+    async def publish_failure(
+        self,
+        internal_id: int,
+        error_code: str,
+        error_message: str,
+    ) -> bool:
+        """Atomically persist one safe failed terminal transition.
+
+        Args:
+            internal_id: Private identifier held only by the claiming consumer.
+            error_code: Validated stable public error code.
+            error_message: Validated safe nonempty public error message.
+
+        Returns:
+            ``True`` when this consumer committed the failed terminal outcome,
+            otherwise ``False`` when another terminal transition owns the job.
+
+        Raises:
+            TranscriptionJobStoreUnavailableError: If validation or SQLite
+                publication cannot complete safely.
+        """
+        error = _validate_error_detail(error_code, error_message)
+        try:
+            async with self._engine.connect() as connection:
+                try:
+                    await connection.execute(text("BEGIN IMMEDIATE"))
+                    finished_at = _as_utc(self._clock())
+                    transition = await connection.execute(
+                        update(transcription_job)
+                        .where(
+                            transcription_job.c.id == internal_id,
+                            transcription_job.c.status == "processing",
+                            transcription_job.c.cancellation_requested.is_(False),
+                        )
+                        .values(
+                            status="finished",
+                            outcome="failed",
+                            finished_at=finished_at,
+                            error_code=error.code,
+                            error_message=error.message,
+                        )
+                    )
+                    if transition.rowcount != 1:
+                        await connection.rollback()
+                        return False
+                    await connection.commit()
+                except TranscriptionJobStoreUnavailableError:
+                    await connection.rollback()
+                    raise
+                except SQLAlchemyError as exc:
+                    try:
+                        await connection.rollback()
+                    except SQLAlchemyError as rollback_exc:
+                        raise TranscriptionJobStoreUnavailableError() from rollback_exc
+                    raise TranscriptionJobStoreUnavailableError() from exc
+        except TranscriptionJobStoreUnavailableError:
+            raise
+        except (OSError, SQLAlchemyError) as exc:
+            raise TranscriptionJobStoreUnavailableError() from exc
+        return True
+
     async def get_job(self, public_id: UUID) -> TranscriptionJob | None:
         """Read one safe Transcription Job snapshot by bearer capability.
 
@@ -504,8 +581,8 @@ class SqliteTranscriptionJobRepository:
             public_id: Canonical UUIDv4 capability supplied by the coordinator.
 
         Returns:
-            Safe queued, processing, or successful snapshot, or ``None`` when unknown.
-
+            Safe queued, processing, successful, or failed snapshot, or ``None`` when
+            unknown.
         Raises:
             TranscriptionJobStoreUnavailableError: If SQLite cannot read safely.
         """
@@ -530,9 +607,12 @@ class SqliteTranscriptionJobRepository:
                     return _queued_job_from_row(job_row)
                 if status == "processing":
                     return _processing_job_from_row(job_row)
-                if status != "finished" or job_row["outcome"] != "succeeded":
+                if status != "finished":
                     raise TranscriptionJobStoreUnavailableError()
-
+                if job_row["outcome"] == "failed":
+                    return _failed_job_from_row(job_row)
+                if job_row["outcome"] != "succeeded":
+                    raise TranscriptionJobStoreUnavailableError()
                 internal_id = _internal_id_from_row(job_row)
                 exclusions = await self._load_exclusions(connection, internal_id)
                 result_row = (
@@ -701,6 +781,37 @@ def _succeeded_job_from_rows(
     )
 
 
+def _failed_job_from_row(row: RowMapping) -> FailedTranscriptionJob:
+    """Translate a failed terminal row without loading result data."""
+    if (
+        row["status"] != "finished"
+        or row["outcome"] != "failed"
+        or row["cancellation_requested"] is not False
+    ):
+        raise TranscriptionJobStoreUnavailableError()
+    started_at_value = row["started_at"]
+    started_at = (
+        None if started_at_value is None else _datetime_from_row(row, "started_at")
+    )
+    error = _error_detail_from_row(row)
+    from textify.transcription.jobs import (
+        FailedTranscriptionJob,
+        JobOutcome,
+        JobStatus,
+    )
+
+    return FailedTranscriptionJob(
+        public_id=_public_id_from_row(row),
+        status=JobStatus.FINISHED,
+        outcome=JobOutcome.FAILED,
+        submitted_at=_datetime_from_row(row, "submitted_at"),
+        started_at=started_at,
+        finished_at=_datetime_from_row(row, "finished_at"),
+        error_code=error.code,
+        error_message=error.message,
+    )
+
+
 def _response_from_result_rows(
     result_row: RowMapping,
     segment_rows: Sequence[RowMapping],
@@ -824,6 +935,21 @@ def _validate_response(value: object) -> TranscriptionResponse:
     """Validate one projected response before write and after reconstruction."""
     try:
         return _RESPONSE_ADAPTER.validate_python(value)
+    except (TypeError, ValidationError, ValueError) as exc:
+        raise TranscriptionJobStoreUnavailableError() from exc
+
+
+def _error_detail_from_row(row: RowMapping) -> ErrorDetail:
+    """Validate a persisted safe public error pair."""
+    return _validate_error_detail(row["error_code"], row["error_message"])
+
+
+def _validate_error_detail(error_code: object, error_message: object) -> ErrorDetail:
+    """Validate one safe public error pair before writing or after reading."""
+    try:
+        return ErrorDetail.model_validate(
+            {"code": error_code, "message": error_message}
+        )
     except (TypeError, ValidationError, ValueError) as exc:
         raise TranscriptionJobStoreUnavailableError() from exc
 

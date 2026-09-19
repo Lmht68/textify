@@ -1,10 +1,13 @@
 """ASGI proofs for successful durable Transcription Jobs."""
 
 import asyncio
+import logging
 import sqlite3
 import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TypedDict, cast
 from uuid import UUID
@@ -12,11 +15,27 @@ from uuid import UUID
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient, Response
+from starlette.types import Message
 
 from textify.config import AppConfig, Environment
 from textify.main import create_app
 from textify.transcription import inspection
 from textify.transcription.config import TranscriptionConfig
+from textify.transcription.exceptions import (
+    AudioDownloadFailedError,
+    AudioDownloadTimeoutError,
+    InvalidMediaDurationError,
+    MetadataRetrievalFailedError,
+    MetadataTimeoutError,
+    NoUsableTranscriptError,
+    TranscriptionError,
+    TranscriptionFailedError,
+    TranscriptionTimeoutError,
+    UnsupportedContentError,
+    UnsupportedMediaError,
+    VideoTooLongError,
+)
+from textify.transcription.jobs import utc_now
 from textify.transcription.service import TranscriptionAdapters
 from textify.transcription.types import (
     Platform,
@@ -261,10 +280,24 @@ class ControlledAdapterState:
     caption_segments: tuple[tuple[float, float, str], ...] = ()
     caption_language: str = "en-US"
     probe: ConcurrencyProbe | None = None
+    metadata_error: Exception | None = None
+    download_error: Exception | None = None
+    native_error: Exception | None = None
+    metadata_delay_seconds: float = 0.0
+    download_delay_seconds: float = 0.0
+    native_delay_seconds: float = 0.0
     metadata_calls: list[str] = field(default_factory=list)
     download_calls: list[str] = field(default_factory=list)
     native_include_segments: list[bool] = field(default_factory=list)
     caption_calls: list[str] = field(default_factory=list)
+    metadata_deadlines: list[float] = field(default_factory=list)
+    download_deadlines: list[float] = field(default_factory=list)
+    metadata_entry_times: list[float] = field(default_factory=list)
+    download_entry_times: list[float] = field(default_factory=list)
+    native_entry_times: list[float] = field(default_factory=list)
+    request_directories: list[Path] = field(default_factory=list)
+    audio_paths: list[Path] = field(default_factory=list)
+    audio_paths_by_source: dict[str, Path] = field(default_factory=dict)
     metadata_entered: threading.Event = field(default_factory=threading.Event)
     metadata_release: threading.Event = field(default_factory=threading.Event)
     native_completed: threading.Event = field(default_factory=threading.Event)
@@ -354,16 +387,21 @@ class ControlledMetadataExtractor:
         Returns:
             Valid metadata accepted by the production normalization boundary.
         """
-        del deadline
         probe = self._state.probe
         if probe is not None:
             probe.enter_metadata(provider_url)
         try:
             self._state.metadata_calls.append(provider_url)
+            self._state.metadata_deadlines.append(deadline)
+            self._state.metadata_entry_times.append(time.monotonic())
             self._state.metadata_entered.set()
             if self._state.block_metadata:
                 while not self._state.metadata_release.wait(0.01):
                     assert not cancellation_event.is_set()
+            if self._state.metadata_delay_seconds:
+                time.sleep(self._state.metadata_delay_seconds)
+            if self._state.metadata_error is not None:
+                raise self._state.metadata_error
             return inspection.ExtractedMetadata(_metadata_for(provider_url))
         finally:
             if probe is not None:
@@ -400,13 +438,21 @@ class ControlledAudioDownloader:
         Returns:
             A completed small local media file.
         """
-        del deadline
         assert not cancellation_event.is_set()
         self._state.download_calls.append(source_url)
+        self._state.download_deadlines.append(deadline)
+        self._state.download_entry_times.append(time.monotonic())
+        self._state.request_directories.append(destination)
+        if self._state.download_error is not None:
+            raise self._state.download_error
         audio_path = destination / "audio.webm"
         audio_path.write_bytes(b"audio")
+        self._state.audio_paths.append(audio_path)
+        self._state.audio_paths_by_source[source_url] = audio_path
         if self._state.probe is not None:
             self._state.probe.register_audio_source(audio_path, source_url)
+        if self._state.download_delay_seconds:
+            time.sleep(self._state.download_delay_seconds)
         return audio_path
 
 
@@ -434,12 +480,17 @@ class ControlledTranscriber:
             A valid normalized transcript.
         """
         assert audio_path.is_file()
+        self._state.native_entry_times.append(time.monotonic())
         probe = self._state.probe
         if probe is not None:
             probe.enter_native(audio_path)
         try:
             self._state.native_include_segments.append(include_segments)
             self._state.native_completed.set()
+            if self._state.native_delay_seconds:
+                time.sleep(self._state.native_delay_seconds)
+            if self._state.native_error is not None:
+                raise self._state.native_error
             if not include_segments:
                 return Transcript(TranscriptMethod.FASTER_WHISPER, "en", "One")
             return TimedTranscript(
@@ -556,6 +607,9 @@ def _transcription_config(
     *,
     transcription_concurrency: int = 1,
     job_worker_count: int = 1,
+    job_queue_timeout_seconds: int = 20,
+    metadata_timeout_seconds: float = 30.0,
+    audio_download_timeout_seconds: float = 300.0,
     transcription_timeout_seconds: float = 1800.0,
 ) -> TranscriptionConfig:
     """Create bounded worker and native capacity settings for durable-job tests."""
@@ -563,9 +617,11 @@ def _transcription_config(
         temporary_media_root=temporary_media_root,
         max_media_bytes=1024,
         max_outstanding_jobs=8,
-        job_queue_timeout_seconds=20,
+        job_queue_timeout_seconds=job_queue_timeout_seconds,
         transcription_concurrency=transcription_concurrency,
         job_worker_count=job_worker_count,
+        metadata_timeout_seconds=metadata_timeout_seconds,
+        audio_download_timeout_seconds=audio_download_timeout_seconds,
         transcription_timeout_seconds=transcription_timeout_seconds,
     )
 
@@ -576,6 +632,7 @@ def _application(
     factory: ControlledAdaptersFactory,
     *,
     settings: TranscriptionConfig | None = None,
+    clock: Callable[[], datetime] = utc_now,
 ) -> FastAPI:
     """Build one application with real durable storage and controlled providers."""
     return create_app(
@@ -585,6 +642,7 @@ def _application(
         else _transcription_config(temporary_media_root),
         factory,
         available_temporary_media_bytes=lambda _root: 1 << 60,
+        clock=clock,
     )
 
 
@@ -597,7 +655,7 @@ async def _poll_until_finished(
     client: AsyncClient,
     location: str,
 ) -> Response:
-    """Poll one durable capability until it exposes a complete successful result."""
+    """Poll one durable capability until it exposes a terminal snapshot."""
     latest_response: Response | None = None
     for _ in range(200):
         response = await client.get(location)
@@ -606,6 +664,18 @@ async def _poll_until_finished(
             return response
         await asyncio.sleep(0.01)
     raise AssertionError(f"Transcription Job did not finish: {latest_response!r}")
+
+
+async def _wait_until(
+    predicate: Callable[[], bool],
+    failure_message: str,
+) -> None:
+    """Wait for an observable asynchronous condition without blocking the event loop."""
+    for _ in range(200):
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(failure_message)
 
 
 def _assert_generated_request_id(response: Response) -> str:
@@ -682,6 +752,50 @@ def _assert_succeeded(response: Response, location: str) -> dict[str, object]:
     assert payload["links"] == {"self": location}
     finished_at = datetime.fromisoformat(payload["finished_at"])
     assert finished_at.tzinfo is not None
+    assert "Retry-After" not in response.headers
+    assert response.headers["Cache-Control"] == "no-store"
+    _assert_generated_request_id(response)
+    return cast(dict[str, object], payload)
+
+
+def _assert_failed(
+    response: Response,
+    location: str,
+    expected_code: str,
+    *,
+    started: bool,
+) -> dict[str, object]:
+    """Assert the complete safe terminal representation of a failed job."""
+    payload = response.json()
+    assert response.status_code == 200
+    assert set(payload) == {
+        "id",
+        "status",
+        "outcome",
+        "submitted_at",
+        "started_at",
+        "finished_at",
+        "error",
+        "links",
+    }
+    assert payload["status"] == "finished"
+    assert payload["outcome"] == "failed"
+    submitted_at = datetime.fromisoformat(payload["submitted_at"])
+    assert submitted_at.tzinfo is not None
+    assert submitted_at.astimezone(UTC).utcoffset() == UTC.utcoffset(submitted_at)
+    if started:
+        started_at = datetime.fromisoformat(payload["started_at"])
+        assert started_at.tzinfo is not None
+        assert started_at.astimezone(UTC).utcoffset() == UTC.utcoffset(started_at)
+    else:
+        assert payload["started_at"] is None
+    finished_at = datetime.fromisoformat(payload["finished_at"])
+    assert finished_at.tzinfo is not None
+    assert finished_at.astimezone(UTC).utcoffset() == UTC.utcoffset(finished_at)
+    assert payload["error"]["code"] == expected_code
+    assert isinstance(payload["error"]["message"], str)
+    assert payload["error"]["message"]
+    assert payload["links"] == {"self": location}
     assert "Retry-After" not in response.headers
     assert response.headers["Cache-Control"] == "no-store"
     _assert_generated_request_id(response)
@@ -1106,7 +1220,7 @@ async def test_api_completes_submission_after_response_delivery_disconnect(
             }
         return {"type": "http.disconnect"}
 
-    async def send(message: dict[str, object]) -> None:
+    async def send(message: Message) -> None:
         """Capture the committed Location and then block response delivery."""
         if message["type"] == "http.response.start":
             headers = cast(list[tuple[bytes, bytes]], message["headers"])
@@ -1408,14 +1522,43 @@ async def test_api_retains_timed_out_native_permits_until_underlying_calls_finis
         transport = ASGITransport(app=application)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             try:
-                for provider_url in native_urls:
-                    _assert_submission(
+                native_submissions = {
+                    provider_url: _assert_submission(
                         await client.post(
                             "/api/transcription-jobs",
                             json={"url": provider_url},
                         )
                     )
+                    for provider_url in native_urls
+                }
                 await probe.wait_for_native_calls(2)
+                timed_native_urls = probe.native_source_urls
+                timed_locations = [
+                    native_submissions[provider_url]["links"]["self"]
+                    for provider_url in timed_native_urls
+                ]
+                timed_media_paths = [
+                    state.audio_paths_by_source[provider_url]
+                    for provider_url in timed_native_urls
+                ]
+                timed_failed = await asyncio.gather(
+                    *(
+                        _poll_until_finished(client, location)
+                        for location in timed_locations
+                    )
+                )
+                for response, location in zip(
+                    timed_failed, timed_locations, strict=True
+                ):
+                    _assert_failed(
+                        response,
+                        location,
+                        "transcription_timeout",
+                        started=True,
+                    )
+                assert all(audio_path.is_file() for audio_path in timed_media_paths)
+                assert probe.active_native_calls == 2
+                assert len(probe.native_source_urls) == 2
                 caption_submissions = [
                     _assert_submission(
                         await client.post(
@@ -1448,11 +1591,22 @@ async def test_api_retains_timed_out_native_permits_until_underlying_calls_finis
                     for caption_url in caption_urls
                 )
 
-                probe.release_native()
-                await probe.wait_for_native_calls(3)
+                probe.release_native(4)
+                await probe.wait_for_native_calls(4)
+                await _wait_until(
+                    lambda: all(
+                        not audio_path.exists() for audio_path in timed_media_paths
+                    ),
+                    "Timed-out native media was not released by its finalizer.",
+                )
+                for location in timed_locations:
+                    _assert_failed(
+                        await client.get(location),
+                        location,
+                        "transcription_timeout",
+                        started=True,
+                    )
                 assert probe.peak_native_calls == 2
-
-                probe.release_native(3)
             finally:
                 probe.release_metadata(2)
                 probe.release_native(4)
@@ -1465,3 +1619,272 @@ async def test_api_retains_timed_out_native_permits_until_underlying_calls_finis
         _assert_succeeded(response, location)
     assert probe.peak_native_calls == 2
     assert factory.calls == 1
+
+
+@pytest.mark.parametrize(
+    ("stage", "error_type"),
+    (
+        ("metadata", UnsupportedContentError),
+        ("metadata", VideoTooLongError),
+        ("metadata", InvalidMediaDurationError),
+        ("metadata", UnsupportedMediaError),
+        ("metadata", MetadataRetrievalFailedError),
+        ("metadata", MetadataTimeoutError),
+        ("download", AudioDownloadFailedError),
+        ("download", AudioDownloadTimeoutError),
+        ("native", NoUsableTranscriptError),
+        ("native", TranscriptionFailedError),
+        ("native", TranscriptionTimeoutError),
+    ),
+)
+async def test_api_persists_each_safe_execution_failure(
+    stage: str,
+    error_type: type[TranscriptionError],
+    migrated_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Expose every safe worker failure as one durable failed job."""
+    state = ControlledAdapterState()
+    error = error_type()
+    if stage == "metadata":
+        state.metadata_error = error
+    elif stage == "download":
+        state.download_error = error
+    else:
+        state.native_error = error
+    application = _application(
+        migrated_database_path,
+        tmp_path / "media",
+        ControlledAdaptersFactory(state),
+    )
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            accepted = await client.post(
+                "/api/transcription-jobs",
+                json={"url": TIKTOK_URL},
+            )
+            location = _assert_submission(accepted)["links"]["self"]
+            failed = await _poll_until_finished(client, location)
+
+    _assert_failed(failed, location, error.code, started=True)
+    assert state.metadata_calls == [TIKTOK_URL]
+    if stage == "metadata":
+        assert state.download_calls == []
+        assert state.native_include_segments == []
+    elif stage == "download":
+        assert state.download_calls == [TIKTOK_URL]
+        assert state.native_include_segments == []
+    else:
+        assert state.download_calls == [TIKTOK_URL]
+        assert state.native_include_segments == [True]
+
+
+async def test_api_expires_queue_waits_at_the_deadline_without_provider_work(
+    migrated_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Claim before a deadline and expire equal-deadline work without execution."""
+    initial = datetime(2026, 8, 24, tzinfo=UTC)
+    now = [initial]
+    first_url = f"{TIKTOK_URL}?queue_deadline=first"
+    before_deadline_url = f"{TIKTOK_URL}?queue_deadline=before"
+    expired_url = f"{TIKTOK_URL}?queue_deadline=expired"
+    probe = ConcurrencyProbe(
+        gated_metadata_urls=frozenset({first_url, before_deadline_url})
+    )
+    state = ControlledAdapterState(probe=probe)
+    application = _application(
+        migrated_database_path,
+        tmp_path / "media",
+        ControlledAdaptersFactory(state),
+        clock=lambda: now[0],
+    )
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            try:
+                first_location = _assert_submission(
+                    await client.post(
+                        "/api/transcription-jobs", json={"url": first_url}
+                    )
+                )["links"]["self"]
+                await probe.wait_for_metadata_calls(1)
+                before_deadline_location = _assert_submission(
+                    await client.post(
+                        "/api/transcription-jobs",
+                        json={"url": before_deadline_url},
+                    )
+                )["links"]["self"]
+                expired_location = _assert_submission(
+                    await client.post(
+                        "/api/transcription-jobs",
+                        json={"url": expired_url},
+                    )
+                )["links"]["self"]
+
+                now[0] = initial + timedelta(seconds=20, microseconds=-1)
+                probe.release_metadata()
+                await probe.wait_for_metadata_calls(2)
+                assert probe.metadata_urls == (first_url, before_deadline_url)
+
+                now[0] = initial + timedelta(seconds=20)
+                probe.release_metadata()
+                expired = await _poll_until_finished(client, expired_location)
+                _assert_failed(
+                    expired,
+                    expired_location,
+                    "queue_timeout",
+                    started=False,
+                )
+                _assert_succeeded(
+                    await _poll_until_finished(client, first_location),
+                    first_location,
+                )
+                _assert_succeeded(
+                    await _poll_until_finished(client, before_deadline_location),
+                    before_deadline_location,
+                )
+            finally:
+                probe.release_metadata(2)
+
+    assert expired_url not in state.metadata_calls
+    assert expired_url not in state.download_calls
+    assert expired_url not in probe.native_source_urls
+
+
+async def test_api_gives_each_processing_stage_its_full_deadline_after_queueing(
+    migrated_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Keep queue delay outside metadata, download, and native stage budgets."""
+    stage_timeout = 0.3
+    first_url = f"{TIKTOK_URL}?deadline_budget=first"
+    queued_url = f"{TIKTOK_URL}?deadline_budget=queued"
+    state = ControlledAdapterState(
+        block_metadata=True,
+        metadata_delay_seconds=0.07,
+        download_delay_seconds=0.12,
+        native_delay_seconds=0.12,
+    )
+    settings = _transcription_config(
+        tmp_path / "media",
+        metadata_timeout_seconds=stage_timeout,
+        audio_download_timeout_seconds=stage_timeout,
+        transcription_timeout_seconds=stage_timeout,
+    )
+    application = _application(
+        migrated_database_path,
+        tmp_path / "media",
+        ControlledAdaptersFactory(state),
+        settings=settings,
+    )
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            try:
+                first_location = _assert_submission(
+                    await client.post(
+                        "/api/transcription-jobs", json={"url": first_url}
+                    )
+                )["links"]["self"]
+                await _wait_for_thread_event(state.metadata_entered)
+                queued_location = _assert_submission(
+                    await client.post(
+                        "/api/transcription-jobs", json={"url": queued_url}
+                    )
+                )["links"]["self"]
+                queued_at = time.monotonic()
+                await asyncio.sleep(0.06)
+                state.metadata_release.set()
+                queued_finished = await _poll_until_finished(client, queued_location)
+                queued_elapsed = time.monotonic() - queued_at
+                first_finished = await _poll_until_finished(client, first_location)
+            finally:
+                state.metadata_release.set()
+
+    _assert_succeeded(first_finished, first_location)
+    _assert_succeeded(queued_finished, queued_location)
+    assert queued_elapsed > stage_timeout
+    assert len(state.metadata_deadlines) == 2
+    assert len(state.download_deadlines) == 2
+    assert len(state.native_entry_times) == 2
+    assert all(
+        deadline - entered_at >= stage_timeout * 0.9
+        for deadline, entered_at in zip(
+            state.metadata_deadlines, state.metadata_entry_times, strict=True
+        )
+    )
+    assert all(
+        deadline - entered_at >= stage_timeout * 0.9
+        for deadline, entered_at in zip(
+            state.download_deadlines, state.download_entry_times, strict=True
+        )
+    )
+
+
+class _UnexpectedProviderError(Exception):
+    """Represent a provider error deliberately outside executor translation."""
+
+
+async def test_api_publishes_unexpected_worker_failures_without_provider_details(
+    caplog: pytest.LogCaptureFixture,
+    migrated_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Publish only internal_error when an unknown provider exception escapes."""
+    sensitive_sentinel = "UNIQUE_PROVIDER_SECRET_SENTINEL"
+    state = ControlledAdapterState(
+        native_error=_UnexpectedProviderError(sensitive_sentinel)
+    )
+    application = _application(
+        migrated_database_path,
+        tmp_path / "media",
+        ControlledAdaptersFactory(state),
+    )
+    caplog.set_level(logging.ERROR)
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            accepted = await client.post(
+                "/api/transcription-jobs",
+                json={"url": TIKTOK_URL},
+            )
+            location = _assert_submission(accepted)["links"]["self"]
+            failed = await _poll_until_finished(client, location)
+
+    _assert_failed(failed, location, "internal_error", started=True)
+    assert sensitive_sentinel not in failed.text
+    assert _UnexpectedProviderError.__name__ not in failed.text
+    assert all(
+        sensitive_sentinel not in record.getMessage()
+        and _UnexpectedProviderError.__name__ not in record.getMessage()
+        for record in caplog.records
+    )
+
+
+async def test_api_publishes_failure_only_after_request_media_cleanup(
+    migrated_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Finish a native failure only after its request directory is removed."""
+    state = ControlledAdapterState(native_error=TranscriptionFailedError())
+    application = _application(
+        migrated_database_path,
+        tmp_path / "media",
+        ControlledAdaptersFactory(state),
+    )
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            accepted = await client.post(
+                "/api/transcription-jobs",
+                json={"url": TIKTOK_URL},
+            )
+            location = _assert_submission(accepted)["links"]["self"]
+            failed = await _poll_until_finished(client, location)
+            _assert_failed(failed, location, "transcription_failed", started=True)
+            assert len(state.request_directories) == 1
+            assert len(state.audio_paths) == 1
+            assert not state.request_directories[0].exists()
+            assert not state.audio_paths[0].exists()

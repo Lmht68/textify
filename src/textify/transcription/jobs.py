@@ -13,6 +13,7 @@ from uuid import UUID
 from textify.logging import bind_request_log_fields
 from textify.transcription import inspection
 from textify.transcription.exceptions import (
+    InternalTranscriptionError,
     JobNotFoundError,
     JobStoreUnavailableError,
     TranscriptionCapacityExceededError,
@@ -24,6 +25,7 @@ from textify.transcription.job_repository import (
     TranscriptionJobStoreUnavailableError,
 )
 from textify.transcription.schemas import (
+    PublicErrorCode,
     TranscriptionResponse,
     build_transcription_response,
 )
@@ -103,8 +105,25 @@ class SucceededTranscriptionJob:
     result: TranscriptionResponse
 
 
+@dataclass(frozen=True, slots=True)
+class FailedTranscriptionJob:
+    """Hold the safe persisted projection of a failed finished job."""
+
+    public_id: UUID
+    status: JobStatus
+    outcome: JobOutcome
+    submitted_at: datetime
+    started_at: datetime | None
+    finished_at: datetime
+    error_code: PublicErrorCode
+    error_message: str
+
+
 type TranscriptionJob = (
-    QueuedTranscriptionJob | ProcessingTranscriptionJob | SucceededTranscriptionJob
+    QueuedTranscriptionJob
+    | ProcessingTranscriptionJob
+    | SucceededTranscriptionJob
+    | FailedTranscriptionJob
 )
 
 
@@ -266,9 +285,9 @@ class TranscriptionJobCoordinator:
 
     async def _execute_claimed_job(self, claimed_job: ClaimedTranscriptionJob) -> None:
         """Execute and publish one durable claim without retaining private inputs."""
+        cancellation_event = threading.Event()
         try:
             submitted = inspection.classify_submitted_url(claimed_job.submitted_url)
-            cancellation_event = threading.Event()
             result = await self._executor.execute(
                 submitted,
                 cancellation_event=cancellation_event,
@@ -278,12 +297,28 @@ class TranscriptionJobCoordinator:
                 result,
                 frozenset(claimed_job.exclusions),
             )
+        except TranscriptionError as error:
+            logger.error("transcription job worker failed", extra={"code": error.code})
+            await self._repository.publish_failure(
+                claimed_job.internal_id,
+                error.code,
+                error.message,
+            )
+        except Exception:  # noqa: BLE001
+            logger.error(
+                "transcription job worker failed",
+                extra={"code": InternalTranscriptionError.code},
+            )
+            await self._repository.publish_failure(
+                claimed_job.internal_id,
+                InternalTranscriptionError.code,
+                InternalTranscriptionError.message,
+            )
+        else:
             await self._repository.publish_success(
                 claimed_job.internal_id,
                 projected_result,
             )
-        except TranscriptionError as error:
-            logger.error("transcription job worker failed", extra={"code": error.code})
 
 
 def _parse_capability(capability: str) -> UUID:

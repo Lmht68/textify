@@ -365,6 +365,7 @@ PublicErrorCode = Literal[
     "transcription_capacity_exceeded",
     "job_not_found",
     "job_store_unavailable",
+    "queue_timeout",
     "metadata_timeout",
     "audio_download_timeout",
     "transcription_timeout",

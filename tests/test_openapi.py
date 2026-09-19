@@ -72,6 +72,7 @@ async def test_openapi_describes_job_only_transcription_contract() -> None:
     queued_component = components["QueuedTranscriptionJobResponse"]
     processing_component = components["ProcessingTranscriptionJobResponse"]
     succeeded_component = components["SucceededTranscriptionJobResponse"]
+    failed_component = components["FailedTranscriptionJobResponse"]
     assert queued_component["required"] == ["id", "status", "submitted_at", "links"]
     assert queued_component["properties"]["id"]["format"] == "uuid4"
     assert queued_component["properties"]["status"]["const"] == "queued"
@@ -112,15 +113,41 @@ async def test_openapi_describes_job_only_transcription_contract() -> None:
         "$ref": "#/components/schemas/FinishedTranscriptionJobLinks"
     }
 
+    assert failed_component["required"] == [
+        "id",
+        "status",
+        "outcome",
+        "submitted_at",
+        "started_at",
+        "finished_at",
+        "error",
+        "links",
+    ]
+    assert failed_component["properties"]["status"]["const"] == "finished"
+    assert failed_component["properties"]["outcome"]["const"] == "failed"
+    assert failed_component["properties"]["started_at"]["anyOf"] == [
+        {"type": "string", "format": "date-time"},
+        {"type": "null"},
+    ]
+    assert failed_component["properties"]["error"] == {
+        "$ref": "#/components/schemas/ErrorDetail"
+    }
+    assert failed_component["properties"]["links"] == {
+        "$ref": "#/components/schemas/FinishedTranscriptionJobLinks"
+    }
+    assert "result" not in failed_component["properties"]
+
     assert components["TranscriptionJobResponse"] == {
         "anyOf": [
             {"$ref": "#/components/schemas/QueuedTranscriptionJobResponse"},
             {"$ref": "#/components/schemas/ProcessingTranscriptionJobResponse"},
             {"$ref": "#/components/schemas/SucceededTranscriptionJobResponse"},
+            {"$ref": "#/components/schemas/FailedTranscriptionJobResponse"},
         ]
     }
     assert components["ActiveTranscriptionJobLinks"]["required"] == ["self", "cancel"]
     assert components["FinishedTranscriptionJobLinks"]["required"] == ["self"]
+    assert "queue_timeout" in components["ErrorDetail"]["properties"]["code"]["enum"]
 
     for header_name in ("Location", "Retry-After", "Cache-Control"):
         assert header_name in submission_operation["responses"]["202"]["headers"]

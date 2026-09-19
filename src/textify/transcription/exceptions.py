@@ -130,6 +130,24 @@ class JobStoreUnavailableError(TranscriptionError):
     message = "Transcription job storage is currently unavailable."
 
 
+class QueueTimeoutError(TranscriptionError):
+    """Indicate a job expiring before a worker claims it."""
+
+    code = "queue_timeout"
+    status_code = 504
+    message = (
+        "The transcription job did not begin processing before its queue deadline."
+    )
+
+
+class InternalTranscriptionError(TranscriptionError):
+    """Indicate an unexpected internal transcription failure."""
+
+    code = "internal_error"
+    status_code = 500
+    message = "An unexpected error occurred."
+
+
 def _job_cache_headers(request: Request) -> dict[str, str]:
     """Return no-store headers for routes that contain bearer capabilities."""
     path = request.url.path
@@ -194,14 +212,10 @@ async def unhandled_error_handler(request: Request, _exc: Exception) -> JSONResp
     Returns:
         Generic internal-error response.
     """
-    bind_request_log_fields(code="internal_error")
+    error = InternalTranscriptionError()
+    bind_request_log_fields(code=error.code)
     return JSONResponse(
-        status_code=500,
-        content={
-            "error": {
-                "code": "internal_error",
-                "message": "An unexpected error occurred.",
-            }
-        },
+        status_code=error.status_code,
+        content={"error": {"code": error.code, "message": error.message}},
         headers=_job_cache_headers(request),
     )

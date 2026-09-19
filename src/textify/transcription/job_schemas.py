@@ -5,7 +5,7 @@ from typing import Literal
 
 from pydantic import UUID4, BaseModel, ConfigDict
 
-from textify.transcription.schemas import TranscriptionResponse
+from textify.transcription.schemas import ErrorDetail, TranscriptionResponse
 
 
 class ActiveTranscriptionJobLinks(BaseModel):
@@ -64,8 +64,24 @@ class SucceededTranscriptionJobResponse(BaseModel):
     links: FinishedTranscriptionJobLinks
 
 
+class FailedTranscriptionJobResponse(BaseModel):
+    """Serialize the safe reason for a failed finished job."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    id: UUID4
+    status: Literal["finished"]
+    outcome: Literal["failed"]
+    submitted_at: datetime
+    started_at: datetime | None
+    finished_at: datetime
+    error: ErrorDetail
+    links: FinishedTranscriptionJobLinks
+
+
 type TranscriptionJobResponse = (
     QueuedTranscriptionJobResponse
     | ProcessingTranscriptionJobResponse
     | SucceededTranscriptionJobResponse
+    | FailedTranscriptionJobResponse
 )

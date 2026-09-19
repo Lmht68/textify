@@ -7,7 +7,7 @@ import tempfile
 import time
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -214,6 +214,8 @@ def create_app(
     available_temporary_media_bytes: Callable[
         [Path], int
     ] = _available_temporary_media_bytes,
+    *,
+    clock: Callable[[], datetime] = utc_now,
 ) -> FastAPI:
     """Create the configured Textify FastAPI application.
 
@@ -222,6 +224,7 @@ def create_app(
         transcription_config: Optional transcription configuration for composition or tests.
         adapters_factory: Factory that creates the complete provider adapter bundle.
         available_temporary_media_bytes: Reader for current writable media capacity.
+        clock: UTC clock supplied to durable job storage.
 
     Returns:
         Unstarted FastAPI application with startup-owned model lifecycle.
@@ -256,7 +259,7 @@ def create_app(
                 queue_timeout=timedelta(
                     seconds=resolved_transcription_config.job_queue_timeout_seconds
                 ),
-                clock=utc_now,
+                clock=clock,
             )
             adapters = adapters_factory(resolved_transcription_config)
             executor = TranscriptionExecutor(adapters, resolved_transcription_config)
