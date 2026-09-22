@@ -4,7 +4,7 @@ import asyncio
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from requests.exceptions import RequestException, Timeout
 from yt_dlp.utils import YoutubeDLError
@@ -15,6 +15,7 @@ from textify.transcription.config import TranscriptionConfig
 from textify.transcription.exceptions import (
     MetadataRetrievalFailedError,
     MetadataTimeoutError,
+    TranscriptionCancellationRequestedError,
     TranscriptionError,
     UnsupportedContentError,
     UnsupportedMediaError,
@@ -49,6 +50,28 @@ class TranscriptionAdapters:
 type TranscriptionAdaptersFactory = Callable[
     [TranscriptionConfig], TranscriptionAdapters
 ]
+
+
+@dataclass(slots=True)
+class TranscriptionExecutionControl:
+    """Own cancellation and cleanup signals for one executor invocation."""
+
+    provider_cancellation: threading.Event = field(default_factory=threading.Event)
+    cancellation_requested: asyncio.Event = field(default_factory=asyncio.Event)
+    cleanup_complete: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def request_cancellation(self) -> None:
+        """Signal an accepted durable cancellation to cooperative providers."""
+        self.provider_cancellation.set()
+        self.cancellation_requested.set()
+
+
+def _raise_if_cancellation_requested(
+    control: TranscriptionExecutionControl,
+) -> None:
+    """Stop result production after durable cancellation has been accepted."""
+    if control.cancellation_requested.is_set():
+        raise TranscriptionCancellationRequestedError()
 
 
 def build_transcription_adapters(
@@ -113,7 +136,8 @@ async def _finish_cancelled_metadata(
 class TranscriptionExecutor:
     """Execute one validated transcription lifecycle outside HTTP concerns.
 
-    Callers supply a supported SubmittedSource and a cooperative cancellation event.
+    Callers supply a supported SubmittedSource and execution control owned by the
+    orchestration layer.
     """
 
     def __init__(
@@ -140,21 +164,22 @@ class TranscriptionExecutor:
         self,
         submitted: inspection.SubmittedSource,
         *,
-        cancellation_event: threading.Event,
+        control: TranscriptionExecutionControl,
         include_segments: bool = True,
     ) -> TranscriptionResult:
         """Execute one validated supported source through transcript composition.
 
         Args:
             submitted: Supported SubmittedSource produced by URL inspection.
-            cancellation_event: Caller-owned event set when cooperative provider
-                cancellation must begin.
+            control: Caller-owned cancellation and cleanup control.
             include_segments: Whether to retain normalized timed segments.
 
         Returns:
             Canonical source metadata paired with a normalized transcript.
 
         Raises:
+            TranscriptionCancellationRequestedError: If durable cancellation was
+                accepted before a result can be returned.
             TranscriptionError: If provider, media, or native work fails safely.
             asyncio.CancelledError: If the caller cancels execution.
         """
@@ -163,9 +188,10 @@ class TranscriptionExecutor:
         try:
             extracted_metadata = await self._extract_metadata(
                 submitted.provider_url,
-                cancellation_event,
+                control.provider_cancellation,
             )
             prepared_audio = extracted_metadata.prepared_audio
+            _raise_if_cancellation_requested(control)
             inspection._raise_if_selected_media_exceeds_limit(
                 extracted_metadata.metadata,
                 self._settings.max_media_bytes,
@@ -198,22 +224,28 @@ class TranscriptionExecutor:
                         normalized_metadata.declared_language,
                         include_segments=include_segments,
                     )
+                    _raise_if_cancellation_requested(control)
                     if caption_transcript is not None:
                         bind_request_log_fields(
                             method=caption_transcript.method.value,
                         )
                         return TranscriptionResult(source, caption_transcript)
 
+            _raise_if_cancellation_requested(control)
             ownership = acquisition.TranscriptionOwnership(
                 prepared_audio,
-                cancellation_event,
+                control.provider_cancellation,
+                control.cleanup_complete,
             )
             prepared_audio = None
+            _raise_if_cancellation_requested(control)
             transcript = await self._whisper_acquirer.acquire(
                 submitted.provider_url,
                 ownership,
+                cancellation_requested=control.cancellation_requested,
                 include_segments=include_segments,
             )
+            _raise_if_cancellation_requested(control)
             bind_request_log_fields(method=transcript.method.value)
             return TranscriptionResult(source, transcript)
         except MediaByteLimitExceeded as exc:
@@ -224,9 +256,12 @@ class TranscriptionExecutor:
             raise MetadataRetrievalFailedError() from exc
         finally:
             if ownership is None:
-                cancellation_event.set()
-                if prepared_audio is not None:
-                    prepared_audio.cleanup()
+                control.provider_cancellation.set()
+                try:
+                    if prepared_audio is not None:
+                        prepared_audio.cleanup()
+                finally:
+                    control.cleanup_complete.set()
             else:
                 ownership.finish_caller()
 

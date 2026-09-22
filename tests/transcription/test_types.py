@@ -44,6 +44,7 @@ def test_normalize_transcript_sorts_and_collapses_segments() -> None:
             (4.0, 4.0, "\t"),
         ),
     )
+    assert isinstance(transcript, TimedTranscript)
 
     assert transcript.language == "en-US"
     assert transcript.text == "first second segment overlapping"

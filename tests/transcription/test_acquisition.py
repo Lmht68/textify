@@ -19,7 +19,7 @@ from textify.transcription.acquisition import (
     acquire_transcript,
 )
 from textify.transcription.config import TranscriptionConfig
-from textify.transcription.types import RawSegment, TranscriptMethod
+from textify.transcription.types import RawSegment, TimedTranscript, TranscriptMethod
 from textify.transcription.util import (
     MediaByteLimitExceeded,
     _TextifyFacebookIE,
@@ -580,6 +580,7 @@ def test_youtube_caption_adapter_fetches_original_timed_snippets(
     )
 
     assert transcript is not None
+    assert isinstance(transcript, TimedTranscript)
     assert transcript.method is TranscriptMethod.YOUTUBE_CAPTIONS
     assert transcript.language == "en-US"
     assert transcript.text == "first second overlap"
@@ -658,6 +659,7 @@ def test_faster_whisper_adapter_normalizes_timed_external_segments(
     )
 
     transcript = adapter.transcribe(audio_path)
+    assert isinstance(transcript, TimedTranscript)
 
     assert transcript.method is TranscriptMethod.FASTER_WHISPER
     assert transcript.language == "en-US"
@@ -700,6 +702,7 @@ def test_faster_whisper_adapter_accepts_silent_media(tmp_path: Path) -> None:
     )
 
     transcript = adapter.transcribe(audio_path)
+    assert isinstance(transcript, TimedTranscript)
 
     assert transcript.language == "und"
     assert transcript.segments == ()

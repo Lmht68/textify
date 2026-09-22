@@ -80,9 +80,24 @@ class FailedTranscriptionJobResponse(BaseModel):
     links: FinishedTranscriptionJobLinks
 
 
+class CancelledTranscriptionJobResponse(BaseModel):
+    """Serialize the safe representation of a cancelled finished job."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    id: UUID4
+    status: Literal["finished"]
+    outcome: Literal["cancelled"]
+    submitted_at: datetime
+    started_at: datetime | None
+    finished_at: datetime
+    links: FinishedTranscriptionJobLinks
+
+
 type TranscriptionJobResponse = (
     QueuedTranscriptionJobResponse
     | ProcessingTranscriptionJobResponse
     | SucceededTranscriptionJobResponse
     | FailedTranscriptionJobResponse
+    | CancelledTranscriptionJobResponse
 )

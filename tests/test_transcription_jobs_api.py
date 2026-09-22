@@ -16,6 +16,7 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient, Response
 from starlette.types import Message
+from yt_dlp.utils import DownloadCancelled
 
 from textify.config import AppConfig, Environment
 from textify.jobs.config import JobConfig
@@ -278,6 +279,7 @@ class ControlledAdapterState:
     """Coordinate deterministic provider work for Transcription Job ASGI tests."""
 
     block_metadata: bool = False
+    block_download_until_cancellation: bool = False
     caption_segments: tuple[tuple[float, float, str], ...] = ()
     caption_language: str = "en-US"
     probe: ConcurrencyProbe | None = None
@@ -287,6 +289,7 @@ class ControlledAdapterState:
     metadata_delay_seconds: float = 0.0
     download_delay_seconds: float = 0.0
     native_delay_seconds: float = 0.0
+    metadata_cancellation_prepared_directory: Path | None = None
     metadata_calls: list[str] = field(default_factory=list)
     download_calls: list[str] = field(default_factory=list)
     native_include_segments: list[bool] = field(default_factory=list)
@@ -301,6 +304,15 @@ class ControlledAdapterState:
     audio_paths_by_source: dict[str, Path] = field(default_factory=dict)
     metadata_entered: threading.Event = field(default_factory=threading.Event)
     metadata_release: threading.Event = field(default_factory=threading.Event)
+    metadata_cancellation_observed: threading.Event = field(
+        default_factory=threading.Event
+    )
+    download_cancellation_entered: threading.Event = field(
+        default_factory=threading.Event
+    )
+    download_cancellation_observed: threading.Event = field(
+        default_factory=threading.Event
+    )
     native_completed: threading.Event = field(default_factory=threading.Event)
 
 
@@ -398,7 +410,22 @@ class ControlledMetadataExtractor:
             self._state.metadata_entered.set()
             if self._state.block_metadata:
                 while not self._state.metadata_release.wait(0.01):
-                    assert not cancellation_event.is_set()
+                    if cancellation_event.is_set():
+                        self._state.metadata_cancellation_observed.set()
+                        break
+            if cancellation_event.is_set():
+                self._state.metadata_cancellation_observed.set()
+                prepared_directory = (
+                    self._state.metadata_cancellation_prepared_directory
+                )
+                if prepared_directory is not None:
+                    prepared_directory.mkdir(parents=True, exist_ok=True)
+                    prepared_path = prepared_directory / "audio.webm"
+                    prepared_path.write_bytes(b"prepared")
+                    return inspection.ExtractedMetadata(
+                        _metadata_for(provider_url),
+                        inspection.PreparedAudio(prepared_path, prepared_directory),
+                    )
             if self._state.metadata_delay_seconds:
                 time.sleep(self._state.metadata_delay_seconds)
             if self._state.metadata_error is not None:
@@ -439,7 +466,6 @@ class ControlledAudioDownloader:
         Returns:
             A completed small local media file.
         """
-        assert not cancellation_event.is_set()
         self._state.download_calls.append(source_url)
         self._state.download_deadlines.append(deadline)
         self._state.download_entry_times.append(time.monotonic())
@@ -447,6 +473,15 @@ class ControlledAudioDownloader:
         if self._state.download_error is not None:
             raise self._state.download_error
         audio_path = destination / "audio.webm"
+        if self._state.block_download_until_cancellation:
+            audio_path.write_bytes(b"partial")
+            self._state.audio_paths.append(audio_path)
+            self._state.download_cancellation_entered.set()
+            if not cancellation_event.wait(2.0):
+                raise AssertionError("Downloader did not receive cancellation.")
+            self._state.download_cancellation_observed.set()
+            raise DownloadCancelled("controlled download cancellation")
+        assert not cancellation_event.is_set()
         audio_path.write_bytes(b"audio")
         self._state.audio_paths.append(audio_path)
         self._state.audio_paths_by_source[source_url] = audio_path
@@ -724,10 +759,16 @@ def _assert_submission(response: Response) -> QueuedJobPayload:
     return payload
 
 
-def _assert_processing(response: Response, location: str) -> dict[str, object]:
+def _assert_processing(
+    response: Response,
+    location: str,
+    *,
+    expected_status: int = 200,
+    cancellation_requested: bool = False,
+) -> dict[str, object]:
     """Assert the public active representation after a worker claim."""
     payload = response.json()
-    assert response.status_code == 200
+    assert response.status_code == expected_status
     assert set(payload) == {
         "id",
         "status",
@@ -737,7 +778,7 @@ def _assert_processing(response: Response, location: str) -> dict[str, object]:
         "links",
     }
     assert payload["status"] == "processing"
-    assert payload["cancellation_requested"] is False
+    assert payload["cancellation_requested"] is cancellation_requested
     assert payload["links"] == {"self": location, "cancel": f"{location}/cancellation"}
     started_at = datetime.fromisoformat(payload["started_at"])
     assert started_at.tzinfo is not None
@@ -810,6 +851,40 @@ def _assert_failed(
     assert isinstance(payload["error"]["message"], str)
     assert payload["error"]["message"]
     assert payload["links"] == {"self": location}
+    assert "Retry-After" not in response.headers
+    assert response.headers["Cache-Control"] == "no-store"
+    _assert_generated_request_id(response)
+    return cast(dict[str, object], payload)
+
+
+def _assert_cancelled(
+    response: Response,
+    location: str,
+    *,
+    started: bool,
+) -> dict[str, object]:
+    """Assert the complete safe terminal representation of a cancelled job."""
+    payload = response.json()
+    assert response.status_code == 200
+    assert set(payload) == {
+        "id",
+        "status",
+        "outcome",
+        "submitted_at",
+        "started_at",
+        "finished_at",
+        "links",
+    }
+    assert payload["status"] == "finished"
+    assert payload["outcome"] == "cancelled"
+    assert payload["links"] == {"self": location}
+    if started:
+        started_at = datetime.fromisoformat(payload["started_at"])
+        assert started_at.tzinfo is not None
+    else:
+        assert payload["started_at"] is None
+    finished_at = datetime.fromisoformat(payload["finished_at"])
+    assert finished_at.tzinfo is not None
     assert "Retry-After" not in response.headers
     assert response.headers["Cache-Control"] == "no-store"
     _assert_generated_request_id(response)
@@ -1902,3 +1977,367 @@ async def test_api_publishes_failure_only_after_request_media_cleanup(
             assert len(state.audio_paths) == 1
             assert not state.request_directories[0].exists()
             assert not state.audio_paths[0].exists()
+
+
+async def test_api_cancels_queued_jobs_and_rejects_nonempty_bodies(
+    migrated_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Cancel queued work without invoking providers or accepting ignored bodies."""
+    first_url = f"{TIKTOK_URL}?queued_cancellation=first"
+    queued_url = f"{TIKTOK_URL}?queued_cancellation=second"
+    state = ControlledAdapterState(block_metadata=True)
+    application = _application(
+        migrated_database_path,
+        tmp_path / "media",
+        ControlledAdaptersFactory(state),
+    )
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            try:
+                first_location = _assert_submission(
+                    await client.post(
+                        "/api/transcription-jobs",
+                        json={"url": first_url},
+                    )
+                )["links"]["self"]
+                await _wait_for_thread_event(state.metadata_entered)
+                queued_location = _assert_submission(
+                    await client.post(
+                        "/api/transcription-jobs",
+                        json={"url": queued_url},
+                    )
+                )["links"]["self"]
+
+                for body in (b"{}", b"null", b" ", b"\x00"):
+                    rejected = await client.put(
+                        f"{queued_location}/cancellation",
+                        content=body,
+                    )
+                    _assert_safe_error(rejected, 422, "invalid_request")
+                    assert (await client.get(queued_location)).json()[
+                        "status"
+                    ] == "queued"
+
+                cancelled = await client.put(f"{queued_location}/cancellation")
+                cancelled_payload = _assert_cancelled(
+                    cancelled,
+                    queued_location,
+                    started=False,
+                )
+                repeated = await client.put(f"{queued_location}/cancellation")
+                repeated_payload = _assert_cancelled(
+                    repeated,
+                    queued_location,
+                    started=False,
+                )
+                assert (
+                    repeated_payload["finished_at"] == cancelled_payload["finished_at"]
+                )
+                assert (
+                    repeated.headers["X-Request-ID"]
+                    != cancelled.headers["X-Request-ID"]
+                )
+                state.metadata_release.set()
+                _assert_succeeded(
+                    await _poll_until_finished(client, first_location),
+                    first_location,
+                )
+            finally:
+                state.metadata_release.set()
+
+    assert state.metadata_calls == [first_url]
+    assert state.download_calls == [first_url]
+
+
+async def test_api_cancels_metadata_after_late_prepared_media_cleanup(
+    migrated_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Publish cancellation only after cooperative metadata media is removed."""
+    prepared_directory = tmp_path / "late-metadata"
+    state = ControlledAdapterState(
+        block_metadata=True,
+        metadata_cancellation_prepared_directory=prepared_directory,
+    )
+    application = _application(
+        migrated_database_path,
+        tmp_path / "media",
+        ControlledAdaptersFactory(state),
+    )
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            try:
+                accepted = await client.post(
+                    "/api/transcription-jobs",
+                    json={"url": TIKTOK_URL},
+                )
+                location = _assert_submission(accepted)["links"]["self"]
+                await _wait_for_thread_event(state.metadata_entered)
+
+                cancellation = await client.put(f"{location}/cancellation")
+                _assert_processing(
+                    cancellation,
+                    location,
+                    expected_status=202,
+                    cancellation_requested=True,
+                )
+                with sqlite3.connect(migrated_database_path) as connection:
+                    lifecycle = connection.execute(
+                        "SELECT status, cancellation_requested FROM transcription_job"
+                    ).fetchone()
+                assert lifecycle == ("processing", 1)
+                await _wait_for_thread_event(state.metadata_cancellation_observed)
+                await _wait_until(
+                    lambda: not prepared_directory.exists(),
+                    "Late metadata media was not removed before cancellation.",
+                )
+                cancelled = await _poll_until_finished(client, location)
+            finally:
+                state.metadata_release.set()
+
+    _assert_cancelled(cancelled, location, started=True)
+    assert state.download_calls == []
+    assert state.native_include_segments == []
+
+
+async def test_api_cancels_download_without_starting_native_work(
+    migrated_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Resolve cooperative download cancellation after partial-media cleanup."""
+    state = ControlledAdapterState(block_download_until_cancellation=True)
+    application = _application(
+        migrated_database_path,
+        tmp_path / "media",
+        ControlledAdaptersFactory(state),
+    )
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            accepted = await client.post(
+                "/api/transcription-jobs",
+                json={"url": TIKTOK_URL},
+            )
+            location = _assert_submission(accepted)["links"]["self"]
+            await _wait_for_thread_event(state.download_cancellation_entered)
+
+            cancellation = await client.put(f"{location}/cancellation")
+            _assert_processing(
+                cancellation,
+                location,
+                expected_status=202,
+                cancellation_requested=True,
+            )
+            await _wait_for_thread_event(state.download_cancellation_observed)
+            cancelled = await _poll_until_finished(client, location)
+
+    _assert_cancelled(cancelled, location, started=True)
+    assert state.native_include_segments == []
+    assert all(not directory.exists() for directory in state.request_directories)
+
+
+async def test_api_retains_cancelled_native_work_until_cleanup_releases_its_permit(
+    migrated_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Keep cancelled native work processing until retained inference can clean up."""
+    first_url = f"{TIKTOK_URL}?native_cancellation=first"
+    second_url = f"{TIKTOK_URL}?native_cancellation=second"
+    probe = ConcurrencyProbe(gate_native_calls=True)
+    state = ControlledAdapterState(probe=probe)
+    settings = _transcription_config(
+        tmp_path / "media",
+        transcription_concurrency=1,
+        transcription_timeout_seconds=0.5,
+    )
+    application = _application(
+        migrated_database_path,
+        tmp_path / "media",
+        ControlledAdaptersFactory(state),
+        settings=settings,
+        job_config=_job_config(migrated_database_path, job_worker_count=2),
+    )
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            try:
+                first_submission = _assert_submission(
+                    await client.post(
+                        "/api/transcription-jobs",
+                        json={"url": first_url},
+                    )
+                )
+                first_location = first_submission["links"]["self"]
+                await probe.wait_for_native_calls(1)
+                first_audio_path = state.audio_paths_by_source[first_url]
+
+                cancellation = await client.put(f"{first_location}/cancellation")
+                _assert_processing(
+                    cancellation,
+                    first_location,
+                    expected_status=202,
+                    cancellation_requested=True,
+                )
+                repeated_processing = await client.put(f"{first_location}/cancellation")
+                _assert_processing(
+                    repeated_processing,
+                    first_location,
+                    expected_status=202,
+                    cancellation_requested=True,
+                )
+                assert (
+                    repeated_processing.headers["X-Request-ID"]
+                    != cancellation.headers["X-Request-ID"]
+                )
+                await asyncio.sleep(0.6)
+                _assert_processing(
+                    await client.get(first_location),
+                    first_location,
+                    cancellation_requested=True,
+                )
+                assert first_audio_path.is_file()
+                assert probe.active_native_calls == 1
+
+                second_submission = _assert_submission(
+                    await client.post(
+                        "/api/transcription-jobs",
+                        json={"url": second_url},
+                    )
+                )
+                second_location = second_submission["links"]["self"]
+                await _wait_until(
+                    lambda: second_url in state.download_calls,
+                    "Second native job did not reach audio acquisition.",
+                )
+                assert probe.native_source_urls == (first_url,)
+
+                probe.release_native()
+                first_cancelled = await _poll_until_finished(client, first_location)
+                first_payload = _assert_cancelled(
+                    first_cancelled,
+                    first_location,
+                    started=True,
+                )
+                assert not first_audio_path.exists()
+                with sqlite3.connect(migrated_database_path) as connection:
+                    result_count = connection.execute(
+                        "SELECT COUNT(*) FROM transcription_job_result "
+                        "WHERE job_id = ("
+                        "SELECT id FROM transcription_job WHERE public_id = ?"
+                        ")",
+                        (first_submission["id"],),
+                    ).fetchone()[0]
+                    segment_count = connection.execute(
+                        "SELECT COUNT(*) FROM transcription_job_segment "
+                        "WHERE job_id = ("
+                        "SELECT id FROM transcription_job WHERE public_id = ?"
+                        ")",
+                        (first_submission["id"],),
+                    ).fetchone()[0]
+                assert result_count == 0
+                assert segment_count == 0
+
+                repeated_terminal = await client.put(f"{first_location}/cancellation")
+                repeated_payload = _assert_cancelled(
+                    repeated_terminal,
+                    first_location,
+                    started=True,
+                )
+                assert repeated_payload["finished_at"] == first_payload["finished_at"]
+                await probe.wait_for_native_calls(2)
+                assert list(probe.native_source_urls) == [first_url, second_url]
+                probe.release_native()
+                _assert_succeeded(
+                    await _poll_until_finished(client, second_location),
+                    second_location,
+                )
+            finally:
+                probe.release_native(2)
+
+
+async def test_api_rejects_completed_unknown_and_deleted_cancellation_capabilities(
+    migrated_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Preserve completed outcomes and hide malformed, unknown, and deleted jobs."""
+    succeeded_state = ControlledAdapterState()
+    succeeded_application = _application(
+        migrated_database_path,
+        tmp_path / "succeeded-media",
+        ControlledAdaptersFactory(succeeded_state),
+    )
+    async with succeeded_application.router.lifespan_context(succeeded_application):
+        transport = ASGITransport(app=succeeded_application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            succeeded_submission = _assert_submission(
+                await client.post(
+                    "/api/transcription-jobs",
+                    json={"url": TIKTOK_URL},
+                )
+            )
+            succeeded_location = succeeded_submission["links"]["self"]
+            succeeded = await _poll_until_finished(client, succeeded_location)
+            succeeded_payload = _assert_succeeded(succeeded, succeeded_location)
+            conflict = await client.put(f"{succeeded_location}/cancellation")
+            _assert_safe_error(conflict, 409, "job_already_finished")
+            assert (await client.get(succeeded_location)).json() == succeeded_payload
+
+    failed_state = ControlledAdapterState(metadata_error=MetadataRetrievalFailedError())
+    failed_application = _application(
+        migrated_database_path,
+        tmp_path / "failed-media",
+        ControlledAdaptersFactory(failed_state),
+    )
+    async with failed_application.router.lifespan_context(failed_application):
+        transport = ASGITransport(app=failed_application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            failed_submission = _assert_submission(
+                await client.post(
+                    "/api/transcription-jobs",
+                    json={"url": f"{TIKTOK_URL}?failed_cancellation=true"},
+                )
+            )
+            failed_location = failed_submission["links"]["self"]
+            failed = await _poll_until_finished(client, failed_location)
+            failed_payload = _assert_failed(
+                failed,
+                failed_location,
+                "metadata_retrieval_failed",
+                started=True,
+            )
+            conflict = await client.put(f"{failed_location}/cancellation")
+            _assert_safe_error(conflict, 409, "job_already_finished")
+            assert (await client.get(failed_location)).json() == failed_payload
+
+            malformed = await client.put(
+                "/api/transcription-jobs/not-a-uuid/cancellation"
+            )
+            unknown = await client.put(
+                "/api/transcription-jobs/00000000-0000-4000-8000-000000000000/"
+                "cancellation"
+            )
+            with sqlite3.connect(migrated_database_path) as connection:
+                connection.execute(
+                    "DELETE FROM transcription_job WHERE public_id = ?",
+                    (failed_submission["id"],),
+                )
+            deleted = await client.put(f"{failed_location}/cancellation")
+
+    for response in (malformed, unknown, deleted):
+        _assert_safe_error(response, 404, "job_not_found")
+    assert malformed.json() == unknown.json() == deleted.json()
+    assert (
+        len(
+            {
+                malformed.headers["X-Request-ID"],
+                unknown.headers["X-Request-ID"],
+                deleted.headers["X-Request-ID"],
+            }
+        )
+        == 3
+    )
+    assert succeeded_state.metadata_calls == [TIKTOK_URL]
+    assert failed_state.metadata_calls == [f"{TIKTOK_URL}?failed_cancellation=true"]

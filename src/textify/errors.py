@@ -22,6 +22,7 @@ PublicErrorCode = Literal[
     "transcription_failed",
     "transcription_capacity_exceeded",
     "job_not_found",
+    "job_already_finished",
     "job_store_unavailable",
     "queue_timeout",
     "metadata_timeout",

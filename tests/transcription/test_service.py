@@ -14,6 +14,7 @@ from textify.transcription.exceptions import (
     AudioDownloadTimeoutError,
     MetadataRetrievalFailedError,
     MetadataTimeoutError,
+    TranscriptionCancellationRequestedError,
     TranscriptionFailedError,
     UnsupportedMediaError,
     VideoTooLongError,
@@ -21,6 +22,7 @@ from textify.transcription.exceptions import (
 from textify.transcription.inspection import ExtractedMetadata, PreparedAudio
 from textify.transcription.service import (
     TranscriptionAdapters,
+    TranscriptionExecutionControl,
     TranscriptionExecutor,
 )
 from textify.transcription.types import (
@@ -493,7 +495,7 @@ async def test_transcribe_allows_the_inclusive_duration_and_cleans_media(
 
     result = await service.execute(
         inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
-        cancellation_event=threading.Event(),
+        control=TranscriptionExecutionControl(),
     )
 
     assert result.source.duration_seconds == 1800
@@ -518,7 +520,7 @@ async def test_transcribe_forwards_text_only_selection_to_native_inference(
 
     result = await service.execute(
         inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
-        cancellation_event=threading.Event(),
+        control=TranscriptionExecutionControl(),
         include_segments=False,
     )
 
@@ -548,7 +550,7 @@ async def test_transcribe_preserves_validated_provider_parameters(
 
     await service.execute(
         inspection.classify_submitted_url(submitted_url),
-        cancellation_event=threading.Event(),
+        control=TranscriptionExecutionControl(),
     )
 
     assert extractor.calls == [provider_url]
@@ -569,7 +571,7 @@ async def test_transcribe_accepts_completed_audio_at_byte_limit(
 
     result = await service.execute(
         inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
-        cancellation_event=threading.Event(),
+        control=TranscriptionExecutionControl(),
     )
 
     assert result.transcript.text == "Transcript"
@@ -592,7 +594,7 @@ async def test_transcribe_rejects_oversized_injected_metadata(tmp_path: Path) ->
     with pytest.raises(UnsupportedMediaError):
         await service.execute(
             inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
-            cancellation_event=threading.Event(),
+            control=TranscriptionExecutionControl(),
         )
 
     assert downloader.calls == []
@@ -619,7 +621,7 @@ async def test_transcribe_rejects_oversized_prepared_audio(tmp_path: Path) -> No
     with pytest.raises(UnsupportedMediaError):
         await service.execute(
             inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
-            cancellation_event=threading.Event(),
+            control=TranscriptionExecutionControl(),
         )
 
     assert downloader.calls == []
@@ -641,7 +643,7 @@ async def test_transcribe_rejects_duration_above_the_inclusive_ceiling(
     with pytest.raises(VideoTooLongError):
         await service.execute(
             inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
-            cancellation_event=threading.Event(),
+            control=TranscriptionExecutionControl(),
         )
 
     assert downloader.calls == []
@@ -669,7 +671,7 @@ async def test_transcribe_cleans_inspection_audio_after_inference_failure(
     with pytest.raises(TranscriptionFailedError):
         await service.execute(
             inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
-            cancellation_event=threading.Event(),
+            control=TranscriptionExecutionControl(),
         )
 
     assert not prepared_directory.exists()
@@ -698,12 +700,12 @@ async def test_transcribe_translates_metadata_and_download_timeouts(
     with pytest.raises(MetadataTimeoutError):
         await metadata_timeout_service.execute(
             inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
-            cancellation_event=threading.Event(),
+            control=TranscriptionExecutionControl(),
         )
     with pytest.raises(AudioDownloadTimeoutError):
         await download_timeout_service.execute(
             inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
-            cancellation_event=threading.Event(),
+            control=TranscriptionExecutionControl(),
         )
 
 
@@ -720,7 +722,7 @@ async def test_transcribe_translates_ordinary_metadata_failures(tmp_path: Path) 
     with pytest.raises(MetadataRetrievalFailedError):
         await service.execute(
             inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
-            cancellation_event=threading.Event(),
+            control=TranscriptionExecutionControl(),
         )
 
 
@@ -747,7 +749,7 @@ async def test_transcribe_returns_youtube_captions_without_native_work(
 
     result = await service.execute(
         inspection.classify_submitted_url(YOUTUBE_URL),
-        cancellation_event=threading.Event(),
+        control=TranscriptionExecutionControl(),
     )
 
     assert result.source.video_id == "dQw4w9WgXcQ"
@@ -789,7 +791,7 @@ async def test_transcribe_forwards_text_only_selection_to_youtube_captions(
 
     result = await service.execute(
         inspection.classify_submitted_url(YOUTUBE_URL),
-        cancellation_event=threading.Event(),
+        control=TranscriptionExecutionControl(),
         include_segments=False,
     )
 
@@ -840,7 +842,7 @@ async def test_transcribe_falls_back_after_unusable_youtube_captions(
 
     result = await service.execute(
         inspection.classify_submitted_url(YOUTUBE_URL),
-        cancellation_event=threading.Event(),
+        control=TranscriptionExecutionControl(),
     )
 
     assert result.transcript.method is TranscriptMethod.FASTER_WHISPER
@@ -876,7 +878,7 @@ async def test_transcribe_cleans_prepared_audio_after_youtube_caption_success(
 
     result = await service.execute(
         inspection.classify_submitted_url(YOUTUBE_URL),
-        cancellation_event=threading.Event(),
+        control=TranscriptionExecutionControl(),
     )
 
     assert result.transcript.method is TranscriptMethod.YOUTUBE_CAPTIONS
@@ -909,7 +911,7 @@ async def test_transcribe_reuses_prepared_audio_after_youtube_caption_miss(
 
     result = await service.execute(
         inspection.classify_submitted_url(YOUTUBE_URL),
-        cancellation_event=threading.Event(),
+        control=TranscriptionExecutionControl(),
     )
 
     assert result.transcript.method is TranscriptMethod.FASTER_WHISPER
@@ -938,7 +940,7 @@ async def test_transcribe_preserves_native_failure_after_caption_failure(
     with pytest.raises(TranscriptionFailedError):
         await service.execute(
             inspection.classify_submitted_url(YOUTUBE_URL),
-            cancellation_event=threading.Event(),
+            control=TranscriptionExecutionControl(),
         )
 
     assert caption_provider.calls == ["dQw4w9WgXcQ"]
@@ -999,7 +1001,7 @@ async def test_transcription_execution_runs_caption_bypass_and_native_fallback_w
 
     result = await executor.execute(
         inspection.classify_submitted_url(YOUTUBE_URL),
-        cancellation_event=threading.Event(),
+        control=TranscriptionExecutionControl(),
     )
 
     assert result.source.video_id == "dQw4w9WgXcQ"
@@ -1043,11 +1045,11 @@ async def test_transcription_execution_uses_caller_cancellation_for_pre_native_w
         transcriber,
         caption_provider,
     )
-    cancellation_event = threading.Event()
+    control = TranscriptionExecutionControl()
     task = asyncio.create_task(
         executor.execute(
             inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
-            cancellation_event=cancellation_event,
+            control=control,
         )
     )
     stage_entered = (
@@ -1059,7 +1061,7 @@ async def test_transcription_execution_uses_caller_cancellation_for_pre_native_w
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert cancellation_event.is_set()
+    assert control.provider_cancellation.is_set()
     assert caption_provider.calls == []
     assert transcriber.calls == []
     if stage == "metadata":
@@ -1075,3 +1077,34 @@ async def test_transcription_execution_uses_caller_cancellation_for_pre_native_w
         assert all(
             not directory.exists() for directory in audio_downloader.request_directories
         )
+
+
+@pytest.mark.asyncio
+async def test_transcription_execution_publishes_pre_native_cancellation_after_cleanup(
+    tmp_path: Path,
+) -> None:
+    """Raise the internal cancellation signal only after owned media is released."""
+    downloader = BlockingAudioDownloader(block=True)
+    transcriber = FixedTranscriber()
+    executor = build_execution(
+        build_transcription_config(tmp_path),
+        RecordingMetadataExtractor(tiktok_metadata()),
+        downloader,
+        transcriber,
+    )
+    control = TranscriptionExecutionControl()
+    task = asyncio.create_task(
+        executor.execute(
+            inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
+            control=control,
+        )
+    )
+
+    assert await asyncio.to_thread(downloader.entered.wait, 1.0)
+    control.request_cancellation()
+    with pytest.raises(TranscriptionCancellationRequestedError):
+        await task
+
+    assert control.cleanup_complete.is_set()
+    assert transcriber.calls == []
+    assert all(not directory.exists() for directory in downloader.request_directories)

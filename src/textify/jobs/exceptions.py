@@ -19,6 +19,14 @@ class JobNotFoundError(TextifyError):
     message = "The transcription job was not found."
 
 
+class JobAlreadyFinishedError(TextifyError):
+    """Indicate cancellation targeted a completed non-cancelled job."""
+
+    status_code = 409
+    code = "job_already_finished"
+    message = "The transcription job has already finished."
+
+
 class JobStoreUnavailableError(TextifyError):
     """Indicate that durable Transcription Job storage is unavailable."""
 

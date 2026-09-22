@@ -257,8 +257,9 @@ def create_app(
     application = FastAPI(
         title="Textify",
         description=(
-            "Durable Transcription Job acceptance and status inspection for eligible "
-            "public YouTube, Facebook, Instagram, TikTok, and X videos."
+            "Durable Transcription Job acceptance, bearer-capability status inspection, "
+            "and cancellation for eligible public YouTube, Facebook, Instagram, TikTok, "
+            "and X videos."
         ),
         version="0.1.0",
         openapi_tags=[
@@ -272,8 +273,8 @@ def create_app(
             {
                 "name": "transcription-jobs",
                 "description": (
-                    "Durable queued Transcription Job acceptance and "
-                    "bearer-capability status inspection."
+                    "Durable queued Transcription Job acceptance, bearer-capability "
+                    "status inspection, and cancellation."
                 ),
             },
         ],

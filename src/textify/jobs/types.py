@@ -66,6 +66,29 @@ class ProcessingTranscriptionJob:
 
 
 @dataclass(frozen=True, slots=True)
+class ProcessingCancellation:
+    """Hold an accepted cancellation with its private active-worker identity."""
+
+    job: ProcessingTranscriptionJob
+    internal_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class CancelledTranscriptionJob:
+    """Hold the safe persisted projection of a cancelled finished job."""
+
+    public_id: UUID
+    status: JobStatus
+    outcome: JobOutcome
+    submitted_at: datetime
+    started_at: datetime | None
+    finished_at: datetime
+
+
+type CancellationResult = ProcessingCancellation | CancelledTranscriptionJob
+
+
+@dataclass(frozen=True, slots=True)
 class SucceededTranscriptionJob:
     """Hold the safe persisted projection of a successful finished job."""
 
@@ -97,4 +120,5 @@ type TranscriptionJob = (
     | ProcessingTranscriptionJob
     | SucceededTranscriptionJob
     | FailedTranscriptionJob
+    | CancelledTranscriptionJob
 )

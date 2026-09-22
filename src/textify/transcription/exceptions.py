@@ -3,6 +3,10 @@
 from textify.errors import TextifyError
 
 
+class TranscriptionCancellationRequestedError(RuntimeError):
+    """Signal an accepted Transcription Job cancellation within execution internals."""
+
+
 class TranscriptionError(TextifyError):
     """Base class for safe, parameterless transcription errors.
 

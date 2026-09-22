@@ -36,11 +36,14 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from textify.errors import ErrorDetail
 from textify.jobs.exceptions import QueueTimeoutError
 from textify.jobs.types import (
+    CancellationResult,
+    CancelledTranscriptionJob,
     ClaimedTranscriptionJob,
     FailedTranscriptionJob,
     JobOutcome,
     JobStatus,
     NewQueuedTranscriptionJob,
+    ProcessingCancellation,
     ProcessingTranscriptionJob,
     QueuedTranscriptionJob,
     SucceededTranscriptionJob,
@@ -262,6 +265,10 @@ class TranscriptionJobStoreUnavailableError(RuntimeError):
     """Indicate SQLite could not safely persist or read a Transcription Job."""
 
 
+class TranscriptionJobAlreadyFinishedError(RuntimeError):
+    """Indicate a cancellation request targeted a completed non-cancelled job."""
+
+
 class SqliteTranscriptionJobRepository:
     """Persist Transcription Job lifecycle snapshots through one SQLite boundary."""
 
@@ -449,6 +456,187 @@ class SqliteTranscriptionJobRepository:
 
         return _claimed_job(internal_id, submitted_url, exclusions)
 
+    async def request_cancellation(
+        self,
+        public_id: UUID,
+    ) -> CancellationResult | None:
+        """Durably accept one cancellation through its public capability.
+
+        Args:
+            public_id: Canonical UUIDv4 capability supplied by the coordinator.
+
+        Returns:
+            Processing cancellation details, a cancelled terminal snapshot, or ``None``
+            when the capability is unknown.
+
+        Raises:
+            TranscriptionJobAlreadyFinishedError: If the job has a non-cancelled
+                terminal outcome.
+            TranscriptionJobStoreUnavailableError: If SQLite cannot safely record the
+                cancellation.
+        """
+        try:
+            async with self._engine.connect() as connection:
+                try:
+                    await connection.execute(text("BEGIN IMMEDIATE"))
+                    job_row = (
+                        (
+                            await connection.execute(
+                                select(transcription_job).where(
+                                    transcription_job.c.public_id == str(public_id)
+                                )
+                            )
+                        )
+                        .mappings()
+                        .one_or_none()
+                    )
+                    if job_row is None:
+                        await connection.commit()
+                        return None
+
+                    status = job_row["status"]
+                    if status == "queued":
+                        internal_id = _internal_id_from_row(job_row)
+                        finished_at = _as_utc(self._clock())
+                        transition = await connection.execute(
+                            update(transcription_job)
+                            .where(
+                                transcription_job.c.id == internal_id,
+                                transcription_job.c.status == "queued",
+                            )
+                            .values(
+                                status="finished",
+                                outcome="cancelled",
+                                started_at=None,
+                                finished_at=finished_at,
+                                cancellation_requested=False,
+                            )
+                        )
+                        if transition.rowcount != 1:
+                            raise TranscriptionJobStoreUnavailableError()
+                        cancelled_row = (
+                            (
+                                await connection.execute(
+                                    select(transcription_job).where(
+                                        transcription_job.c.id == internal_id
+                                    )
+                                )
+                            )
+                            .mappings()
+                            .one_or_none()
+                        )
+                        if cancelled_row is None:
+                            raise TranscriptionJobStoreUnavailableError()
+                        await connection.commit()
+                        return _cancelled_job_from_row(cancelled_row)
+
+                    if status == "processing":
+                        internal_id = _internal_id_from_row(job_row)
+                        await connection.execute(
+                            update(transcription_job)
+                            .where(
+                                transcription_job.c.id == internal_id,
+                                transcription_job.c.status == "processing",
+                                transcription_job.c.cancellation_requested.is_(False),
+                            )
+                            .values(cancellation_requested=True)
+                        )
+                        processing_row = (
+                            (
+                                await connection.execute(
+                                    select(transcription_job).where(
+                                        transcription_job.c.id == internal_id
+                                    )
+                                )
+                            )
+                            .mappings()
+                            .one_or_none()
+                        )
+                        if processing_row is None:
+                            raise TranscriptionJobStoreUnavailableError()
+                        await connection.commit()
+                        return ProcessingCancellation(
+                            job=_processing_job_from_row(processing_row),
+                            internal_id=internal_id,
+                        )
+
+                    if status != "finished":
+                        raise TranscriptionJobStoreUnavailableError()
+                    if job_row["outcome"] == "cancelled":
+                        await connection.commit()
+                        return _cancelled_job_from_row(job_row)
+                    if job_row["outcome"] in {"succeeded", "failed"}:
+                        raise TranscriptionJobAlreadyFinishedError()
+                    raise TranscriptionJobStoreUnavailableError()
+                except TranscriptionJobAlreadyFinishedError:
+                    await connection.rollback()
+                    raise
+                except TranscriptionJobStoreUnavailableError:
+                    await connection.rollback()
+                    raise
+                except SQLAlchemyError as exc:
+                    try:
+                        await connection.rollback()
+                    except SQLAlchemyError as rollback_exc:
+                        raise TranscriptionJobStoreUnavailableError() from rollback_exc
+                    raise TranscriptionJobStoreUnavailableError() from exc
+        except TranscriptionJobAlreadyFinishedError:
+            raise
+        except TranscriptionJobStoreUnavailableError:
+            raise
+        except (OSError, SQLAlchemyError) as exc:
+            raise TranscriptionJobStoreUnavailableError() from exc
+
+    async def publish_cancelled(self, internal_id: int) -> bool:
+        """Publish cancellation after active provider work has cleaned up.
+
+        Args:
+            internal_id: Private identifier held only by the claiming consumer.
+
+        Returns:
+            ``True`` when cancellation committed the terminal outcome, otherwise
+            ``False`` when another terminal transition owns the job.
+
+        Raises:
+            TranscriptionJobStoreUnavailableError: If SQLite cannot publish safely.
+        """
+        try:
+            async with self._engine.connect() as connection:
+                try:
+                    await connection.execute(text("BEGIN IMMEDIATE"))
+                    finished_at = _as_utc(self._clock())
+                    transition = await connection.execute(
+                        update(transcription_job)
+                        .where(
+                            transcription_job.c.id == internal_id,
+                            transcription_job.c.status == "processing",
+                            transcription_job.c.cancellation_requested.is_(True),
+                        )
+                        .values(
+                            status="finished",
+                            outcome="cancelled",
+                            finished_at=finished_at,
+                        )
+                    )
+                    if transition.rowcount != 1:
+                        await connection.rollback()
+                        return False
+                    await connection.commit()
+                except TranscriptionJobStoreUnavailableError:
+                    await connection.rollback()
+                    raise
+                except SQLAlchemyError as exc:
+                    try:
+                        await connection.rollback()
+                    except SQLAlchemyError as rollback_exc:
+                        raise TranscriptionJobStoreUnavailableError() from rollback_exc
+                    raise TranscriptionJobStoreUnavailableError() from exc
+        except TranscriptionJobStoreUnavailableError:
+            raise
+        except (OSError, SQLAlchemyError) as exc:
+            raise TranscriptionJobStoreUnavailableError() from exc
+        return True
+
     async def publish_success(
         self,
         internal_id: int,
@@ -582,8 +770,8 @@ class SqliteTranscriptionJobRepository:
             public_id: Canonical UUIDv4 capability supplied by the coordinator.
 
         Returns:
-            Safe queued, processing, successful, or failed snapshot, or ``None`` when
-            unknown.
+            Safe queued, processing, successful, failed, or cancelled snapshot, or
+            ``None`` when unknown.
         Raises:
             TranscriptionJobStoreUnavailableError: If SQLite cannot read safely.
         """
@@ -612,6 +800,8 @@ class SqliteTranscriptionJobRepository:
                     raise TranscriptionJobStoreUnavailableError()
                 if job_row["outcome"] == "failed":
                     return _failed_job_from_row(job_row)
+                if job_row["outcome"] == "cancelled":
+                    return _cancelled_job_from_row(job_row)
                 if job_row["outcome"] != "succeeded":
                     raise TranscriptionJobStoreUnavailableError()
                 internal_id = _internal_id_from_row(job_row)
@@ -797,6 +987,37 @@ def _failed_job_from_row(row: RowMapping) -> FailedTranscriptionJob:
         finished_at=_datetime_from_row(row, "finished_at"),
         error_code=error.code,
         error_message=error.message,
+    )
+
+
+def _cancelled_job_from_row(row: RowMapping) -> CancelledTranscriptionJob:
+    """Translate a cancelled terminal row and enforce its legal origins."""
+    if (
+        row["status"] != "finished"
+        or row["outcome"] != "cancelled"
+        or row["error_code"] is not None
+        or row["error_message"] is not None
+    ):
+        raise TranscriptionJobStoreUnavailableError()
+
+    cancellation_requested = row["cancellation_requested"]
+    started_at_value = row["started_at"]
+    if started_at_value is None:
+        if cancellation_requested is not False:
+            raise TranscriptionJobStoreUnavailableError()
+        started_at = None
+    else:
+        if cancellation_requested is not True:
+            raise TranscriptionJobStoreUnavailableError()
+        started_at = _datetime_from_row(row, "started_at")
+
+    return CancelledTranscriptionJob(
+        public_id=_public_id_from_row(row),
+        status=JobStatus.FINISHED,
+        outcome=JobOutcome.CANCELLED,
+        submitted_at=_datetime_from_row(row, "submitted_at"),
+        started_at=started_at,
+        finished_at=_datetime_from_row(row, "finished_at"),
     )
 
 

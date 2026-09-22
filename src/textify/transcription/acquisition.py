@@ -26,6 +26,7 @@ from textify.transcription.config import TranscriptionConfig
 from textify.transcription.exceptions import (
     AudioDownloadFailedError,
     AudioDownloadTimeoutError,
+    TranscriptionCancellationRequestedError,
     TranscriptionFailedError,
     TranscriptionTimeoutError,
     UnsupportedMediaError,
@@ -630,15 +631,18 @@ class TranscriptionOwnership:
         self,
         prepared_audio: PreparedAudio | None,
         cancellation_event: threading.Event,
+        cleanup_complete: asyncio.Event,
     ) -> None:
         """Initialize caller-scoped ownership before native work can begin.
 
         Args:
             prepared_audio: Inspection-stage media this ownership must clean.
             cancellation_event: Cooperative signal shared with provider work.
+            cleanup_complete: Signal set after all owned media and native work release.
         """
         self._prepared_audio = prepared_audio
         self._cancellation_event = cancellation_event
+        self._cleanup_complete = cleanup_complete
         self._native_retained = False
         self._caller_finished = False
         self._native_completed = False
@@ -679,6 +683,7 @@ class TranscriptionOwnership:
         self._released = True
         if self._prepared_audio is not None:
             self._prepared_audio.cleanup()
+        self._cleanup_complete.set()
 
 
 async def _finish_cancelled_download(worker: asyncio.Task[Path]) -> None:
@@ -710,6 +715,16 @@ async def _finish_cancelled_download(worker: asyncio.Task[Path]) -> None:
                 "code": "audio_download_cleanup_failed",
             },
         )
+
+
+async def _cancel_and_await(task: asyncio.Task[bool]) -> bool:
+    """Cancel one task if needed and report whether it completed successfully."""
+    if not task.done():
+        task.cancel()
+    try:
+        return await task
+    except asyncio.CancelledError:
+        return False
 
 
 def _validate_audio_path(
@@ -918,6 +933,7 @@ class WhisperAcquirer:
         source_url: str,
         ownership: TranscriptionOwnership,
         *,
+        cancellation_requested: asyncio.Event,
         include_segments: bool = True,
     ) -> Transcript:
         """Acquire source audio and transcribe it under the native permit.
@@ -926,6 +942,7 @@ class WhisperAcquirer:
             source_url: Validated provider URL for yt-dlp.
             ownership: Execution ownership retained when native work outlives the
                 coordinator task.
+            cancellation_requested: Durable cancellation signal from the coordinator.
             include_segments: Whether to retain normalized timed segments.
 
         Returns:
@@ -934,6 +951,8 @@ class WhisperAcquirer:
         Raises:
             AudioDownloadFailedError: If the audio download is unusable.
             AudioDownloadTimeoutError: If the audio download times out.
+            TranscriptionCancellationRequestedError: If cancellation wins before
+                native inference begins.
             TranscriptionFailedError: If native inference is unusable.
             TranscriptionTimeoutError: If native inference does not respond in time.
         """
@@ -946,9 +965,42 @@ class WhisperAcquirer:
                 ownership.prepared_audio,
                 cancellation_event,
             )
+            if cancellation_requested.is_set():
+                raise TranscriptionCancellationRequestedError()
+
+            permit_acquisition = asyncio.create_task(
+                self._inference_semaphore.acquire(),
+                name="native-inference-permit",
+            )
+            cancellation_waiter = asyncio.create_task(
+                cancellation_requested.wait(),
+                name="native-cancellation-wait",
+            )
             try:
-                await self._inference_semaphore.acquire()
-                inference_permit_acquired = True
+                done, _ = await asyncio.wait(
+                    (permit_acquisition, cancellation_waiter),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            except asyncio.CancelledError:
+                permit_acquired = await _cancel_and_await(permit_acquisition)
+                await _cancel_and_await(cancellation_waiter)
+                if permit_acquired:
+                    self._inference_semaphore.release()
+                raise
+
+            if cancellation_waiter in done:
+                permit_acquired = await _cancel_and_await(permit_acquisition)
+                if permit_acquired:
+                    self._inference_semaphore.release()
+                raise TranscriptionCancellationRequestedError()
+
+            await permit_acquisition
+            inference_permit_acquired = True
+            await _cancel_and_await(cancellation_waiter)
+            if cancellation_requested.is_set():
+                raise TranscriptionCancellationRequestedError()
+
+            try:
                 worker = asyncio.create_task(
                     asyncio.to_thread(
                         _transcribe_audio,
@@ -991,10 +1043,16 @@ class WhisperAcquirer:
                 if inference_permit_acquired:
                     self._inference_semaphore.release()
         except MediaByteLimitExceeded as exc:
+            if cancellation_requested.is_set():
+                raise TranscriptionCancellationRequestedError() from exc
             raise UnsupportedMediaError() from exc
         except _AudioDownloadProviderTimeout as exc:
+            if cancellation_requested.is_set():
+                raise TranscriptionCancellationRequestedError() from exc
             raise AudioDownloadTimeoutError() from exc
         except _AudioDownloadProviderFailure as exc:
+            if cancellation_requested.is_set():
+                raise TranscriptionCancellationRequestedError() from exc
             raise AudioDownloadFailedError() from exc
         finally:
             if request_directory is not None:

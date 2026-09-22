@@ -4,32 +4,42 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import threading
 from datetime import UTC, datetime
 from uuid import UUID
 
 from textify.errors import InternalError
 from textify.jobs.exceptions import (
+    JobAlreadyFinishedError,
     JobNotFoundError,
     JobStoreUnavailableError,
     TranscriptionCapacityExceededError,
 )
 from textify.jobs.repository import (
     SqliteTranscriptionJobRepository,
+    TranscriptionJobAlreadyFinishedError,
     TranscriptionJobCapacityError,
     TranscriptionJobStoreUnavailableError,
 )
 from textify.jobs.types import (
+    CancelledTranscriptionJob,
     ClaimedTranscriptionJob,
     NewQueuedTranscriptionJob,
+    ProcessingCancellation,
+    ProcessingTranscriptionJob,
     QueuedTranscriptionJob,
     TranscriptionJob,
 )
 from textify.logging import bind_request_log_fields
 from textify.transcription import inspection
-from textify.transcription.exceptions import TranscriptionError
+from textify.transcription.exceptions import (
+    TranscriptionCancellationRequestedError,
+    TranscriptionError,
+)
 from textify.transcription.schemas import build_transcription_response
-from textify.transcription.service import TranscriptionExecutor
+from textify.transcription.service import (
+    TranscriptionExecutionControl,
+    TranscriptionExecutor,
+)
 from textify.transcription.types import ResponseFieldPath
 
 logger = logging.getLogger(__name__)
@@ -67,7 +77,8 @@ class TranscriptionJobCoordinator:
         self._executor = executor
         self._worker_count = worker_count
         self._work_available = asyncio.Event()
-        self._claim_lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
+        self._active_executions: dict[int, TranscriptionExecutionControl] = {}
         self._consumer_tasks: tuple[asyncio.Task[None], ...] = ()
         self._started = False
         self._stopping = False
@@ -96,7 +107,7 @@ class TranscriptionJobCoordinator:
         if self._shutdown_started:
             return
         self._shutdown_started = True
-        async with self._claim_lock:
+        async with self._lifecycle_lock:
             self._stopping = True
         self._work_available.set()
         try:
@@ -162,6 +173,42 @@ class TranscriptionJobCoordinator:
             raise JobNotFoundError()
         return job
 
+    async def cancel(
+        self,
+        capability: str,
+    ) -> ProcessingTranscriptionJob | CancelledTranscriptionJob:
+        """Accept cancellation through one canonical Transcription Job capability.
+
+        Args:
+            capability: Opaque client-supplied bearer capability path value.
+
+        Returns:
+            Current processing snapshot after durable acceptance, or the stable
+            cancelled terminal snapshot.
+
+        Raises:
+            JobNotFoundError: If the capability is malformed, noncanonical, or unknown.
+            JobAlreadyFinishedError: If the job has a non-cancelled terminal outcome.
+            JobStoreUnavailableError: If durable cancellation cannot commit safely.
+        """
+        public_id = _parse_capability(capability)
+        async with self._lifecycle_lock:
+            try:
+                cancellation = await self._repository.request_cancellation(public_id)
+            except TranscriptionJobAlreadyFinishedError as exc:
+                raise JobAlreadyFinishedError() from exc
+            except TranscriptionJobStoreUnavailableError as exc:
+                raise JobStoreUnavailableError() from exc
+
+            if cancellation is None:
+                raise JobNotFoundError()
+            if isinstance(cancellation, ProcessingCancellation):
+                control = self._active_executions.get(cancellation.internal_id)
+                if control is not None:
+                    control.request_cancellation()
+                return cancellation.job
+            return cancellation
+
     async def _consume_jobs(self) -> None:
         """Wait for committed work, then drain eligible jobs with bounded wakes."""
         try:
@@ -187,48 +234,135 @@ class TranscriptionJobCoordinator:
         self._work_available.clear()
 
     async def _claim_next(self) -> ClaimedTranscriptionJob | None:
-        """Return one new claim unless consumer shutdown has started."""
-        async with self._claim_lock:
+        """Claim one job and register its process-local execution control."""
+        async with self._lifecycle_lock:
             if self._stopping:
                 return None
-            return await self._repository.claim_next()
+            claimed_job = await self._repository.claim_next()
+            if claimed_job is not None:
+                self._active_executions[claimed_job.internal_id] = (
+                    TranscriptionExecutionControl()
+                )
+            return claimed_job
 
     async def _execute_claimed_job(self, claimed_job: ClaimedTranscriptionJob) -> None:
         """Execute and publish one durable claim without retaining private inputs."""
-        cancellation_event = threading.Event()
+        async with self._lifecycle_lock:
+            control = self._active_executions.get(claimed_job.internal_id)
+        if control is None:
+            raise RuntimeError("Claimed Transcription Job has no execution control.")
+
         try:
             submitted = inspection.classify_submitted_url(claimed_job.submitted_url)
             result = await self._executor.execute(
                 submitted,
-                cancellation_event=cancellation_event,
+                control=control,
                 include_segments="transcript.segments" not in claimed_job.exclusions,
             )
-            projected_result = build_transcription_response(
-                result,
-                frozenset(claimed_job.exclusions),
-            )
+        except TranscriptionCancellationRequestedError:
+            await self._publish_cancelled_after_cleanup(claimed_job, control)
         except TranscriptionError as error:
+            if control.cancellation_requested.is_set():
+                await self._publish_cancelled_after_cleanup(claimed_job, control)
+                return
             logger.error("transcription job worker failed", extra={"code": error.code})
-            await self._repository.publish_failure(
-                claimed_job.internal_id,
+            await self._publish_failure_or_cancelled(
+                claimed_job,
+                control,
                 error.code,
                 error.message,
             )
         except Exception:  # noqa: BLE001
+            if control.cancellation_requested.is_set():
+                await self._publish_cancelled_after_cleanup(claimed_job, control)
+                return
             logger.error(
                 "transcription job worker failed",
                 extra={"code": InternalError.code},
             )
-            await self._repository.publish_failure(
-                claimed_job.internal_id,
+            await self._publish_failure_or_cancelled(
+                claimed_job,
+                control,
                 InternalError.code,
                 InternalError.message,
             )
         else:
-            await self._repository.publish_success(
+            if control.cancellation_requested.is_set():
+                await self._publish_cancelled_after_cleanup(claimed_job, control)
+                return
+            try:
+                projected_result = build_transcription_response(
+                    result,
+                    frozenset(claimed_job.exclusions),
+                )
+            except Exception:  # noqa: BLE001
+                if control.cancellation_requested.is_set():
+                    await self._publish_cancelled_after_cleanup(claimed_job, control)
+                    return
+                logger.error(
+                    "transcription job worker failed",
+                    extra={"code": InternalError.code},
+                )
+                await self._publish_failure_or_cancelled(
+                    claimed_job,
+                    control,
+                    InternalError.code,
+                    InternalError.message,
+                )
+                return
+            published = await self._repository.publish_success(
                 claimed_job.internal_id,
                 projected_result,
             )
+            if not published:
+                await self._publish_cancelled_after_cleanup(claimed_job, control)
+        finally:
+            asyncio.create_task(
+                self._remove_active_execution_after_cleanup(
+                    claimed_job.internal_id,
+                    control,
+                ),
+                name=f"transcription-job-cleanup-{claimed_job.internal_id}",
+            )
+
+    async def _publish_failure_or_cancelled(
+        self,
+        claimed_job: ClaimedTranscriptionJob,
+        control: TranscriptionExecutionControl,
+        error_code: str,
+        error_message: str,
+    ) -> None:
+        """Publish failure unless accepted cancellation wins its race."""
+        if control.cancellation_requested.is_set():
+            await self._publish_cancelled_after_cleanup(claimed_job, control)
+            return
+        published = await self._repository.publish_failure(
+            claimed_job.internal_id,
+            error_code,
+            error_message,
+        )
+        if not published:
+            await self._publish_cancelled_after_cleanup(claimed_job, control)
+
+    async def _publish_cancelled_after_cleanup(
+        self,
+        claimed_job: ClaimedTranscriptionJob,
+        control: TranscriptionExecutionControl,
+    ) -> None:
+        """Publish accepted cancellation only after provider ownership is released."""
+        await control.cleanup_complete.wait()
+        await self._repository.publish_cancelled(claimed_job.internal_id)
+
+    async def _remove_active_execution_after_cleanup(
+        self,
+        internal_id: int,
+        control: TranscriptionExecutionControl,
+    ) -> None:
+        """Remove an execution control only after provider cleanup completes."""
+        await control.cleanup_complete.wait()
+        async with self._lifecycle_lock:
+            if self._active_executions.get(internal_id) is control:
+                self._active_executions.pop(internal_id)
 
 
 def _parse_capability(capability: str) -> UUID:

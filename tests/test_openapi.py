@@ -31,16 +31,23 @@ async def test_openapi_describes_job_only_transcription_contract() -> None:
         "/health",
         "/api/transcription-jobs",
         "/api/transcription-jobs/{job_id}",
+        "/api/transcription-jobs/{job_id}/cancellation",
     }
     assert set(document["paths"]["/health"]) == {"get"}
     assert set(document["paths"]["/api/transcription-jobs"]) == {"post"}
     assert set(document["paths"]["/api/transcription-jobs/{job_id}"]) == {"get"}
+    assert set(document["paths"]["/api/transcription-jobs/{job_id}/cancellation"]) == {
+        "put"
+    }
     assert "synchronous" not in document["info"]["description"].casefold()
 
     components = document["components"]["schemas"]
     health_operation = document["paths"]["/health"]["get"]
     submission_operation = document["paths"]["/api/transcription-jobs"]["post"]
     status_operation = document["paths"]["/api/transcription-jobs/{job_id}"]["get"]
+    cancellation_operation = document["paths"][
+        "/api/transcription-jobs/{job_id}/cancellation"
+    ]["put"]
 
     assert health_operation["responses"]["200"]["content"]["application/json"][
         "schema"
@@ -61,6 +68,13 @@ async def test_openapi_describes_job_only_transcription_contract() -> None:
         "$ref": "#/components/schemas/QueuedTranscriptionJobResponse"
     }
     assert status_schema == {"$ref": "#/components/schemas/TranscriptionJobResponse"}
+    assert "requestBody" not in cancellation_operation
+    assert cancellation_operation["responses"]["200"]["content"]["application/json"][
+        "schema"
+    ] == {"$ref": "#/components/schemas/TranscriptionJobResponse"}
+    assert cancellation_operation["responses"]["202"]["content"]["application/json"][
+        "schema"
+    ] == {"$ref": "#/components/schemas/TranscriptionJobResponse"}
 
     request_component = components["TranscriptRequest"]
     assert "exclude" not in request_component["required"]
@@ -73,6 +87,7 @@ async def test_openapi_describes_job_only_transcription_contract() -> None:
     processing_component = components["ProcessingTranscriptionJobResponse"]
     succeeded_component = components["SucceededTranscriptionJobResponse"]
     failed_component = components["FailedTranscriptionJobResponse"]
+    cancelled_component = components["CancelledTranscriptionJobResponse"]
     assert queued_component["required"] == ["id", "status", "submitted_at", "links"]
     assert queued_component["properties"]["id"]["format"] == "uuid4"
     assert queued_component["properties"]["status"]["const"] == "queued"
@@ -137,28 +152,71 @@ async def test_openapi_describes_job_only_transcription_contract() -> None:
     }
     assert "result" not in failed_component["properties"]
 
+    assert cancelled_component["required"] == [
+        "id",
+        "status",
+        "outcome",
+        "submitted_at",
+        "started_at",
+        "finished_at",
+        "links",
+    ]
+    assert cancelled_component["properties"]["status"]["const"] == "finished"
+    assert cancelled_component["properties"]["outcome"]["const"] == "cancelled"
+    assert cancelled_component["properties"]["started_at"]["anyOf"] == [
+        {"type": "string", "format": "date-time"},
+        {"type": "null"},
+    ]
+    assert cancelled_component["properties"]["links"] == {
+        "$ref": "#/components/schemas/FinishedTranscriptionJobLinks"
+    }
+    assert "result" not in cancelled_component["properties"]
+    assert "error" not in cancelled_component["properties"]
+
     assert components["TranscriptionJobResponse"] == {
         "anyOf": [
             {"$ref": "#/components/schemas/QueuedTranscriptionJobResponse"},
             {"$ref": "#/components/schemas/ProcessingTranscriptionJobResponse"},
             {"$ref": "#/components/schemas/SucceededTranscriptionJobResponse"},
             {"$ref": "#/components/schemas/FailedTranscriptionJobResponse"},
+            {"$ref": "#/components/schemas/CancelledTranscriptionJobResponse"},
         ]
     }
     assert components["ActiveTranscriptionJobLinks"]["required"] == ["self", "cancel"]
     assert components["FinishedTranscriptionJobLinks"]["required"] == ["self"]
     assert "queue_timeout" in components["ErrorDetail"]["properties"]["code"]["enum"]
+    assert (
+        "job_already_finished"
+        in components["ErrorDetail"]["properties"]["code"]["enum"]
+    )
 
     for header_name in ("Location", "Retry-After", "Cache-Control"):
         assert header_name in submission_operation["responses"]["202"]["headers"]
     for header_name in ("Retry-After", "Cache-Control"):
         assert header_name in status_operation["responses"]["200"]["headers"]
+    for header_name in ("Cache-Control", "X-Request-ID"):
+        assert header_name in cancellation_operation["responses"]["200"]["headers"]
+    for header_name in ("Retry-After", "Cache-Control", "X-Request-ID"):
+        assert header_name in cancellation_operation["responses"]["202"]["headers"]
 
     assert set(submission_operation["responses"]) >= {"202", "400", "422", "500", "503"}
     assert set(status_operation["responses"]) >= {"200", "404", "500", "503"}
+    assert set(cancellation_operation["responses"]) >= {
+        "200",
+        "202",
+        "404",
+        "409",
+        "422",
+        "500",
+        "503",
+    }
     assert submission_operation["responses"]["400"]["content"]["application/json"][
         "schema"
     ] == {"$ref": "#/components/schemas/ErrorResponse"}
     assert status_operation["responses"]["404"]["content"]["application/json"][
         "schema"
     ] == {"$ref": "#/components/schemas/ErrorResponse"}
+    for status_code in ("404", "409", "422", "500", "503"):
+        assert cancellation_operation["responses"][status_code]["content"][
+            "application/json"
+        ]["schema"] == {"$ref": "#/components/schemas/ErrorResponse"}
