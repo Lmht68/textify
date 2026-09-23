@@ -3,6 +3,9 @@
 import asyncio
 import math
 import os
+from datetime import UTC, datetime
+from urllib.parse import urlsplit
+from uuid import UUID
 
 import pytest
 from httpx import AsyncClient, Response, Timeout
@@ -32,15 +35,183 @@ pytestmark = [
 ]
 
 
+def _mapping(value: object) -> dict[str, object]:
+    """Return a JSON object after asserting its structural contract."""
+    assert isinstance(value, dict)
+    assert all(isinstance(key, str) for key in value)
+    return value
+
+
+def _parse_utc_timestamp(value: object) -> datetime:
+    """Return one required RFC 3339 UTC timestamp."""
+    assert isinstance(value, str)
+    parsed_timestamp = datetime.fromisoformat(value)
+    assert parsed_timestamp.tzinfo is not None
+    assert parsed_timestamp.utcoffset() == UTC.utcoffset(parsed_timestamp)
+    return parsed_timestamp
+
+
+def _assert_canonical_job_id(value: object) -> str:
+    """Assert that a public job identifier is a canonical lowercase UUIDv4."""
+    assert isinstance(value, str)
+    parsed_job_id = UUID(value)
+    assert parsed_job_id.version == 4
+    assert str(parsed_job_id) == value
+    return value
+
+
+def _assert_relative_capability_link(link: object, expected_path: str) -> None:
+    """Assert that a capability link is same-origin, relative, and canonical."""
+    assert isinstance(link, str)
+    parsed_link = urlsplit(link)
+    assert parsed_link.scheme == ""
+    assert parsed_link.netloc == ""
+    assert parsed_link.query == ""
+    assert parsed_link.fragment == ""
+    assert parsed_link.path == expected_path
+
+
+def _assert_active_job(
+    payload: dict[str, object],
+    location: str,
+    expected_job_id: str | None = None,
+) -> str:
+    """Assert the queued or processing representation and its active links."""
+    job_id = _assert_canonical_job_id(payload["id"])
+    if expected_job_id is not None:
+        assert job_id == expected_job_id
+    _assert_relative_capability_link(location, f"/api/transcription-jobs/{job_id}")
+    links = _mapping(payload["links"])
+    assert set(links) == {"self", "cancel"}
+    assert links["self"] == location
+    _assert_relative_capability_link(links["self"], location)
+    _assert_relative_capability_link(links["cancel"], f"{location}/cancellation")
+    submitted_at = _parse_utc_timestamp(payload["submitted_at"])
+
+    status = payload["status"]
+    assert status in {"queued", "processing"}
+    if status == "queued":
+        assert set(payload) == {"id", "status", "submitted_at", "links"}
+        return job_id
+
+    assert set(payload) == {
+        "id",
+        "status",
+        "submitted_at",
+        "started_at",
+        "cancellation_requested",
+        "links",
+    }
+    started_at = _parse_utc_timestamp(payload["started_at"])
+    assert submitted_at <= started_at
+    assert isinstance(payload["cancellation_requested"], bool)
+    return job_id
+
+
+def _assert_succeeded_job(
+    payload: dict[str, object],
+    location: str,
+    expected_job_id: str,
+) -> dict[str, object]:
+    """Assert a terminal successful representation and return its result."""
+    assert set(payload) == {
+        "id",
+        "status",
+        "outcome",
+        "submitted_at",
+        "started_at",
+        "finished_at",
+        "result",
+        "links",
+    }
+    assert _assert_canonical_job_id(payload["id"]) == expected_job_id
+    assert payload["status"] == "finished"
+    assert payload["outcome"] == "succeeded"
+    submitted_at = _parse_utc_timestamp(payload["submitted_at"])
+    started_at = _parse_utc_timestamp(payload["started_at"])
+    finished_at = _parse_utc_timestamp(payload["finished_at"])
+    assert submitted_at <= started_at <= finished_at
+    links = _mapping(payload["links"])
+    assert set(links) == {"self"}
+    assert links["self"] == location
+    _assert_relative_capability_link(links["self"], location)
+    return _mapping(payload["result"])
+
+
+def _assert_transcription_response(
+    result: dict[str, object],
+    expected_platform: str,
+) -> None:
+    """Assert the full successful projected transcript response contract."""
+    assert set(result) == {"source", "transcript"}
+    source = _mapping(result["source"])
+    transcript = _mapping(result["transcript"])
+    assert set(source) == {
+        "platform",
+        "video_id",
+        "url",
+        "title",
+        "description",
+        "channel",
+        "duration_seconds",
+    }
+    assert set(transcript) == {"method", "language", "text", "segments"}
+
+    assert source["platform"] == expected_platform
+    for field_name in ("title", "description", "channel"):
+        assert isinstance(source[field_name], str)
+    assert isinstance(source["video_id"], str)
+    assert source["video_id"]
+    assert isinstance(source["url"], str)
+    canonical_url = urlsplit(source["url"])
+    assert canonical_url.scheme == "https"
+    assert canonical_url.netloc
+    assert isinstance(source["duration_seconds"], int)
+    assert not isinstance(source["duration_seconds"], bool)
+    assert 0 < source["duration_seconds"] <= 1800
+
+    assert transcript["method"] in {"youtube_captions", "faster_whisper"}
+    assert isinstance(transcript["language"], str)
+    assert transcript["language"]
+    assert isinstance(transcript["text"], str)
+    segments = transcript["segments"]
+    assert isinstance(segments, list)
+    segment_texts: list[str] = []
+
+    previous_start = 0.0
+    for segment in segments:
+        normalized_segment = _mapping(segment)
+        assert set(normalized_segment) == {"start", "end", "text"}
+        start = normalized_segment["start"]
+        end = normalized_segment["end"]
+        text = normalized_segment["text"]
+        assert isinstance(start, (int, float))
+        assert not isinstance(start, bool)
+        assert isinstance(end, (int, float))
+        assert not isinstance(end, bool)
+        assert isinstance(text, str)
+        assert text == " ".join(text.split())
+        assert text
+        segment_texts.append(text)
+        assert math.isfinite(start)
+        assert math.isfinite(end)
+        assert start >= previous_start >= 0.0
+        assert end >= start
+        previous_start = start
+    assert transcript["text"] == " ".join(segment_texts)
+
+
 async def _poll_until_succeeded(
     client: AsyncClient,
     location: str,
+    job_id: str,
 ) -> Response:
     """Poll a job capability until it reaches the successful terminal state.
 
     Args:
         client: Connected live API client.
         location: Relative job capability URL returned at submission.
+        job_id: Canonical public capability identifier returned at submission.
 
     Returns:
         The terminal successful polling response.
@@ -53,16 +224,18 @@ async def _poll_until_succeeded(
         assert response.status_code == 200
         assert response.headers.get("X-Request-ID")
         assert response.headers["Cache-Control"] == "no-store"
-        payload = response.json()
+        payload = _mapping(response.json())
         if payload["status"] in {"queued", "processing"}:
+            _assert_active_job(payload, location, job_id)
             retry_after = response.headers["Retry-After"]
             assert retry_after.isdecimal()
+            assert int(retry_after) > 0
             await asyncio.sleep(int(retry_after))
             continue
 
-        assert payload["status"] == "finished"
-        assert payload["outcome"] == "succeeded"
+        result = _assert_succeeded_job(payload, location, job_id)
         assert "Retry-After" not in response.headers
+        assert result
         return response
 
     raise AssertionError(
@@ -92,33 +265,9 @@ async def test_configured_public_videos_match_transcription_job_contract() -> No
             assert submission.headers["Cache-Control"] == "no-store"
             assert submission.headers["Retry-After"] == "2"
             location = submission.headers["Location"]
-            assert submission.json()["links"]["self"] == location
+            submission_payload = _mapping(submission.json())
+            job_id = _assert_active_job(submission_payload, location)
 
-            response = await _poll_until_succeeded(client, location)
-            result = response.json()["result"]
-            source = result["source"]
-            transcript = result["transcript"]
-            segments = transcript["segments"]
-
-            assert source["platform"] == expected_platform
-            assert isinstance(source["duration_seconds"], int)
-            assert not isinstance(source["duration_seconds"], bool)
-            assert 0 < source["duration_seconds"] <= 1800
-            assert transcript["method"] in {"youtube_captions", "faster_whisper"}
-            assert transcript["text"] == " ".join(
-                segment["text"] for segment in segments
-            )
-
-            previous_start = 0.0
-            for segment in segments:
-                start = segment["start"]
-                end = segment["end"]
-                assert isinstance(start, (int, float))
-                assert not isinstance(start, bool)
-                assert isinstance(end, (int, float))
-                assert not isinstance(end, bool)
-                assert math.isfinite(start)
-                assert math.isfinite(end)
-                assert start >= previous_start >= 0.0
-                assert end >= start
-                previous_start = start
+            response = await _poll_until_succeeded(client, location, job_id)
+            result = _assert_succeeded_job(_mapping(response.json()), location, job_id)
+            _assert_transcription_response(result, expected_platform)

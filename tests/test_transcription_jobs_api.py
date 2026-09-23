@@ -1243,45 +1243,124 @@ async def test_api_rolls_back_result_when_terminal_transition_is_aborted(
     migrated_database_path: Path,
     tmp_path: Path,
 ) -> None:
-    """Never expose success when result insertion and terminal transition cannot commit."""
-    with sqlite3.connect(migrated_database_path) as connection:
-        connection.executescript(
-            """
-            CREATE TRIGGER transcription_job_finish_abort
-            BEFORE UPDATE OF status ON transcription_job
-            WHEN OLD.status = 'processing' AND NEW.status = 'finished'
-            BEGIN
-                SELECT RAISE(ABORT, 'blocked finish');
-            END;
-            """
-        )
-    state = ControlledAdapterState(block_metadata=True)
-    application = _application(
-        migrated_database_path, tmp_path / "media", ControlledAdaptersFactory(state)
+    """Fail closed, preserve work, and recover without retrying interrupted jobs."""
+    processing_url = f"{TIKTOK_URL}?terminal-rollback=processing"
+    queued_url = f"{TIKTOK_URL}?terminal-rollback=queued"
+    rejected_url = f"{TIKTOK_URL}?terminal-rollback=rejected"
+    first_state = ControlledAdapterState(block_metadata=True)
+    first_application = _application(
+        migrated_database_path,
+        tmp_path / "first-media",
+        ControlledAdaptersFactory(first_state),
     )
-    async with application.router.lifespan_context(application):
-        transport = ASGITransport(app=application)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
-            accepted = await client.post(
-                "/api/transcription-jobs", json={"url": TIKTOK_URL}
-            )
-            location = _assert_submission(accepted)["links"]["self"]
-            await _wait_for_thread_event(state.metadata_entered)
-            state.metadata_release.set()
-            await _wait_for_thread_event(state.native_completed)
-            await asyncio.sleep(0.05)
-            processing = await client.get(location)
-            _assert_processing(processing, location)
 
-    with sqlite3.connect(migrated_database_path) as connection:
-        result_count = connection.execute(
-            "SELECT COUNT(*) FROM transcription_job_result"
-        ).fetchone()[0]
-        segment_count = connection.execute(
-            "SELECT COUNT(*) FROM transcription_job_segment"
-        ).fetchone()[0]
-    assert result_count == 0
-    assert segment_count == 0
+    try:
+        async with first_application.router.lifespan_context(first_application):
+            transport = ASGITransport(app=first_application)
+            async with AsyncClient(
+                transport=transport,
+                base_url="http://test",
+            ) as client:
+                processing_submission = _assert_submission(
+                    await client.post(
+                        "/api/transcription-jobs",
+                        json={"url": processing_url},
+                    )
+                )
+                processing_location = processing_submission["links"]["self"]
+                await _wait_for_thread_event(first_state.metadata_entered)
+                with sqlite3.connect(migrated_database_path) as connection:
+                    connection.executescript(
+                        """
+                        CREATE TRIGGER transcription_job_finish_abort
+                        BEFORE UPDATE OF status ON transcription_job
+                        WHEN OLD.status = 'processing'
+                            AND NEW.status = 'finished'
+                            AND NEW.outcome = 'succeeded'
+                            AND OLD.submitted_url LIKE '%terminal-rollback=processing'
+                        BEGIN
+                            SELECT RAISE(ABORT, 'blocked finish');
+                        END;
+                        """
+                    )
+                queued_submission = _assert_submission(
+                    await client.post(
+                        "/api/transcription-jobs",
+                        json={"url": queued_url},
+                    )
+                )
+                queued_location = queued_submission["links"]["self"]
+                first_state.metadata_release.set()
+                await _wait_for_thread_event(first_state.native_completed)
+                await _wait_until(
+                    lambda: first_application.state.ready is False,
+                    "Terminal persistence failure did not make the application unready.",
+                )
+
+                health_response = await client.get("/health")
+                assert health_response.status_code == 503
+                with sqlite3.connect(migrated_database_path) as connection:
+                    result_count = connection.execute(
+                        "SELECT COUNT(*) FROM transcription_job_result"
+                    ).fetchone()[0]
+                    segment_count = connection.execute(
+                        "SELECT COUNT(*) FROM transcription_job_segment"
+                    ).fetchone()[0]
+                    rows_before_rejection = connection.execute(
+                        "SELECT public_id, status FROM transcription_job ORDER BY id"
+                    ).fetchall()
+
+                rejected_submission = await client.post(
+                    "/api/transcription-jobs",
+                    json={"url": rejected_url},
+                )
+                _assert_safe_error(
+                    rejected_submission,
+                    503,
+                    "job_store_unavailable",
+                )
+
+                with sqlite3.connect(migrated_database_path) as connection:
+                    rows_after_rejection = connection.execute(
+                        "SELECT public_id, status FROM transcription_job ORDER BY id"
+                    ).fetchall()
+
+                assert result_count == 0
+                assert segment_count == 0
+                assert rows_before_rejection == [
+                    (processing_submission["id"], "processing"),
+                    (queued_submission["id"], "queued"),
+                ]
+                assert rows_after_rejection == rows_before_rejection
+    finally:
+        first_state.metadata_release.set()
+
+    recovered_state = ControlledAdapterState()
+    recovered_application = _application(
+        migrated_database_path,
+        tmp_path / "recovered-media",
+        ControlledAdaptersFactory(recovered_state),
+    )
+    async with recovered_application.router.lifespan_context(recovered_application):
+        transport = ASGITransport(app=recovered_application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            _assert_failed(
+                await client.get(processing_location),
+                processing_location,
+                "worker_interrupted",
+                started=True,
+            )
+            _assert_succeeded(
+                await _poll_until_finished(client, queued_location),
+                queued_location,
+            )
+
+    assert first_state.metadata_calls == [processing_url]
+    assert first_state.download_calls == [processing_url]
+    assert first_state.native_include_segments == [True]
+    assert recovered_state.metadata_calls == [queued_url]
+    assert recovered_state.download_calls == [queued_url]
+    assert recovered_state.native_include_segments == [True]
 
 
 async def test_api_completes_submission_after_response_delivery_disconnect(
@@ -3385,6 +3464,70 @@ async def test_api_periodically_deletes_expired_terminal_jobs_and_checkpoints_wa
         transcript_sentinel,
     ):
         assert sentinel not in output
+
+
+async def test_api_marks_unready_when_periodic_retention_cannot_commit(
+    migrated_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Fail closed when periodic terminal retention cannot delete durable rows."""
+    now = [datetime(2026, 8, 24, tzinfo=UTC)]
+    state = ControlledAdapterState()
+    application = _application(
+        migrated_database_path,
+        tmp_path / "media",
+        ControlledAdaptersFactory(state),
+        job_config=_job_config(
+            migrated_database_path,
+            job_retention_seconds=1,
+        ),
+        clock=lambda: now[0],
+        retention_cleanup_interval=timedelta(milliseconds=50),
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            terminal_submission = _assert_submission(
+                await client.post(
+                    "/api/transcription-jobs",
+                    json={"url": f"{TIKTOK_URL}?periodic-retention=failure"},
+                )
+            )
+            terminal_location = terminal_submission["links"]["self"]
+            terminal_payload = _assert_succeeded(
+                await _poll_until_finished(client, terminal_location),
+                terminal_location,
+            )
+            now[0] = datetime.fromisoformat(
+                cast(str, terminal_payload["finished_at"])
+            ) + timedelta(seconds=1)
+            with sqlite3.connect(migrated_database_path) as connection:
+                connection.executescript(
+                    """
+                    CREATE TRIGGER terminal_retention_abort
+                    BEFORE DELETE ON transcription_job
+                    WHEN OLD.status = 'finished'
+                    BEGIN
+                        SELECT RAISE(ABORT, 'blocked retention cleanup');
+                    END;
+                    """
+                )
+
+            await _wait_until(
+                lambda: application.state.ready is False,
+                "Periodic retention failure did not make the application unready.",
+            )
+            health_response = await client.get("/health")
+            assert health_response.status_code == 503
+            _assert_safe_error(
+                await client.post(
+                    "/api/transcription-jobs",
+                    json={"url": f"{TIKTOK_URL}?periodic-retention=rejected"},
+                ),
+                503,
+                "job_store_unavailable",
+            )
 
 
 def _terminal_job_rows_are_deleted(

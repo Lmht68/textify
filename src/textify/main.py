@@ -212,17 +212,21 @@ def create_app(
     Returns:
         Unstarted FastAPI application with startup-owned model lifecycle.
     """
-    resolved_app_config = app_config if app_config is not None else AppConfig()
-    resolved_transcription_config = (
-        transcription_config
-        if transcription_config is not None
-        else TranscriptionConfig()
-    )
-    resolved_job_config = job_config if job_config is not None else JobConfig()
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
         """Create process-lifetime state before accepting traffic."""
+        application.state.ready = False
+        resolved_app_config = app_config if app_config is not None else AppConfig()
+        resolved_transcription_config = (
+            transcription_config
+            if transcription_config is not None
+            else TranscriptionConfig()
+        )
+        resolved_job_config = (
+            job_config if job_config is not None else JobConfig()  # type: ignore[call-arg]
+        )
+
         configure_logging(resolved_app_config.log_level)
         _ensure_writable_temporary_media_root(
             resolved_transcription_config.temporary_media_root
@@ -232,10 +236,7 @@ def create_app(
             resolved_job_config.job_worker_count,
             available_bytes=available_temporary_media_bytes,
         )
-        database_path = resolved_job_config.database_path
-        if database_path is None:
-            raise RuntimeError("TEXTIFY_DATABASE_PATH must be configured.")
-        engine = create_application_engine(database_path)
+        engine = create_application_engine(resolved_job_config.database_path)
         try:
             await verify_application_database(engine)
             repository = SqliteTranscriptionJobRepository(
@@ -267,14 +268,20 @@ def create_app(
                 raise
             adapters = adapters_factory(resolved_transcription_config)
             executor = TranscriptionExecutor(adapters, resolved_transcription_config)
+
+            def mark_application_unready() -> None:
+                """Make readiness fail after a durable-store failure."""
+                application.state.ready = False
+
             coordinator = TranscriptionJobCoordinator(
                 repository,
                 executor,
                 resolved_job_config.job_worker_count,
                 retention_cleanup_interval,
+                on_store_unavailable=mark_application_unready,
             )
-            application.state.transcription_job_coordinator = coordinator
             await coordinator.start()
+            application.state.transcription_job_coordinator = coordinator
             application.state.ready = True
             try:
                 yield

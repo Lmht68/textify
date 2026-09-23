@@ -9,7 +9,14 @@ ENV UV_PYTHON=python3.12 \
     PATH=/opt/textify/.venv/bin:$PATH \
     HF_HOME=/var/cache/textify/huggingface \
     TEXTIFY_HOST=0.0.0.0 \
+    TEXTIFY_DATABASE_PATH=/var/lib/textify/textify.sqlite3 \
     TEXTIFY_TEMPORARY_MEDIA_ROOT=/var/lib/textify/media \
+    TEXTIFY_JOB_WORKER_COUNT=4 \
+    TEXTIFY_MAX_OUTSTANDING_JOBS=8 \
+    TEXTIFY_JOB_QUEUE_TIMEOUT_SECONDS=20 \
+    TEXTIFY_JOB_RETENTION_SECONDS=86400 \
+    TEXTIFY_TRANSCRIPTION_CONCURRENCY=2 \
+    TEXTIFY_MAX_MEDIA_BYTES=536870912 \
     TEXTIFY_WHISPER_MODEL=large-v3-turbo \
     TEXTIFY_WHISPER_REVISION=0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf \
     TEXTIFY_WHISPER_DEVICE=cuda \
@@ -21,7 +28,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 textify \
     && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin textify \
-    && mkdir --parents "$HF_HOME" /var/lib/textify/media \
+    && mkdir --parents "$HF_HOME" /var/lib/textify /var/lib/textify/media \
     && chown --recursive textify:textify "$HF_HOME" /var/lib/textify
 
 WORKDIR /opt/textify
@@ -30,9 +37,11 @@ COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 COPY src ./src
+COPY alembic.ini ./
+COPY migrations ./migrations
 RUN uv sync --frozen --no-dev --no-editable
 
-VOLUME ["/var/cache/textify/huggingface", "/var/lib/textify/media"]
+VOLUME ["/var/cache/textify/huggingface", "/var/lib/textify"]
 EXPOSE 8182
 USER 10001:10001
-CMD ["textify"]
+CMD ["sh", "-c", "alembic upgrade head && exec textify"]

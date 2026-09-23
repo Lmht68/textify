@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -95,6 +96,8 @@ class TranscriptionJobCoordinator:
         executor: TranscriptionExecutor,
         worker_count: int,
         retention_cleanup_interval: timedelta,
+        *,
+        on_store_unavailable: Callable[[], None],
     ) -> None:
         """Initialize application-owned Transcription Job consumers.
 
@@ -103,6 +106,7 @@ class TranscriptionJobCoordinator:
             executor: Process-lifetime provider execution boundary.
             worker_count: Number of consumer tasks to own for this application.
             retention_cleanup_interval: Delay between expired terminal-job cleanup runs.
+            on_store_unavailable: Synchronous readiness callback for one store failure.
 
         Raises:
             ValueError: If no consumer task is configured or cleanup is nonpositive.
@@ -115,6 +119,7 @@ class TranscriptionJobCoordinator:
         self._executor = executor
         self._worker_count = worker_count
         self._retention_cleanup_interval = retention_cleanup_interval
+        self._on_store_unavailable = on_store_unavailable
         self._work_available = asyncio.Event()
         self._retention_cleanup_stop = asyncio.Event()
         self._lifecycle_lock = asyncio.Lock()
@@ -122,31 +127,118 @@ class TranscriptionJobCoordinator:
         self._consumer_tasks: tuple[asyncio.Task[None], ...] = ()
         self._retention_cleanup_task: asyncio.Task[None] | None = None
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
+        self._store_available = True
         self._started = False
         self._stopping = False
         self._shutdown_started = False
 
+    async def _mark_store_unavailable(self) -> None:
+        """Trip the one-way durable-store failure latch and wake owned tasks."""
+        async with self._lifecycle_lock:
+            if not self._store_available:
+                return
+            self._store_available = False
+            self._retention_cleanup_stop.set()
+            self._work_available.set()
+        logger.error(
+            "transcription job store became unavailable",
+            extra={"code": JobStoreUnavailableError.code},
+        )
+        self._on_store_unavailable()
+
+    def _require_store_available(self) -> None:
+        """Raise when the caller holds the lifecycle lock after a store failure."""
+        if not self._store_available:
+            raise JobStoreUnavailableError()
+
     async def start(self) -> None:
-        """Start consumers and consider durable queued work immediately.
+        """Start every owned task before making durable admission available.
 
         Raises:
-            RuntimeError: If consumers have already started or shut down.
+            JobStoreUnavailableError: If a task detects unavailable durable storage.
+            RuntimeError: If consumers have already started, shut down, or fail to start.
         """
         if self._started or self._shutdown_started:
             raise RuntimeError("Transcription Job consumers cannot be started again.")
-        self._started = True
+
+        startup_signals: list[asyncio.Event] = []
+        consumer_tasks: list[asyncio.Task[None]] = []
+        retention_cleanup_task: asyncio.Task[None] | None = None
+        startup_succeeded = False
         self._work_available.set()
-        self._consumer_tasks = tuple(
-            asyncio.create_task(
-                self._consume_jobs(),
-                name=f"transcription-job-consumer-{worker_number}",
+        try:
+            for worker_number in range(1, self._worker_count + 1):
+                startup_signal = asyncio.Event()
+                startup_signals.append(startup_signal)
+                consumer_coroutine = self._consume_jobs(startup_signal)
+                try:
+                    consumer_task = asyncio.create_task(
+                        consumer_coroutine,
+                        name=f"transcription-job-consumer-{worker_number}",
+                    )
+                except RuntimeError:
+                    consumer_coroutine.close()
+                    raise
+                consumer_tasks.append(consumer_task)
+
+            retention_startup_signal = asyncio.Event()
+            startup_signals.append(retention_startup_signal)
+            retention_cleanup_coroutine = (
+                self._remove_expired_terminal_jobs_periodically(
+                    retention_startup_signal
+                )
             )
-            for worker_number in range(1, self._worker_count + 1)
-        )
-        self._retention_cleanup_task = asyncio.create_task(
-            self._remove_expired_terminal_jobs_periodically(),
-            name="transcription-job-retention-cleanup",
-        )
+            try:
+                retention_cleanup_task = asyncio.create_task(
+                    retention_cleanup_coroutine,
+                    name="transcription-job-retention-cleanup",
+                )
+            except RuntimeError:
+                retention_cleanup_coroutine.close()
+                raise
+
+            await asyncio.gather(*(signal.wait() for signal in startup_signals))
+            assert retention_cleanup_task is not None
+            await asyncio.sleep(0)
+            for task in (*consumer_tasks, retention_cleanup_task):
+                if task.cancelled():
+                    raise RuntimeError(
+                        "Transcription Job task was cancelled during startup."
+                    )
+                task_error = task.exception() if task.done() else None
+                if task_error is not None:
+                    raise task_error
+            if not self._store_available:
+                raise JobStoreUnavailableError()
+            self._consumer_tasks = tuple(consumer_tasks)
+            self._retention_cleanup_task = retention_cleanup_task
+            self._started = True
+            startup_succeeded = True
+        finally:
+            if not startup_succeeded:
+                startup_tasks = tuple(consumer_tasks)
+                if retention_cleanup_task is not None:
+                    startup_tasks += (retention_cleanup_task,)
+                await self._abort_startup(startup_tasks)
+
+    async def _abort_startup(
+        self,
+        startup_tasks: tuple[asyncio.Task[None], ...],
+    ) -> None:
+        """Cancel partially started tasks and release executor resources."""
+        async with self._lifecycle_lock:
+            self._shutdown_started = True
+            self._stopping = True
+            self._retention_cleanup_stop.set()
+        self._work_available.set()
+        for task in startup_tasks:
+            task.cancel()
+        if startup_tasks:
+            await asyncio.gather(*startup_tasks, return_exceptions=True)
+        try:
+            await self._executor.shutdown()
+        finally:
+            await self._await_cleanup_tasks()
 
     async def shutdown(self) -> None:
         """Stop admission and claiming before draining owned execution resources."""
@@ -206,12 +298,14 @@ class TranscriptionJobCoordinator:
         )
         try:
             async with self._lifecycle_lock:
+                self._require_store_available()
                 if not self._started or self._stopping:
                     raise TranscriptionCapacityExceededError()
                 queued_job = await self._repository.create_queued(new_job)
         except TranscriptionJobCapacityError as exc:
             raise TranscriptionCapacityExceededError() from exc
         except TranscriptionJobStoreUnavailableError as exc:
+            await self._mark_store_unavailable()
             raise JobStoreUnavailableError() from exc
         self._work_available.set()
         return queued_job
@@ -231,8 +325,11 @@ class TranscriptionJobCoordinator:
         """
         public_id = _parse_capability(capability)
         try:
-            job = await self._repository.get_job(public_id)
+            async with self._lifecycle_lock:
+                self._require_store_available()
+                job = await self._repository.get_job(public_id)
         except TranscriptionJobStoreUnavailableError as exc:
+            await self._mark_store_unavailable()
             raise JobStoreUnavailableError() from exc
         if job is None:
             raise JobNotFoundError()
@@ -257,25 +354,34 @@ class TranscriptionJobCoordinator:
             JobStoreUnavailableError: If durable cancellation cannot commit safely.
         """
         public_id = _parse_capability(capability)
-        async with self._lifecycle_lock:
-            try:
+        job: ProcessingTranscriptionJob | CancelledTranscriptionJob
+        try:
+            async with self._lifecycle_lock:
+                self._require_store_available()
                 cancellation = await self._repository.request_cancellation(public_id)
-            except TranscriptionJobAlreadyFinishedError as exc:
-                raise JobAlreadyFinishedError() from exc
-            except TranscriptionJobStoreUnavailableError as exc:
-                raise JobStoreUnavailableError() from exc
+                if cancellation is None:
+                    raise JobNotFoundError()
+                if isinstance(cancellation, ProcessingCancellation):
+                    control = self._active_executions.get(cancellation.internal_id)
+                    if control is not None:
+                        control.request_cancellation()
+                    job = cancellation.job
+                else:
+                    job = cancellation
+        except TranscriptionJobAlreadyFinishedError as exc:
+            raise JobAlreadyFinishedError() from exc
+        except TranscriptionJobStoreUnavailableError as exc:
+            await self._mark_store_unavailable()
+            raise JobStoreUnavailableError() from exc
+        self._work_available.set()
+        return job
 
-            if cancellation is None:
-                raise JobNotFoundError()
-            if isinstance(cancellation, ProcessingCancellation):
-                control = self._active_executions.get(cancellation.internal_id)
-                if control is not None:
-                    control.request_cancellation()
-                return cancellation.job
-            return cancellation
-
-    async def _remove_expired_terminal_jobs_periodically(self) -> None:
+    async def _remove_expired_terminal_jobs_periodically(
+        self,
+        startup_signal: asyncio.Event,
+    ) -> None:
         """Delete expired terminal jobs after each configured full interval."""
+        startup_signal.set()
         try:
             while True:
                 try:
@@ -289,22 +395,24 @@ class TranscriptionJobCoordinator:
                     return
                 await self._repository.delete_expired_terminal_jobs()
         except TranscriptionJobStoreUnavailableError:
-            logger.error("job_store_unavailable")
+            await self._mark_store_unavailable()
 
-    async def _consume_jobs(self) -> None:
+    async def _consume_jobs(self, startup_signal: asyncio.Event) -> None:
         """Wait for committed work, then drain eligible jobs with bounded wakes."""
+        startup_signal.set()
         try:
             while True:
                 await self._wait_for_work()
-                if self._stopping:
-                    return
+                async with self._lifecycle_lock:
+                    if self._stopping or not self._store_available:
+                        return
                 while True:
                     claimed_job = await self._claim_next()
                     if claimed_job is None:
                         break
                     await self._execute_claimed_job(claimed_job)
         except TranscriptionJobStoreUnavailableError:
-            logger.error("job_store_unavailable")
+            await self._mark_store_unavailable()
 
     async def _wait_for_work(self) -> None:
         """Wait for work submission or an interval boundary before draining."""
@@ -320,7 +428,7 @@ class TranscriptionJobCoordinator:
     async def _claim_next(self) -> ClaimedTranscriptionJob | None:
         """Claim one job and register its process-local execution control."""
         async with self._lifecycle_lock:
-            if self._stopping:
+            if self._stopping or not self._store_available:
                 return None
             claimed_job = await self._repository.claim_next()
             if claimed_job is not None:

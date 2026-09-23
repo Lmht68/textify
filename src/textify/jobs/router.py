@@ -2,7 +2,7 @@
 
 from typing import Annotated, cast
 
-from fastapi import APIRouter, Depends, Request, Response, status
+from fastapi import APIRouter, Depends, Path, Request, Response, status
 
 from textify.errors import ErrorDetail, ErrorResponse, InvalidRequestError
 from textify.jobs.schemas import (
@@ -56,6 +56,38 @@ type TranscriptionJobCoordinatorDependency = Annotated[
     Depends(get_transcription_job_coordinator),
 ]
 
+JobCapability = Annotated[
+    str,
+    Path(
+        description=(
+            "Opaque lowercase UUIDv4 bearer capability. Possession authorizes "
+            "same-origin status inspection and cancellation. Malformed and "
+            "noncanonical values return `404 job_not_found`."
+        )
+    ),
+]
+
+_REQUEST_ID_HEADER = {
+    "description": "Fresh server-generated identifier for this HTTP request.",
+    "schema": {"type": "string", "format": "uuid"},
+}
+_CACHE_CONTROL_HEADER = {
+    "description": "Bearer capability responses are never cacheable.",
+    "schema": {"type": "string", "example": "no-store"},
+}
+_RETRY_AFTER_HEADER = {
+    "description": "Present only while work is active; seconds before status inspection.",
+    "schema": {"type": "integer", "example": 2},
+}
+_JOB_RESPONSE_HEADERS = {
+    "X-Request-ID": _REQUEST_ID_HEADER,
+    "Cache-Control": _CACHE_CONTROL_HEADER,
+}
+_ACTIVE_JOB_RESPONSE_HEADERS = {
+    **_JOB_RESPONSE_HEADERS,
+    "Retry-After": _RETRY_AFTER_HEADER,
+}
+
 
 async def _require_empty_request_body(request: Request) -> None:
     """Reject nonempty cancellation bodies before durable lifecycle mutation.
@@ -75,31 +107,34 @@ async def _require_empty_request_body(request: Request) -> None:
     "",
     status_code=status.HTTP_202_ACCEPTED,
     tags=["transcription-jobs"],
+    summary="Submit a durable Transcription Job",
+    description=(
+        "Commit eligible work before returning a same-origin relative `Location` "
+        "and JSON links. The links are bearer capabilities: possession authorizes "
+        "polling and cancellation, so clients must not disclose them."
+    ),
     responses={
         status.HTTP_202_ACCEPTED: {
             "description": "Queued Transcription Job accepted after durable commit.",
             "headers": {
+                **_ACTIVE_JOB_RESPONSE_HEADERS,
                 "Location": {
-                    "description": "Relative capability URL for this job.",
+                    "description": (
+                        "Same-origin relative status URL for the new bearer capability."
+                    ),
                     "schema": {"type": "string"},
-                },
-                "Retry-After": {
-                    "description": "Suggested seconds before status inspection.",
-                    "schema": {"type": "integer", "example": 2},
-                },
-                "Cache-Control": {
-                    "description": "Bearer capability responses must not be cached.",
-                    "schema": {"type": "string", "example": "no-store"},
                 },
             },
         },
         status.HTTP_400_BAD_REQUEST: {
             "model": ErrorResponse,
             "description": "Possible codes: `invalid_url`, `unsupported_platform`.",
+            "headers": _JOB_RESPONSE_HEADERS,
         },
         status.HTTP_422_UNPROCESSABLE_CONTENT: {
             "model": ErrorResponse,
             "description": "Possible code: `invalid_request`.",
+            "headers": _JOB_RESPONSE_HEADERS,
         },
         status.HTTP_503_SERVICE_UNAVAILABLE: {
             "model": ErrorResponse,
@@ -107,10 +142,12 @@ async def _require_empty_request_body(request: Request) -> None:
                 "Possible codes: `transcription_capacity_exceeded`, "
                 "`job_store_unavailable`."
             ),
+            "headers": _JOB_RESPONSE_HEADERS,
         },
         status.HTTP_500_INTERNAL_SERVER_ERROR: {
             "model": ErrorResponse,
             "description": "Possible code: `internal_error`.",
+            "headers": _JOB_RESPONSE_HEADERS,
         },
     },
 )
@@ -140,36 +177,43 @@ async def create_transcription_job(
     "/{job_id}",
     tags=["transcription-jobs"],
     response_model=TranscriptionJobResponse,
+    summary="Inspect a Transcription Job",
+    description=(
+        "Poll the same-origin relative bearer capability returned by submission. "
+        "Responses are `queued`, `processing`, or `finished`; finished outcomes are "
+        "`succeeded`, `failed`, or `cancelled`. Provider, timeout, `queue_timeout`, "
+        "`worker_interrupted`, and `internal_error` failures are terminal failed-job "
+        "reasons in HTTP `200` responses, not separate HTTP failures."
+    ),
     responses={
         status.HTTP_200_OK: {
             "description": "Current safe representation of a Transcription Job.",
-            "headers": {
-                "Retry-After": {
-                    "description": "Suggested seconds before active-job inspection.",
-                    "schema": {"type": "integer", "example": 2},
-                },
-                "Cache-Control": {
-                    "description": "Bearer capability responses must not be cached.",
-                    "schema": {"type": "string", "example": "no-store"},
-                },
-            },
+            "headers": _ACTIVE_JOB_RESPONSE_HEADERS,
         },
         status.HTTP_404_NOT_FOUND: {
             "model": ErrorResponse,
             "description": "Possible code: `job_not_found`.",
+            "headers": _JOB_RESPONSE_HEADERS,
+        },
+        status.HTTP_422_UNPROCESSABLE_CONTENT: {
+            "model": ErrorResponse,
+            "description": "Possible code: `invalid_request`.",
+            "headers": _JOB_RESPONSE_HEADERS,
         },
         status.HTTP_503_SERVICE_UNAVAILABLE: {
             "model": ErrorResponse,
             "description": "Possible code: `job_store_unavailable`.",
+            "headers": _JOB_RESPONSE_HEADERS,
         },
         status.HTTP_500_INTERNAL_SERVER_ERROR: {
             "model": ErrorResponse,
             "description": "Possible code: `internal_error`.",
+            "headers": _JOB_RESPONSE_HEADERS,
         },
     },
 )
 async def get_transcription_job(
-    job_id: str,
+    job_id: JobCapability,
     response: Response,
     coordinator: TranscriptionJobCoordinatorDependency,
 ) -> TranscriptionJobResponse:
@@ -193,67 +237,57 @@ async def get_transcription_job(
 @router.put(
     "/{job_id}/cancellation",
     tags=["transcription-jobs"],
-    response_model=TranscriptionJobResponse,
+    response_model=None,
+    summary="Cancel a Transcription Job",
+    description=(
+        "Submit no request body to accept cancellation through the same-origin "
+        "bearer capability. A queued job becomes cancelled with `200`; a processing "
+        "job returns `202` while owned resources finish cleanup."
+    ),
     responses={
         status.HTTP_200_OK: {
-            "description": "Queued or already-cancelled Transcription Job.",
-            "headers": {
-                "Cache-Control": {
-                    "description": "Bearer capability responses must not be cached.",
-                    "schema": {"type": "string", "example": "no-store"},
-                },
-                "X-Request-ID": {
-                    "description": "Fresh identifier for this HTTP request.",
-                    "schema": {"type": "string"},
-                },
-            },
+            "model": CancelledTranscriptionJobResponse,
+            "description": "Cancelled Transcription Job after queued or completed cancellation.",
+            "headers": _JOB_RESPONSE_HEADERS,
         },
         status.HTTP_202_ACCEPTED: {
-            "model": TranscriptionJobResponse,
+            "model": ProcessingTranscriptionJobResponse,
             "description": "Processing cancellation durably accepted.",
-            "headers": {
-                "Retry-After": {
-                    "description": "Suggested seconds before status inspection.",
-                    "schema": {"type": "integer", "example": 2},
-                },
-                "Cache-Control": {
-                    "description": "Bearer capability responses must not be cached.",
-                    "schema": {"type": "string", "example": "no-store"},
-                },
-                "X-Request-ID": {
-                    "description": "Fresh identifier for this HTTP request.",
-                    "schema": {"type": "string"},
-                },
-            },
+            "headers": _ACTIVE_JOB_RESPONSE_HEADERS,
         },
         status.HTTP_404_NOT_FOUND: {
             "model": ErrorResponse,
             "description": "Possible code: `job_not_found`.",
+            "headers": _JOB_RESPONSE_HEADERS,
         },
         status.HTTP_409_CONFLICT: {
             "model": ErrorResponse,
             "description": "Possible code: `job_already_finished`.",
+            "headers": _JOB_RESPONSE_HEADERS,
         },
         status.HTTP_422_UNPROCESSABLE_CONTENT: {
             "model": ErrorResponse,
             "description": "Possible code: `invalid_request`.",
+            "headers": _JOB_RESPONSE_HEADERS,
         },
         status.HTTP_503_SERVICE_UNAVAILABLE: {
             "model": ErrorResponse,
             "description": "Possible code: `job_store_unavailable`.",
+            "headers": _JOB_RESPONSE_HEADERS,
         },
         status.HTTP_500_INTERNAL_SERVER_ERROR: {
             "model": ErrorResponse,
             "description": "Possible code: `internal_error`.",
+            "headers": _JOB_RESPONSE_HEADERS,
         },
     },
 )
 async def cancel_transcription_job(
-    job_id: str,
+    job_id: JobCapability,
     request: Request,
     response: Response,
     coordinator: TranscriptionJobCoordinatorDependency,
-) -> TranscriptionJobResponse:
+) -> ProcessingTranscriptionJobResponse | CancelledTranscriptionJobResponse:
     """Accept cancellation for one queued or processing Transcription Job.
 
     Args:
@@ -267,11 +301,11 @@ async def cancel_transcription_job(
     """
     await _require_empty_request_body(request)
     job = await coordinator.cancel(job_id)
-    job_response = _job_response(job)
     if isinstance(job, ProcessingTranscriptionJob):
         response.status_code = status.HTTP_202_ACCEPTED
         response.headers["Retry-After"] = "2"
-    return job_response
+        return _processing_response(job)
+    return _cancelled_response(job)
 
 
 def _job_response(job: TranscriptionJob) -> TranscriptionJobResponse:

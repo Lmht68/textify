@@ -8,15 +8,14 @@ from pydantic import ValidationError
 from textify.jobs.config import JobConfig
 
 
-def test_database_path_is_optional_only_before_lifespan(
+def test_database_path_is_required(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Keep application imports and OpenAPI generation independent of storage."""
+    """Reject configuration that omits durable SQLite storage."""
     monkeypatch.delenv("TEXTIFY_DATABASE_PATH", raising=False)
 
-    settings = JobConfig(_env_file=None)  # type: ignore[call-arg]
-
-    assert settings.database_path is None
+    with pytest.raises(ValidationError):
+        JobConfig(_env_file=None)  # type: ignore[call-arg]
 
 
 def test_database_path_loads_explicit_filesystem_value(
@@ -32,7 +31,10 @@ def test_database_path_loads_explicit_filesystem_value(
 
 def test_durable_job_settings_use_bounded_defaults() -> None:
     """Default durable admission, polling, worker ownership, and retention."""
-    settings = JobConfig(_env_file=None)  # type: ignore[call-arg]
+    settings = JobConfig(
+        database_path=Path("textify.sqlite3"),
+        _env_file=None,  # type: ignore[call-arg]
+    )
 
     assert settings.max_outstanding_jobs == 8
     assert settings.job_queue_timeout_seconds == 20

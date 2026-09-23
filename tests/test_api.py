@@ -1,11 +1,15 @@
 """ASGI tests for application startup and job-route observability."""
 
+import asyncio
+import gc
 import threading
+from contextvars import Context
 from pathlib import Path
 from uuid import UUID
 
 import pytest
 from httpx import ASGITransport, AsyncClient, Response
+from pydantic import ValidationError
 
 from textify.config import AppConfig, Environment
 from textify.jobs.config import JobConfig
@@ -241,6 +245,27 @@ def test_app_config_defaults_to_deployment_port(
     assert settings.port == 8182
 
 
+def test_default_temporary_media_capacity_reserves_seven_allocations(
+    tmp_path: Path,
+) -> None:
+    """The deployment defaults reserve four workers, two native calls, and cleanup."""
+    transcription_settings = TranscriptionConfig(_env_file=None)  # type: ignore[call-arg]
+    job_settings = JobConfig(
+        database_path=tmp_path / "textify.sqlite3",
+        _env_file=None,  # type: ignore[call-arg]
+    )
+    expected_bytes = 7 * 536_870_912
+
+    assert job_settings.job_worker_count == 4
+    assert transcription_settings.transcription_concurrency == 2
+    assert transcription_settings.max_media_bytes == 536_870_912
+    _validate_temporary_media_capacity(
+        transcription_settings,
+        job_settings.job_worker_count,
+        available_bytes=lambda _root: expected_bytes,
+    )
+
+
 def test_temporary_media_capacity_accepts_exact_quota(tmp_path: Path) -> None:
     """The configured quota accepts exactly the required free bytes."""
     settings = _transcription_config(tmp_path).model_copy(
@@ -365,6 +390,126 @@ async def test_api_fails_startup_before_model_when_temporary_media_capacity_is_l
     assert media_root.is_dir()
     assert factory.calls == 0
     assert application.state.ready is False
+
+
+@pytest.mark.asyncio
+async def test_api_rejects_unconfigured_database_before_touching_filesystem(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Defer required database validation until lifespan before filesystem access."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TEXTIFY_DATABASE_PATH", raising=False)
+    media_root = tmp_path / "media"
+    factory = StartupAdaptersFactory()
+    application = create_app(
+        _app_config(),
+        _transcription_config(media_root),
+        factory,
+        available_temporary_media_bytes=lambda _root: 1 << 60,
+    )
+
+    with pytest.raises(ValidationError):
+        async with application.router.lifespan_context(application):
+            pass
+
+    assert application.state.ready is False
+    assert media_root.exists() is False
+    assert factory.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_api_closes_storage_before_adapter_construction_failure(
+    migrated_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Leave readiness false when adapter construction aborts lifespan startup."""
+    factory_calls = 0
+
+    def failing_adapters_factory(
+        _settings: TranscriptionConfig,
+    ) -> TranscriptionAdapters:
+        """Abort deterministic adapter construction after durable storage startup."""
+        nonlocal factory_calls
+        factory_calls += 1
+        raise RuntimeError("adapter construction failed")
+
+    application = create_app(
+        _app_config(),
+        _transcription_config(tmp_path / "media"),
+        failing_adapters_factory,
+        available_temporary_media_bytes=lambda _root: 1 << 60,
+        job_config=_job_config(migrated_database_path),
+    )
+
+    with pytest.raises(RuntimeError, match="adapter construction failed"):
+        async with application.router.lifespan_context(application):
+            pass
+
+    assert application.state.ready is False
+    assert factory_calls == 1
+    assert not hasattr(application.state, "transcription_job_coordinator")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failed_task_name",
+    (
+        "transcription-job-consumer-2",
+        "transcription-job-retention-cleanup",
+    ),
+)
+async def test_api_closes_partially_scheduled_job_tasks(
+    failed_task_name: str,
+    migrated_database_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recwarn: pytest.WarningsRecorder,
+    tmp_path: Path,
+) -> None:
+    """Abort startup when durable task scheduling fails after earlier tasks exist."""
+    created_tasks: list[asyncio.Task[None]] = []
+    original_create_task = asyncio.create_task
+
+    def create_task(
+        coroutine: object,
+        *,
+        name: str | None = None,
+        context: Context | None = None,
+    ) -> asyncio.Task[None]:
+        """Fail only the named task while recording earlier scheduled tasks."""
+        if name == failed_task_name:
+            raise RuntimeError(f"Unable to schedule {name}.")
+        task = original_create_task(
+            coroutine,  # type: ignore[arg-type]
+            name=name,
+            context=context,
+        )
+        created_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(asyncio, "create_task", create_task)
+    factory = StartupAdaptersFactory()
+    application = create_app(
+        _app_config(),
+        _transcription_config(tmp_path / "media"),
+        factory,
+        available_temporary_media_bytes=lambda _root: 1 << 60,
+        job_config=_job_config(migrated_database_path, job_worker_count=2),
+    )
+
+    with pytest.raises(RuntimeError, match=f"Unable to schedule {failed_task_name}"):
+        async with application.router.lifespan_context(application):
+            pass
+
+    gc.collect()
+    assert application.state.ready is False
+    assert factory.calls == 1
+    assert not hasattr(application.state, "transcription_job_coordinator")
+    assert created_tasks
+    assert all(task.done() for task in created_tasks)
+    assert not [
+        warning for warning in recwarn if "was never awaited" in str(warning.message)
+    ]
 
 
 @pytest.mark.asyncio

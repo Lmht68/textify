@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import UUID4, BaseModel, ConfigDict
+from pydantic import UUID4, BaseModel, ConfigDict, Field
 
 from textify.errors import ErrorDetail
 from textify.transcription.schemas import TranscriptionResponse
@@ -14,8 +14,16 @@ class ActiveTranscriptionJobLinks(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    self: str
-    cancel: str
+    self: str = Field(
+        description="Same-origin relative status URL that acts as a bearer capability.",
+        examples=["/api/transcription-jobs/00000000-0000-4000-8000-000000000000"],
+    )
+    cancel: str = Field(
+        description="Same-origin relative cancellation URL for this bearer capability.",
+        examples=[
+            "/api/transcription-jobs/00000000-0000-4000-8000-000000000000/cancellation"
+        ],
+    )
 
 
 class QueuedTranscriptionJobResponse(BaseModel):
@@ -47,7 +55,10 @@ class FinishedTranscriptionJobLinks(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    self: str
+    self: str = Field(
+        description="Same-origin relative status URL that remains a bearer capability.",
+        examples=["/api/transcription-jobs/00000000-0000-4000-8000-000000000000"],
+    )
 
 
 class SucceededTranscriptionJobResponse(BaseModel):

@@ -16,7 +16,7 @@ class JobConfig(BaseSettings):
         populate_by_name=True,
     )
 
-    database_path: Path | None = None
+    database_path: Path
     job_worker_count: int = Field(default=4, gt=0)
     max_outstanding_jobs: int = Field(default=8, gt=0)
     job_queue_timeout_seconds: int = Field(default=20, gt=0)
