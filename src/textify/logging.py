@@ -17,6 +17,7 @@ _ALLOWED_STRUCTURED_FIELDS = frozenset(
         "duration_seconds",
         "elapsed_seconds",
         "code",
+        "internal_job_id",
     }
 )
 

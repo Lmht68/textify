@@ -80,8 +80,12 @@ Keep `.env` private, especially `TEXTIFY_HF_TOKEN` when model access requires it
 | `TEXTIFY_TRANSCRIPTION_CONCURRENCY` | Maximum concurrent native inference operations. |
 | `TEXTIFY_JOB_WORKER_COUNT` | Number of application-owned durable job consumers. |
 | `TEXTIFY_MAX_OUTSTANDING_JOBS`, `TEXTIFY_JOB_QUEUE_TIMEOUT_SECONDS` | Durable admission capacity and database queue-lock deadline. |
+| `TEXTIFY_JOB_RETENTION_SECONDS` | Seconds terminal job capabilities remain available after completion. |
 | `TEXTIFY_MAX_MEDIA_BYTES` | Maximum downloaded media size. |
 | `TEXTIFY_HF_TOKEN` | Optional Hugging Face credential for restricted models. |
 
 The temporary media directory needs enough free space for configured job workers, native inference, and one cleanup reserve.
+
+Terminal job expiration makes the capability inaccessible and deletes its database rows.
+SQLite `secure_delete=ON` does not guarantee erasure from filesystems, snapshots, or backups.
 See `.env.example` for the remaining inference and timeout settings.

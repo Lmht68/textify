@@ -43,3 +43,11 @@ class QueueTimeoutError(TextifyError):
     message = (
         "The transcription job did not begin processing before its queue deadline."
     )
+
+
+class WorkerInterruptedError(TextifyError):
+    """Indicate a job interrupted while a worker owned its execution."""
+
+    code = "worker_interrupted"
+    status_code = 500
+    message = "The transcription job was interrupted before completion."

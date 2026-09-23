@@ -11,7 +11,7 @@ from sqlalchemy import event, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
-EXPECTED_DATABASE_REVISION = "0001_transcription_jobs"
+EXPECTED_DATABASE_REVISION = "0002_terminal_job_retention"
 SQLITE_BUSY_TIMEOUT_MS = 5_000
 
 

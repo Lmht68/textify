@@ -29,10 +29,18 @@ from textify.jobs.database import (
     create_application_engine,
     verify_application_database,
 )
+from textify.jobs.exceptions import JobStoreUnavailableError
 from textify.jobs.http import TranscriptionJobHeadersMiddleware
-from textify.jobs.repository import SqliteTranscriptionJobRepository
+from textify.jobs.repository import (
+    SqliteTranscriptionJobRepository,
+    TranscriptionJobStoreUnavailableError,
+)
 from textify.jobs.router import router as transcription_job_router
-from textify.jobs.service import TranscriptionJobCoordinator, utc_now
+from textify.jobs.service import (
+    TranscriptionJobCoordinator,
+    recover_transcription_jobs,
+    utc_now,
+)
 from textify.logging import configure_logging, request_log_context
 from textify.ops import router as operations_router
 from textify.transcription.config import TranscriptionConfig
@@ -188,6 +196,7 @@ def create_app(
     *,
     job_config: JobConfig | None = None,
     clock: Callable[[], datetime] = utc_now,
+    retention_cleanup_interval: timedelta = timedelta(hours=1),
 ) -> FastAPI:
     """Create the configured Textify FastAPI application.
 
@@ -198,6 +207,7 @@ def create_app(
         available_temporary_media_bytes: Reader for current writable media capacity.
         job_config: Optional durable-job configuration for composition or tests.
         clock: UTC clock supplied to durable job storage.
+        retention_cleanup_interval: Fixed delay between terminal-job cleanup passes.
 
     Returns:
         Unstarted FastAPI application with startup-owned model lifecycle.
@@ -234,14 +244,34 @@ def create_app(
                 queue_timeout=timedelta(
                     seconds=resolved_job_config.job_queue_timeout_seconds
                 ),
+                terminal_retention=timedelta(
+                    seconds=resolved_job_config.job_retention_seconds
+                ),
                 clock=clock,
             )
+            try:
+                await recover_transcription_jobs(repository)
+            except TranscriptionJobStoreUnavailableError:
+                logger.error(
+                    "transcription job recovery failed",
+                    extra={"code": JobStoreUnavailableError.code},
+                )
+                raise
+            try:
+                await repository.delete_expired_terminal_jobs()
+            except TranscriptionJobStoreUnavailableError:
+                logger.error(
+                    "transcription job retention cleanup failed",
+                    extra={"code": JobStoreUnavailableError.code},
+                )
+                raise
             adapters = adapters_factory(resolved_transcription_config)
             executor = TranscriptionExecutor(adapters, resolved_transcription_config)
             coordinator = TranscriptionJobCoordinator(
                 repository,
                 executor,
                 resolved_job_config.job_worker_count,
+                retention_cleanup_interval,
             )
             application.state.transcription_job_coordinator = coordinator
             await coordinator.start()

@@ -25,6 +25,7 @@ PublicErrorCode = Literal[
     "job_already_finished",
     "job_store_unavailable",
     "queue_timeout",
+    "worker_interrupted",
     "metadata_timeout",
     "audio_download_timeout",
     "transcription_timeout",

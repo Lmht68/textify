@@ -23,6 +23,7 @@ from sqlalchemy import (
     Table,
     Text,
     UniqueConstraint,
+    delete,
     func,
     insert,
     select,
@@ -34,7 +35,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from textify.errors import ErrorDetail
-from textify.jobs.exceptions import QueueTimeoutError
+from textify.jobs.exceptions import QueueTimeoutError, WorkerInterruptedError
 from textify.jobs.types import (
     CancellationResult,
     CancelledTranscriptionJob,
@@ -46,6 +47,7 @@ from textify.jobs.types import (
     ProcessingCancellation,
     ProcessingTranscriptionJob,
     QueuedTranscriptionJob,
+    RecoveredTranscriptionJobs,
     SucceededTranscriptionJob,
     TranscriptionJob,
 )
@@ -129,6 +131,11 @@ Index(
     "transcription_job_status_queue_deadline_at_idx",
     transcription_job.c.status,
     transcription_job.c.queue_deadline_at,
+)
+Index(
+    "transcription_job_status_finished_at_idx",
+    transcription_job.c.status,
+    transcription_job.c.finished_at,
 )
 
 transcription_job_exclusion = Table(
@@ -277,6 +284,7 @@ class SqliteTranscriptionJobRepository:
         engine: AsyncEngine,
         maximum_outstanding_jobs: int,
         queue_timeout: timedelta,
+        terminal_retention: timedelta,
         clock: Callable[[], datetime],
     ) -> None:
         """Initialize SQLite storage policy.
@@ -285,18 +293,22 @@ class SqliteTranscriptionJobRepository:
             engine: Verified application-owned asynchronous SQLite engine.
             maximum_outstanding_jobs: Maximum queued and processing jobs allowed.
             queue_timeout: Absolute queued lifetime assigned during admission.
+            terminal_retention: Post-completion capability lifetime before deletion.
             clock: UTC clock read only after a writer lock is held.
 
         Raises:
-            ValueError: If the configured capacity or queue timeout is not positive.
+            ValueError: If capacity, queue timeout, or terminal retention is nonpositive.
         """
         if maximum_outstanding_jobs <= 0:
             raise ValueError("maximum_outstanding_jobs must be positive.")
         if queue_timeout <= timedelta():
             raise ValueError("queue_timeout must be positive.")
+        if terminal_retention <= timedelta():
+            raise ValueError("terminal_retention must be positive.")
         self._engine = engine
         self._maximum_outstanding_jobs = maximum_outstanding_jobs
         self._queue_timeout = queue_timeout
+        self._terminal_retention = terminal_retention
         self._clock = clock
 
     async def create_queued(
@@ -388,20 +400,7 @@ class SqliteTranscriptionJobRepository:
                 try:
                     await connection.execute(text("BEGIN IMMEDIATE"))
                     now = _as_utc(self._clock())
-                    await connection.execute(
-                        update(transcription_job)
-                        .where(
-                            transcription_job.c.status == "queued",
-                            transcription_job.c.queue_deadline_at <= now,
-                        )
-                        .values(
-                            status="finished",
-                            outcome="failed",
-                            finished_at=now,
-                            error_code=QueueTimeoutError.code,
-                            error_message=QueueTimeoutError.message,
-                        )
-                    )
+                    await self._expire_queued_jobs(connection, now)
                     candidate = (
                         (
                             await connection.execute(
@@ -456,6 +455,139 @@ class SqliteTranscriptionJobRepository:
 
         return _claimed_job(internal_id, submitted_url, exclusions)
 
+    async def recover_interrupted_jobs(self) -> RecoveredTranscriptionJobs:
+        """Terminalize jobs interrupted before this application started.
+
+        Returns:
+            Private identifiers grouped by committed recovery transition.
+
+        Raises:
+            TranscriptionJobStoreUnavailableError: If recovery cannot commit safely.
+        """
+        try:
+            async with self._engine.connect() as connection:
+                try:
+                    await connection.execute(text("BEGIN IMMEDIATE"))
+                    now = _as_utc(self._clock())
+                    expired_queued_internal_ids = await self._expire_queued_jobs(
+                        connection,
+                        now,
+                    )
+                    interrupted_processing_internal_ids = (
+                        await self._select_recovery_processing_ids(
+                            connection,
+                            cancellation_requested=False,
+                        )
+                    )
+                    if interrupted_processing_internal_ids:
+                        transition = await connection.execute(
+                            update(transcription_job)
+                            .where(
+                                transcription_job.c.id.in_(
+                                    interrupted_processing_internal_ids
+                                ),
+                                transcription_job.c.status == "processing",
+                                transcription_job.c.cancellation_requested.is_(False),
+                            )
+                            .values(
+                                status="finished",
+                                outcome="failed",
+                                finished_at=now,
+                                error_code=WorkerInterruptedError.code,
+                                error_message=WorkerInterruptedError.message,
+                            )
+                        )
+                        if transition.rowcount != len(
+                            interrupted_processing_internal_ids
+                        ):
+                            raise TranscriptionJobStoreUnavailableError()
+
+                    cancelled_processing_internal_ids = (
+                        await self._select_recovery_processing_ids(
+                            connection,
+                            cancellation_requested=True,
+                        )
+                    )
+                    if cancelled_processing_internal_ids:
+                        transition = await connection.execute(
+                            update(transcription_job)
+                            .where(
+                                transcription_job.c.id.in_(
+                                    cancelled_processing_internal_ids
+                                ),
+                                transcription_job.c.status == "processing",
+                                transcription_job.c.cancellation_requested.is_(True),
+                            )
+                            .values(
+                                status="finished",
+                                outcome="cancelled",
+                                finished_at=now,
+                            )
+                        )
+                        if transition.rowcount != len(
+                            cancelled_processing_internal_ids
+                        ):
+                            raise TranscriptionJobStoreUnavailableError()
+                    await connection.commit()
+                except TranscriptionJobStoreUnavailableError:
+                    await connection.rollback()
+                    raise
+                except (SQLAlchemyError, TypeError, ValidationError, ValueError) as exc:
+                    try:
+                        await connection.rollback()
+                    except SQLAlchemyError as rollback_exc:
+                        raise TranscriptionJobStoreUnavailableError() from rollback_exc
+                    raise TranscriptionJobStoreUnavailableError() from exc
+        except TranscriptionJobStoreUnavailableError:
+            raise
+        except (OSError, SQLAlchemyError) as exc:
+            raise TranscriptionJobStoreUnavailableError() from exc
+
+        return RecoveredTranscriptionJobs(
+            expired_queued_internal_ids=expired_queued_internal_ids,
+            interrupted_processing_internal_ids=interrupted_processing_internal_ids,
+            cancelled_processing_internal_ids=cancelled_processing_internal_ids,
+        )
+
+    async def delete_expired_terminal_jobs(self) -> None:
+        """Delete expired terminal jobs and perform nonblocking WAL maintenance.
+
+        Raises:
+            TranscriptionJobStoreUnavailableError: If SQLite cannot delete or
+                checkpoint durable storage safely.
+        """
+        try:
+            async with self._engine.connect() as connection:
+                try:
+                    await connection.execute(text("BEGIN IMMEDIATE"))
+                    now = _as_utc(self._clock())
+                    cutoff = now - self._terminal_retention
+                    await connection.execute(
+                        delete(transcription_job).where(
+                            transcription_job.c.status == "finished",
+                            transcription_job.c.finished_at <= cutoff,
+                        )
+                    )
+                    await connection.commit()
+                except TranscriptionJobStoreUnavailableError:
+                    try:
+                        await connection.rollback()
+                    except (OSError, SQLAlchemyError) as rollback_exc:
+                        raise TranscriptionJobStoreUnavailableError() from rollback_exc
+                    raise
+                except (OSError, SQLAlchemyError) as exc:
+                    try:
+                        await connection.rollback()
+                    except (OSError, SQLAlchemyError) as rollback_exc:
+                        raise TranscriptionJobStoreUnavailableError() from rollback_exc
+                    raise TranscriptionJobStoreUnavailableError() from exc
+        except TranscriptionJobStoreUnavailableError:
+            raise
+        except (OSError, SQLAlchemyError) as exc:
+            raise TranscriptionJobStoreUnavailableError() from exc
+
+        await self._checkpoint_wal()
+
     async def request_cancellation(
         self,
         public_id: UUID,
@@ -493,11 +625,16 @@ class SqliteTranscriptionJobRepository:
                     if job_row is None:
                         await connection.commit()
                         return None
+                    now = _as_utc(self._clock())
+                    cutoff = now - self._terminal_retention
+                    if _terminal_job_is_expired(job_row, cutoff):
+                        await connection.commit()
+                        return None
 
                     status = job_row["status"]
                     if status == "queued":
                         internal_id = _internal_id_from_row(job_row)
-                        finished_at = _as_utc(self._clock())
+                        finished_at = now
                         transition = await connection.execute(
                             update(transcription_job)
                             .where(
@@ -790,6 +927,9 @@ class SqliteTranscriptionJobRepository:
                 )
                 if job_row is None:
                     return None
+                cutoff = _as_utc(self._clock()) - self._terminal_retention
+                if _terminal_job_is_expired(job_row, cutoff):
+                    return None
 
                 status = job_row["status"]
                 if status == "queued":
@@ -837,6 +977,24 @@ class SqliteTranscriptionJobRepository:
 
         return _succeeded_job_from_rows(job_row, result_row, segment_rows, exclusions)
 
+    async def _checkpoint_wal(self) -> None:
+        """Checkpoint committed WAL pages without waiting on active readers."""
+        try:
+            async with self._engine.connect() as connection:
+                checkpoint_result = await connection.execute(
+                    text("PRAGMA wal_checkpoint(PASSIVE)")
+                )
+                checkpoint_values = tuple(checkpoint_result.one())
+        except TranscriptionJobStoreUnavailableError:
+            raise
+        except (OSError, SQLAlchemyError) as exc:
+            raise TranscriptionJobStoreUnavailableError() from exc
+
+        if len(checkpoint_values) != 3 or any(
+            not isinstance(value, int) for value in checkpoint_values
+        ):
+            raise TranscriptionJobStoreUnavailableError()
+
     async def _load_exclusions(
         self,
         connection: AsyncConnection,
@@ -866,6 +1024,73 @@ class SqliteTranscriptionJobRepository:
         if not isinstance(count, int):
             raise TranscriptionJobStoreUnavailableError()
         return count
+
+    async def _expire_queued_jobs(
+        self,
+        connection: AsyncConnection,
+        now: datetime,
+    ) -> tuple[int, ...]:
+        """Fail every queued job whose immutable deadline has passed."""
+        expired_rows = (
+            (
+                await connection.execute(
+                    select(transcription_job.c.id)
+                    .where(
+                        transcription_job.c.status == "queued",
+                        transcription_job.c.queue_deadline_at <= now,
+                    )
+                    .order_by(transcription_job.c.id)
+                )
+            )
+            .mappings()
+            .all()
+        )
+        expired_internal_ids = tuple(_internal_id_from_row(row) for row in expired_rows)
+        if not expired_internal_ids:
+            return ()
+        transition = await connection.execute(
+            update(transcription_job)
+            .where(
+                transcription_job.c.id.in_(expired_internal_ids),
+                transcription_job.c.status == "queued",
+                transcription_job.c.queue_deadline_at <= now,
+            )
+            .values(
+                status="finished",
+                outcome="failed",
+                finished_at=now,
+                error_code=QueueTimeoutError.code,
+                error_message=QueueTimeoutError.message,
+            )
+        )
+        if transition.rowcount != len(expired_internal_ids):
+            raise TranscriptionJobStoreUnavailableError()
+        return expired_internal_ids
+
+    async def _select_recovery_processing_ids(
+        self,
+        connection: AsyncConnection,
+        *,
+        cancellation_requested: bool,
+    ) -> tuple[int, ...]:
+        """Return interrupted processing identifiers with one cancellation state."""
+        rows = (
+            (
+                await connection.execute(
+                    select(transcription_job.c.id)
+                    .where(
+                        transcription_job.c.status == "processing",
+                        transcription_job.c.cancellation_requested.is_(
+                            cancellation_requested
+                        ),
+                    )
+                    .order_by(transcription_job.c.id)
+                )
+            )
+            .mappings()
+            .all()
+        )
+        return tuple(_internal_id_from_row(row) for row in rows)
 
 
 def _claimed_input_from_row(row: RowMapping) -> tuple[int, str]:
@@ -1161,6 +1386,13 @@ def _validate_error_detail(error_code: object, error_message: object) -> ErrorDe
         )
     except (TypeError, ValidationError, ValueError) as exc:
         raise TranscriptionJobStoreUnavailableError() from exc
+
+
+def _terminal_job_is_expired(row: RowMapping, cutoff: datetime) -> bool:
+    """Return whether a terminal row has reached its retention deadline."""
+    if row["status"] != "finished":
+        return False
+    return _datetime_from_row(row, "finished_at") <= cutoff
 
 
 def _internal_id_from_row(row: RowMapping) -> int:

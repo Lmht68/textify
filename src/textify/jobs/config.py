@@ -20,3 +20,4 @@ class JobConfig(BaseSettings):
     job_worker_count: int = Field(default=4, gt=0)
     max_outstanding_jobs: int = Field(default=8, gt=0)
     job_queue_timeout_seconds: int = Field(default=20, gt=0)
+    job_retention_seconds: int = Field(default=86_400, gt=0)

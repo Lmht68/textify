@@ -186,6 +186,9 @@ async def test_openapi_describes_job_only_transcription_contract() -> None:
     assert components["FinishedTranscriptionJobLinks"]["required"] == ["self"]
     assert "queue_timeout" in components["ErrorDetail"]["properties"]["code"]["enum"]
     assert (
+        "worker_interrupted" in components["ErrorDetail"]["properties"]["code"]["enum"]
+    )
+    assert (
         "job_already_finished"
         in components["ErrorDetail"]["properties"]["code"]["enum"]
     )

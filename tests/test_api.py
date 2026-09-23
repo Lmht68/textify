@@ -184,6 +184,7 @@ def _job_config(database_path: Path, job_worker_count: int = 1) -> JobConfig:
         job_worker_count=job_worker_count,
         max_outstanding_jobs=8,
         job_queue_timeout_seconds=20,
+        job_retention_seconds=86_400,
     )
 
 

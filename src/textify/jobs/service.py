@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from textify.errors import InternalError
@@ -12,7 +12,9 @@ from textify.jobs.exceptions import (
     JobAlreadyFinishedError,
     JobNotFoundError,
     JobStoreUnavailableError,
+    QueueTimeoutError,
     TranscriptionCapacityExceededError,
+    WorkerInterruptedError,
 )
 from textify.jobs.repository import (
     SqliteTranscriptionJobRepository,
@@ -52,6 +54,38 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+async def recover_transcription_jobs(
+    repository: SqliteTranscriptionJobRepository,
+) -> None:
+    """Reconcile durable jobs left active by an interrupted application.
+
+    Args:
+        repository: SQLite lifecycle boundary that owns the recovery transaction.
+
+    Raises:
+        TranscriptionJobStoreUnavailableError: If recovery cannot commit safely.
+    """
+    recovered_jobs = await repository.recover_interrupted_jobs()
+    for internal_job_id in recovered_jobs.expired_queued_internal_ids:
+        logger.info(
+            "expired queued transcription job during startup recovery",
+            extra={"internal_job_id": internal_job_id, "code": QueueTimeoutError.code},
+        )
+    for internal_job_id in recovered_jobs.interrupted_processing_internal_ids:
+        logger.info(
+            "failed interrupted transcription job during startup recovery",
+            extra={
+                "internal_job_id": internal_job_id,
+                "code": WorkerInterruptedError.code,
+            },
+        )
+    for internal_job_id in recovered_jobs.cancelled_processing_internal_ids:
+        logger.info(
+            "cancelled interrupted transcription job during startup recovery",
+            extra={"internal_job_id": internal_job_id},
+        )
+
+
 class TranscriptionJobCoordinator:
     """Validate, admit, inspect, and consume durable Transcription Jobs."""
 
@@ -60,6 +94,7 @@ class TranscriptionJobCoordinator:
         repository: SqliteTranscriptionJobRepository,
         executor: TranscriptionExecutor,
         worker_count: int,
+        retention_cleanup_interval: timedelta,
     ) -> None:
         """Initialize application-owned Transcription Job consumers.
 
@@ -67,19 +102,26 @@ class TranscriptionJobCoordinator:
             repository: SQLite adapter that durably owns lifecycle transitions.
             executor: Process-lifetime provider execution boundary.
             worker_count: Number of consumer tasks to own for this application.
+            retention_cleanup_interval: Delay between expired terminal-job cleanup runs.
 
         Raises:
-            ValueError: If no consumer task is configured.
+            ValueError: If no consumer task is configured or cleanup is nonpositive.
         """
         if worker_count <= 0:
             raise ValueError("worker_count must be positive.")
+        if retention_cleanup_interval <= timedelta():
+            raise ValueError("retention_cleanup_interval must be positive.")
         self._repository = repository
         self._executor = executor
         self._worker_count = worker_count
+        self._retention_cleanup_interval = retention_cleanup_interval
         self._work_available = asyncio.Event()
+        self._retention_cleanup_stop = asyncio.Event()
         self._lifecycle_lock = asyncio.Lock()
         self._active_executions: dict[int, TranscriptionExecutionControl] = {}
         self._consumer_tasks: tuple[asyncio.Task[None], ...] = ()
+        self._retention_cleanup_task: asyncio.Task[None] | None = None
+        self._cleanup_tasks: set[asyncio.Task[None]] = set()
         self._started = False
         self._stopping = False
         self._shutdown_started = False
@@ -101,20 +143,40 @@ class TranscriptionJobCoordinator:
             )
             for worker_number in range(1, self._worker_count + 1)
         )
+        self._retention_cleanup_task = asyncio.create_task(
+            self._remove_expired_terminal_jobs_periodically(),
+            name="transcription-job-retention-cleanup",
+        )
 
     async def shutdown(self) -> None:
-        """Stop new claims, drain active execution, and release executor resources."""
-        if self._shutdown_started:
-            return
-        self._shutdown_started = True
+        """Stop admission and claiming before draining owned execution resources."""
         async with self._lifecycle_lock:
+            if self._shutdown_started:
+                return
+            self._shutdown_started = True
             self._stopping = True
+            self._retention_cleanup_stop.set()
+            active_execution_ids = tuple(sorted(self._active_executions))
+
+        logger.info("transcription job coordinator shutdown started")
+        for internal_job_id in active_execution_ids:
+            logger.info(
+                "waiting for active transcription job during shutdown",
+                extra={"internal_job_id": internal_job_id},
+            )
         self._work_available.set()
+        tasks_to_await = self._consumer_tasks
+        if self._retention_cleanup_task is not None:
+            tasks_to_await += (self._retention_cleanup_task,)
         try:
-            if self._consumer_tasks:
-                await asyncio.gather(*self._consumer_tasks)
+            if tasks_to_await:
+                await asyncio.gather(*tasks_to_await)
         finally:
-            await self._executor.shutdown()
+            try:
+                await self._executor.shutdown()
+            finally:
+                await self._await_cleanup_tasks()
+        logger.info("transcription job coordinator shutdown completed")
 
     async def submit(
         self,
@@ -143,7 +205,10 @@ class TranscriptionJobCoordinator:
             exclusions=tuple(sorted(exclusions)),
         )
         try:
-            queued_job = await self._repository.create_queued(new_job)
+            async with self._lifecycle_lock:
+                if not self._started or self._stopping:
+                    raise TranscriptionCapacityExceededError()
+                queued_job = await self._repository.create_queued(new_job)
         except TranscriptionJobCapacityError as exc:
             raise TranscriptionCapacityExceededError() from exc
         except TranscriptionJobStoreUnavailableError as exc:
@@ -209,6 +274,23 @@ class TranscriptionJobCoordinator:
                 return cancellation.job
             return cancellation
 
+    async def _remove_expired_terminal_jobs_periodically(self) -> None:
+        """Delete expired terminal jobs after each configured full interval."""
+        try:
+            while True:
+                try:
+                    async with asyncio.timeout(
+                        self._retention_cleanup_interval.total_seconds()
+                    ):
+                        await self._retention_cleanup_stop.wait()
+                except TimeoutError:
+                    pass
+                if self._retention_cleanup_stop.is_set():
+                    return
+                await self._repository.delete_expired_terminal_jobs()
+        except TranscriptionJobStoreUnavailableError:
+            logger.error("job_store_unavailable")
+
     async def _consume_jobs(self) -> None:
         """Wait for committed work, then drain eligible jobs with bounded wakes."""
         try:
@@ -226,6 +308,8 @@ class TranscriptionJobCoordinator:
 
     async def _wait_for_work(self) -> None:
         """Wait for work submission or an interval boundary before draining."""
+        if self._stopping:
+            return
         try:
             async with asyncio.timeout(_WORKER_WAKE_INTERVAL_SECONDS):
                 await self._work_available.wait()
@@ -317,13 +401,15 @@ class TranscriptionJobCoordinator:
             if not published:
                 await self._publish_cancelled_after_cleanup(claimed_job, control)
         finally:
-            asyncio.create_task(
+            cleanup_task = asyncio.create_task(
                 self._remove_active_execution_after_cleanup(
                     claimed_job.internal_id,
                     control,
                 ),
                 name=f"transcription-job-cleanup-{claimed_job.internal_id}",
             )
+            self._cleanup_tasks.add(cleanup_task)
+            cleanup_task.add_done_callback(self._cleanup_tasks.discard)
 
     async def _publish_failure_or_cancelled(
         self,
@@ -363,6 +449,12 @@ class TranscriptionJobCoordinator:
         async with self._lifecycle_lock:
             if self._active_executions.get(internal_id) is control:
                 self._active_executions.pop(internal_id)
+
+    async def _await_cleanup_tasks(self) -> None:
+        """Wait for all coordinator-owned execution cleanup tasks."""
+        while self._cleanup_tasks:
+            cleanup_tasks = tuple(self._cleanup_tasks)
+            await asyncio.gather(*cleanup_tasks)
 
 
 def _parse_capability(capability: str) -> UUID:

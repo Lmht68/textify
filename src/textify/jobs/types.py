@@ -44,6 +44,15 @@ class ClaimedTranscriptionJob:
 
 
 @dataclass(frozen=True, slots=True)
+class RecoveredTranscriptionJobs:
+    """Group private job identifiers terminalized during startup recovery."""
+
+    expired_queued_internal_ids: tuple[int, ...]
+    interrupted_processing_internal_ids: tuple[int, ...]
+    cancelled_processing_internal_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class QueuedTranscriptionJob:
     """Hold the safe persisted projection of an accepted queued job."""
 

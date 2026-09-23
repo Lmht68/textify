@@ -55,15 +55,16 @@ def test_initial_migration_round_trip(
         assert _index_names(connection, "transcription_job") >= {
             "transcription_job_status_submitted_at_id_idx",
             "transcription_job_status_queue_deadline_at_idx",
+            "transcription_job_status_finished_at_idx",
         }
-        assert _foreign_key_targets(connection, "transcription_job_exclusion") == {
-            "transcription_job"
+        assert _foreign_key_definitions(connection, "transcription_job_exclusion") == {
+            ("transcription_job", "CASCADE")
         }
-        assert _foreign_key_targets(connection, "transcription_job_result") == {
-            "transcription_job"
+        assert _foreign_key_definitions(connection, "transcription_job_result") == {
+            ("transcription_job", "CASCADE")
         }
-        assert _foreign_key_targets(connection, "transcription_job_segment") == {
-            "transcription_job_result"
+        assert _foreign_key_definitions(connection, "transcription_job_segment") == {
+            ("transcription_job_result", "CASCADE")
         }
 
     command.downgrade(alembic_config, "base")
@@ -134,7 +135,10 @@ def _index_names(connection: sqlite3.Connection, table_name: str) -> set[str]:
     return {str(row[1]) for row in rows}
 
 
-def _foreign_key_targets(connection: sqlite3.Connection, table_name: str) -> set[str]:
-    """Return referenced table names from one SQLite table's foreign keys."""
+def _foreign_key_definitions(
+    connection: sqlite3.Connection,
+    table_name: str,
+) -> set[tuple[str, str]]:
+    """Return referenced tables and deletion actions for one table's foreign keys."""
     rows = connection.execute(f"PRAGMA foreign_key_list({table_name})").fetchall()
-    return {str(row[2]) for row in rows}
+    return {(str(row[2]), str(row[6])) for row in rows}

@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TypedDict, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi import FastAPI
@@ -20,6 +20,7 @@ from yt_dlp.utils import DownloadCancelled
 
 from textify.config import AppConfig, Environment
 from textify.jobs.config import JobConfig
+from textify.jobs.repository import TranscriptionJobStoreUnavailableError
 from textify.jobs.service import utc_now
 from textify.main import create_app
 from textify.transcription import inspection
@@ -642,6 +643,7 @@ def _job_config(
     *,
     job_worker_count: int = 1,
     job_queue_timeout_seconds: int = 20,
+    job_retention_seconds: int = 86_400,
 ) -> JobConfig:
     """Create isolated durable-job configuration for durable-job tests."""
     return JobConfig(
@@ -649,6 +651,7 @@ def _job_config(
         job_worker_count=job_worker_count,
         max_outstanding_jobs=8,
         job_queue_timeout_seconds=job_queue_timeout_seconds,
+        job_retention_seconds=job_retention_seconds,
     )
 
 
@@ -679,6 +682,7 @@ def _application(
     settings: TranscriptionConfig | None = None,
     job_config: JobConfig | None = None,
     clock: Callable[[], datetime] = utc_now,
+    retention_cleanup_interval: timedelta = timedelta(hours=1),
 ) -> FastAPI:
     """Build one application with real durable storage and controlled providers."""
     return create_app(
@@ -692,6 +696,7 @@ def _application(
             job_config if job_config is not None else _job_config(database_path)
         ),
         clock=clock,
+        retention_cleanup_interval=retention_cleanup_interval,
     )
 
 
@@ -2341,3 +2346,1060 @@ async def test_api_rejects_completed_unknown_and_deleted_cancellation_capabiliti
     )
     assert succeeded_state.metadata_calls == [TIKTOK_URL]
     assert failed_state.metadata_calls == [f"{TIKTOK_URL}?failed_cancellation=true"]
+
+
+async def test_api_recovers_every_durable_state_without_retries(
+    capsys: pytest.CaptureFixture[str],
+    migrated_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Recover durable state without resubmitting or retrying interrupted jobs."""
+    initial = datetime(2026, 8, 24, tzinfo=UTC)
+    first_clock = [initial]
+    transcript_sentinel = "transcript-sentinel"
+    submitted_url_sentinel = "submitted-url-sentinel"
+    provider_detail_sentinel = "provider-detail-sentinel"
+    successful_url = f"{YOUTUBE_URL}&{submitted_url_sentinel}=successful"
+    failed_url = f"{TIKTOK_URL}?{provider_detail_sentinel}=failed"
+    cancelled_url = f"{TIKTOK_URL}?{submitted_url_sentinel}=cancelled"
+    active_url = f"{TIKTOK_URL}?{submitted_url_sentinel}=active"
+    expired_url = f"{TIKTOK_URL}?{submitted_url_sentinel}=expired"
+    first_preserved_url = f"{TIKTOK_URL}?{submitted_url_sentinel}=first"
+    second_preserved_url = f"{TIKTOK_URL}?{submitted_url_sentinel}=second"
+    interrupted_url = f"{TIKTOK_URL}?{submitted_url_sentinel}=interrupted"
+    cancelling_url = f"{TIKTOK_URL}?{submitted_url_sentinel}=cancelling"
+    first_state = ControlledAdapterState(
+        caption_segments=((0.0, 1.0, transcript_sentinel),)
+    )
+    first_application = _application(
+        migrated_database_path,
+        tmp_path / "first-media",
+        ControlledAdaptersFactory(first_state),
+        clock=lambda: first_clock[0],
+    )
+
+    async with first_application.router.lifespan_context(first_application):
+        transport = ASGITransport(app=first_application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            successful_submission = _assert_submission(
+                await client.post(
+                    "/api/transcription-jobs",
+                    json={"url": successful_url},
+                )
+            )
+            successful_location = successful_submission["links"]["self"]
+            successful_payload = _assert_succeeded(
+                await _poll_until_finished(client, successful_location),
+                successful_location,
+            )
+
+            first_state.caption_segments = ()
+            first_state.metadata_error = _UnexpectedProviderError(
+                provider_detail_sentinel
+            )
+            failed_submission = _assert_submission(
+                await client.post(
+                    "/api/transcription-jobs",
+                    json={"url": failed_url},
+                )
+            )
+            failed_location = failed_submission["links"]["self"]
+            failed_payload = _assert_failed(
+                await _poll_until_finished(client, failed_location),
+                failed_location,
+                "internal_error",
+                started=True,
+            )
+            first_state.metadata_error = None
+
+            first_state.block_metadata = True
+            first_state.metadata_entered.clear()
+            first_state.metadata_release.clear()
+            cancelled_submission = _assert_submission(
+                await client.post(
+                    "/api/transcription-jobs",
+                    json={"url": cancelled_url},
+                )
+            )
+            cancelled_location = cancelled_submission["links"]["self"]
+            await _wait_for_thread_event(first_state.metadata_entered)
+            _assert_processing(
+                await client.put(f"{cancelled_location}/cancellation"),
+                cancelled_location,
+                expected_status=202,
+                cancellation_requested=True,
+            )
+            cancelled_payload = _assert_cancelled(
+                await _poll_until_finished(client, cancelled_location),
+                cancelled_location,
+                started=True,
+            )
+
+            first_state.metadata_entered.clear()
+            first_state.metadata_release.clear()
+            active_location = _assert_submission(
+                await client.post(
+                    "/api/transcription-jobs",
+                    json={"url": active_url},
+                )
+            )["links"]["self"]
+            await _wait_for_thread_event(first_state.metadata_entered)
+            expired_submission = _assert_submission(
+                await client.post(
+                    "/api/transcription-jobs",
+                    json={"url": expired_url},
+                )
+            )
+            first_preserved_submission = _assert_submission(
+                await client.post(
+                    "/api/transcription-jobs",
+                    json={"url": first_preserved_url},
+                )
+            )
+            second_preserved_submission = _assert_submission(
+                await client.post(
+                    "/api/transcription-jobs",
+                    json={"url": second_preserved_url},
+                )
+            )
+            interrupted_submission = _assert_submission(
+                await client.post(
+                    "/api/transcription-jobs",
+                    json={"url": interrupted_url},
+                )
+            )
+            cancelling_submission = _assert_submission(
+                await client.post(
+                    "/api/transcription-jobs",
+                    json={"url": cancelling_url},
+                )
+            )
+
+            shutdown_task = asyncio.create_task(
+                first_application.state.transcription_job_coordinator.shutdown()
+            )
+            await asyncio.sleep(0)
+            first_state.metadata_release.set()
+            await shutdown_task
+            _assert_succeeded(
+                await client.get(active_location),
+                active_location,
+            )
+
+    recovery_clock = initial + timedelta(seconds=5)
+    first_deadline = recovery_clock + timedelta(seconds=10)
+    second_deadline = recovery_clock + timedelta(seconds=20)
+    recovery_database_time = recovery_clock.replace(tzinfo=None).isoformat(sep=" ")
+    first_deadline_database_time = first_deadline.replace(tzinfo=None).isoformat(
+        sep=" "
+    )
+    second_deadline_database_time = second_deadline.replace(tzinfo=None).isoformat(
+        sep=" "
+    )
+    queued_submissions = (
+        expired_submission,
+        first_preserved_submission,
+        second_preserved_submission,
+        interrupted_submission,
+        cancelling_submission,
+    )
+    with sqlite3.connect(migrated_database_path) as connection:
+        internal_ids = {
+            public_id: internal_id
+            for internal_id, public_id in connection.execute(
+                "SELECT id, public_id FROM transcription_job"
+            )
+        }
+        connection.execute(
+            "UPDATE transcription_job SET queue_deadline_at = ? WHERE public_id = ?",
+            (recovery_database_time, expired_submission["id"]),
+        )
+        connection.execute(
+            "UPDATE transcription_job SET queue_deadline_at = ? WHERE public_id = ?",
+            (first_deadline_database_time, first_preserved_submission["id"]),
+        )
+        connection.execute(
+            "UPDATE transcription_job SET queue_deadline_at = ? WHERE public_id = ?",
+            (second_deadline_database_time, second_preserved_submission["id"]),
+        )
+        connection.execute(
+            "UPDATE transcription_job "
+            "SET status = 'processing', started_at = ? "
+            "WHERE public_id = ?",
+            (recovery_database_time, interrupted_submission["id"]),
+        )
+        connection.execute(
+            "UPDATE transcription_job "
+            "SET status = 'processing', started_at = ?, cancellation_requested = 1 "
+            "WHERE public_id = ?",
+            (recovery_database_time, cancelling_submission["id"]),
+        )
+
+    capsys.readouterr()
+    second_clock = [recovery_clock]
+    second_probe = ConcurrencyProbe(
+        gated_metadata_urls=frozenset({first_preserved_url})
+    )
+    second_state = ControlledAdapterState(probe=second_probe)
+    second_application = _application(
+        migrated_database_path,
+        tmp_path / "second-media",
+        ControlledAdaptersFactory(second_state),
+        job_config=_job_config(migrated_database_path, job_worker_count=1),
+        clock=lambda: second_clock[0],
+    )
+    try:
+        async with second_application.router.lifespan_context(second_application):
+            transport = ASGITransport(app=second_application)
+            async with AsyncClient(
+                transport=transport,
+                base_url="http://test",
+            ) as client:
+                await second_probe.wait_for_metadata_calls(1)
+                first_preserved_location = first_preserved_submission["links"]["self"]
+                first_processing = _assert_processing(
+                    await client.get(first_preserved_location),
+                    first_preserved_location,
+                )
+                assert first_processing["id"] == first_preserved_submission["id"]
+                assert (
+                    first_processing["submitted_at"]
+                    == first_preserved_submission["submitted_at"]
+                )
+                second_preserved_location = second_preserved_submission["links"]["self"]
+                assert (
+                    await client.get(second_preserved_location)
+                ).json() == second_preserved_submission
+
+                expired_location = expired_submission["links"]["self"]
+                expired_payload = _assert_failed(
+                    await client.get(expired_location),
+                    expired_location,
+                    "queue_timeout",
+                    started=False,
+                )
+                assert (
+                    datetime.fromisoformat(cast(str, expired_payload["finished_at"]))
+                    == recovery_clock
+                )
+                interrupted_location = interrupted_submission["links"]["self"]
+                interrupted_payload = _assert_failed(
+                    await client.get(interrupted_location),
+                    interrupted_location,
+                    "worker_interrupted",
+                    started=True,
+                )
+                assert (
+                    datetime.fromisoformat(cast(str, interrupted_payload["started_at"]))
+                    == recovery_clock
+                )
+                assert (
+                    datetime.fromisoformat(
+                        cast(str, interrupted_payload["finished_at"])
+                    )
+                    == recovery_clock
+                )
+                cancelling_location = cancelling_submission["links"]["self"]
+                cancelling_payload = _assert_cancelled(
+                    await client.get(cancelling_location),
+                    cancelling_location,
+                    started=True,
+                )
+                assert (
+                    datetime.fromisoformat(cast(str, cancelling_payload["started_at"]))
+                    == recovery_clock
+                )
+                assert (
+                    datetime.fromisoformat(cast(str, cancelling_payload["finished_at"]))
+                    == recovery_clock
+                )
+
+                assert (
+                    await client.get(successful_location)
+                ).json() == successful_payload
+                assert (await client.get(failed_location)).json() == failed_payload
+                assert (
+                    await client.get(cancelled_location)
+                ).json() == cancelled_payload
+
+                second_clock[0] = second_deadline
+                second_probe.release_metadata()
+                _assert_succeeded(
+                    await _poll_until_finished(client, first_preserved_location),
+                    first_preserved_location,
+                )
+                _assert_failed(
+                    await _poll_until_finished(client, second_preserved_location),
+                    second_preserved_location,
+                    "queue_timeout",
+                    started=False,
+                )
+    finally:
+        second_probe.release_metadata()
+
+    recovery_output = capsys.readouterr().err
+    assert second_state.metadata_calls == [first_preserved_url]
+    assert second_state.caption_calls == []
+    assert second_state.download_calls == [first_preserved_url]
+    assert second_state.native_include_segments == [True]
+    assert second_probe.native_source_urls == (first_preserved_url,)
+    assert recovery_output.count("internal_job_id=") == 3
+    assert (
+        f"internal_job_id={internal_ids[expired_submission['id']]}" in recovery_output
+    )
+    assert (
+        f"internal_job_id={internal_ids[interrupted_submission['id']]}"
+        in recovery_output
+    )
+    assert (
+        f"internal_job_id={internal_ids[cancelling_submission['id']]}"
+        in recovery_output
+    )
+    assert "code=queue_timeout" in recovery_output
+    assert "code=worker_interrupted" in recovery_output
+    for submission in queued_submissions + (
+        successful_submission,
+        failed_submission,
+        cancelled_submission,
+    ):
+        assert submission["id"] not in recovery_output
+        assert submission["links"]["self"] not in recovery_output
+        assert submission["links"]["cancel"] not in recovery_output
+    assert successful_url not in recovery_output
+    assert transcript_sentinel not in recovery_output
+    assert provider_detail_sentinel not in recovery_output
+
+
+async def test_api_rolls_back_failed_startup_recovery(
+    migrated_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Abort startup when any durable recovery transition cannot commit."""
+    submitted_at = datetime(2026, 8, 24, tzinfo=UTC)
+    recovery_clock = submitted_at + timedelta(seconds=5)
+    submitted_database_time = submitted_at.replace(tzinfo=None).isoformat(sep=" ")
+    recovery_database_time = recovery_clock.replace(tzinfo=None).isoformat(sep=" ")
+    future_database_time = (
+        (submitted_at + timedelta(seconds=20)).replace(tzinfo=None).isoformat(sep=" ")
+    )
+    expired_id = str(uuid4())
+    interrupted_id = str(uuid4())
+    cancelling_id = str(uuid4())
+    rows = (
+        (
+            expired_id,
+            f"{TIKTOK_URL}?recovery_rollback=expired",
+            "queued",
+            submitted_database_time,
+            recovery_database_time,
+            None,
+            0,
+        ),
+        (
+            interrupted_id,
+            f"{TIKTOK_URL}?recovery_rollback=interrupted",
+            "processing",
+            submitted_database_time,
+            future_database_time,
+            recovery_database_time,
+            0,
+        ),
+        (
+            cancelling_id,
+            f"{TIKTOK_URL}?recovery_rollback=cancelling",
+            "processing",
+            submitted_database_time,
+            future_database_time,
+            recovery_database_time,
+            1,
+        ),
+    )
+    with sqlite3.connect(migrated_database_path) as connection:
+        connection.executemany(
+            "INSERT INTO transcription_job ("
+            "public_id, submitted_url, status, submitted_at, queue_deadline_at, "
+            "started_at, cancellation_requested"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        before_recovery = connection.execute(
+            "SELECT * FROM transcription_job ORDER BY id"
+        ).fetchall()
+        connection.execute(
+            "CREATE TRIGGER abort_processing_recovery "
+            "BEFORE UPDATE OF status ON transcription_job "
+            "WHEN OLD.status = 'processing' "
+            "BEGIN SELECT RAISE(ABORT, 'recovery update aborted'); END"
+        )
+
+    failed_state = ControlledAdapterState()
+    failed_factory = ControlledAdaptersFactory(failed_state)
+    failed_application = _application(
+        migrated_database_path,
+        tmp_path / "failed-recovery-media",
+        failed_factory,
+        clock=lambda: recovery_clock,
+    )
+    with pytest.raises(TranscriptionJobStoreUnavailableError):
+        async with failed_application.router.lifespan_context(failed_application):
+            pass
+    assert failed_application.state.ready is False
+    assert failed_factory.calls == 0
+    with sqlite3.connect(migrated_database_path) as connection:
+        after_failed_recovery = connection.execute(
+            "SELECT * FROM transcription_job ORDER BY id"
+        ).fetchall()
+        connection.execute("DROP TRIGGER abort_processing_recovery")
+    assert after_failed_recovery == before_recovery
+
+    recovered_state = ControlledAdapterState()
+    recovered_factory = ControlledAdaptersFactory(recovered_state)
+    recovered_application = _application(
+        migrated_database_path,
+        tmp_path / "recovered-media",
+        recovered_factory,
+        clock=lambda: recovery_clock,
+    )
+    async with recovered_application.router.lifespan_context(recovered_application):
+        transport = ASGITransport(app=recovered_application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            _assert_failed(
+                await client.get(f"/api/transcription-jobs/{expired_id}"),
+                f"/api/transcription-jobs/{expired_id}",
+                "queue_timeout",
+                started=False,
+            )
+            _assert_failed(
+                await client.get(f"/api/transcription-jobs/{interrupted_id}"),
+                f"/api/transcription-jobs/{interrupted_id}",
+                "worker_interrupted",
+                started=True,
+            )
+            _assert_cancelled(
+                await client.get(f"/api/transcription-jobs/{cancelling_id}"),
+                f"/api/transcription-jobs/{cancelling_id}",
+                started=True,
+            )
+    assert recovered_factory.calls == 1
+    assert recovered_state.metadata_calls == []
+    assert recovered_state.download_calls == []
+    assert recovered_state.native_include_segments == []
+
+
+async def test_api_shutdown_closes_admission_and_preserves_queued_deadline(
+    migrated_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Finish active work without claiming queued work or extending its deadline."""
+    initial = datetime(2026, 8, 24, tzinfo=UTC)
+    first_clock = [initial]
+    active_url = f"{TIKTOK_URL}?shutdown_deadline=active"
+    queued_url = f"{TIKTOK_URL}?shutdown_deadline=queued"
+    rejected_url = f"{TIKTOK_URL}?shutdown_deadline=rejected"
+    first_state = ControlledAdapterState(block_metadata=True)
+    first_application = _application(
+        migrated_database_path,
+        tmp_path / "first-media",
+        ControlledAdaptersFactory(first_state),
+        clock=lambda: first_clock[0],
+    )
+
+    async with first_application.router.lifespan_context(first_application):
+        transport = ASGITransport(app=first_application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            try:
+                active_location = _assert_submission(
+                    await client.post(
+                        "/api/transcription-jobs",
+                        json={"url": active_url},
+                    )
+                )["links"]["self"]
+                await _wait_for_thread_event(first_state.metadata_entered)
+                queued_submission = _assert_submission(
+                    await client.post(
+                        "/api/transcription-jobs",
+                        json={"url": queued_url},
+                    )
+                )
+                shutdown_task = asyncio.create_task(
+                    first_application.state.transcription_job_coordinator.shutdown()
+                )
+                await asyncio.sleep(0)
+                rejected = await client.post(
+                    "/api/transcription-jobs",
+                    json={"url": rejected_url},
+                )
+                _assert_safe_error(
+                    rejected,
+                    503,
+                    "transcription_capacity_exceeded",
+                )
+                first_state.metadata_release.set()
+                await shutdown_task
+                _assert_succeeded(
+                    await client.get(active_location),
+                    active_location,
+                )
+                assert (
+                    await client.get(queued_submission["links"]["self"])
+                ).json() == queued_submission
+            finally:
+                first_state.metadata_release.set()
+
+    second_state = ControlledAdapterState()
+    second_application = _application(
+        migrated_database_path,
+        tmp_path / "second-media",
+        ControlledAdaptersFactory(second_state),
+        clock=lambda: initial + timedelta(seconds=20),
+    )
+    async with second_application.router.lifespan_context(second_application):
+        transport = ASGITransport(app=second_application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            queued_location = queued_submission["links"]["self"]
+            _assert_failed(
+                await client.get(queued_location),
+                queued_location,
+                "queue_timeout",
+                started=False,
+            )
+
+    assert first_state.metadata_calls == [active_url]
+    assert first_state.download_calls == [active_url]
+    assert first_state.native_include_segments == [True]
+    assert rejected_url not in first_state.metadata_calls
+    assert second_state.metadata_calls == []
+    assert second_state.download_calls == []
+    assert second_state.native_include_segments == []
+
+
+async def test_api_shutdown_wakes_idle_consumers(
+    migrated_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Wake every idle consumer before the lifespan invokes idempotent shutdown."""
+    application = _application(
+        migrated_database_path,
+        tmp_path / "media",
+        ControlledAdaptersFactory(ControlledAdapterState()),
+        job_config=_job_config(migrated_database_path, job_worker_count=4),
+    )
+    async with application.router.lifespan_context(application):
+        await asyncio.sleep(0)
+        async with asyncio.timeout(1):
+            await application.state.transcription_job_coordinator.shutdown()
+
+
+async def test_api_shutdown_waits_for_retained_native_finalizers(
+    migrated_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Wait for retained native ownership before returning from shutdown."""
+    native_url = f"{TIKTOK_URL}?shutdown_native=retained"
+    probe = ConcurrencyProbe(gate_native_calls=True)
+    state = ControlledAdapterState(probe=probe)
+    settings = _transcription_config(
+        tmp_path / "media",
+        transcription_concurrency=1,
+        transcription_timeout_seconds=0.05,
+    )
+    application = _application(
+        migrated_database_path,
+        tmp_path / "media",
+        ControlledAdaptersFactory(state),
+        settings=settings,
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            try:
+                location = _assert_submission(
+                    await client.post(
+                        "/api/transcription-jobs",
+                        json={"url": native_url},
+                    )
+                )["links"]["self"]
+                await probe.wait_for_native_calls(1)
+                audio_path = state.audio_paths_by_source[native_url]
+                _assert_failed(
+                    await _poll_until_finished(client, location),
+                    location,
+                    "transcription_timeout",
+                    started=True,
+                )
+
+                shutdown_task = asyncio.create_task(
+                    application.state.transcription_job_coordinator.shutdown()
+                )
+                await asyncio.sleep(0)
+                assert shutdown_task.done() is False
+                assert probe.active_native_calls == 1
+                assert audio_path.is_file()
+
+                probe.release_native()
+                await shutdown_task
+                assert probe.active_native_calls == 0
+                assert audio_path.exists() is False
+            finally:
+                probe.release_native()
+
+
+def _internal_job_id_for_public_id(
+    connection: sqlite3.Connection,
+    public_id: str,
+) -> int:
+    """Return one persisted internal identifier for a public capability."""
+    row = connection.execute(
+        "SELECT id FROM transcription_job WHERE public_id = ?",
+        (public_id,),
+    ).fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+def _job_storage_counts(
+    connection: sqlite3.Connection,
+    internal_job_id: int,
+) -> tuple[int, int, int, int]:
+    """Count one job and its cascade-owned rows by durable internal identifier."""
+    parent_count = connection.execute(
+        "SELECT COUNT(*) FROM transcription_job WHERE id = ?",
+        (internal_job_id,),
+    ).fetchone()[0]
+    exclusion_count = connection.execute(
+        "SELECT COUNT(*) FROM transcription_job_exclusion WHERE job_id = ?",
+        (internal_job_id,),
+    ).fetchone()[0]
+    result_count = connection.execute(
+        "SELECT COUNT(*) FROM transcription_job_result WHERE job_id = ?",
+        (internal_job_id,),
+    ).fetchone()[0]
+    segment_count = connection.execute(
+        "SELECT COUNT(*) FROM transcription_job_segment WHERE job_id = ?",
+        (internal_job_id,),
+    ).fetchone()[0]
+    return (
+        int(parent_count),
+        int(exclusion_count),
+        int(result_count),
+        int(segment_count),
+    )
+
+
+@pytest.mark.parametrize("outcome", ("succeeded", "failed", "cancelled"))
+async def test_api_hides_terminal_jobs_at_the_retention_cutoff(
+    outcome: str,
+    capsys: pytest.CaptureFixture[str],
+    migrated_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Retain each terminal outcome through, but not at, its finish-based cutoff."""
+    initial = datetime(2026, 8, 24, tzinfo=UTC)
+    finished_at = initial + timedelta(minutes=10)
+    now = [initial]
+    state = ControlledAdapterState(block_metadata=True)
+    if outcome == "failed":
+        state.metadata_error = MetadataRetrievalFailedError()
+    submitted_url = f"{TIKTOK_URL}?retention-cutoff={outcome}"
+    application = _application(
+        migrated_database_path,
+        tmp_path / "media",
+        ControlledAdaptersFactory(state),
+        clock=lambda: now[0],
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            submission = _assert_submission(
+                await client.post(
+                    "/api/transcription-jobs",
+                    json={"url": submitted_url},
+                )
+            )
+            location = submission["links"]["self"]
+            await _wait_for_thread_event(state.metadata_entered)
+            now[0] = finished_at
+
+            if outcome == "cancelled":
+                _assert_processing(
+                    await client.put(f"{location}/cancellation"),
+                    location,
+                    expected_status=202,
+                    cancellation_requested=True,
+                )
+            else:
+                state.metadata_release.set()
+
+            terminal_response = await _poll_until_finished(client, location)
+            if outcome == "succeeded":
+                terminal_payload = _assert_succeeded(terminal_response, location)
+            elif outcome == "failed":
+                terminal_payload = _assert_failed(
+                    terminal_response,
+                    location,
+                    MetadataRetrievalFailedError.code,
+                    started=True,
+                )
+            else:
+                terminal_payload = _assert_cancelled(
+                    terminal_response,
+                    location,
+                    started=True,
+                )
+            assert (
+                datetime.fromisoformat(cast(str, terminal_payload["finished_at"]))
+                == finished_at
+            )
+
+            now[0] = finished_at + timedelta(seconds=86_400, microseconds=-1)
+            before_cutoff = await client.get(location)
+            assert before_cutoff.headers["Cache-Control"] == "no-store"
+            assert before_cutoff.json() == terminal_payload
+
+            now[0] = finished_at + timedelta(seconds=86_400)
+            unknown_id = uuid4()
+            expired_status = await client.get(location)
+            unknown_status = await client.get(f"/api/transcription-jobs/{unknown_id}")
+            expired_cancellation = await client.put(f"{location}/cancellation")
+            unknown_cancellation = await client.put(
+                f"/api/transcription-jobs/{unknown_id}/cancellation"
+            )
+
+            for response in (
+                expired_status,
+                unknown_status,
+                expired_cancellation,
+                unknown_cancellation,
+            ):
+                _assert_safe_error(response, 404, "job_not_found")
+            assert expired_status.json() == unknown_status.json()
+            assert expired_cancellation.json() == unknown_cancellation.json()
+            with sqlite3.connect(migrated_database_path) as connection:
+                assert (
+                    connection.execute(
+                        "SELECT COUNT(*) FROM transcription_job WHERE public_id = ?",
+                        (submission["id"],),
+                    ).fetchone()[0]
+                    == 1
+                )
+
+    output = capsys.readouterr().err
+    for sentinel in (
+        submission["id"],
+        location,
+        f"{location}/cancellation",
+        submitted_url,
+    ):
+        assert sentinel not in output
+
+
+async def test_api_deletes_expired_terminal_job_cascades_during_startup(
+    capsys: pytest.CaptureFixture[str],
+    migrated_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Delete expired successful jobs and every owned row before restart traffic."""
+    initial = datetime(2026, 8, 24, tzinfo=UTC)
+    finished_at = initial + timedelta(minutes=10)
+    now = [initial]
+    transcript_sentinel = "terminal-retention-transcript-sentinel"
+    submitted_url = f"{YOUTUBE_URL}&terminal-retention-url-sentinel=restart"
+    media_root = tmp_path / "terminal-retention-local-media-sentinel"
+    first_state = ControlledAdapterState(
+        block_metadata=True,
+        caption_segments=((0.0, 1.0, transcript_sentinel),),
+    )
+    first_application = _application(
+        migrated_database_path,
+        media_root,
+        ControlledAdaptersFactory(first_state),
+        clock=lambda: now[0],
+    )
+
+    async with first_application.router.lifespan_context(first_application):
+        transport = ASGITransport(app=first_application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            submission = _assert_submission(
+                await client.post(
+                    "/api/transcription-jobs",
+                    json={"url": submitted_url, "exclude": ["source.description"]},
+                )
+            )
+            location = submission["links"]["self"]
+            await _wait_for_thread_event(first_state.metadata_entered)
+            now[0] = finished_at
+            first_state.metadata_release.set()
+            terminal_payload = _assert_succeeded(
+                await _poll_until_finished(client, location),
+                location,
+            )
+            assert (
+                datetime.fromisoformat(cast(str, terminal_payload["finished_at"]))
+                == finished_at
+            )
+
+    with sqlite3.connect(migrated_database_path) as connection:
+        internal_job_id = _internal_job_id_for_public_id(connection, submission["id"])
+        assert _job_storage_counts(connection, internal_job_id) == (1, 1, 1, 1)
+
+    capsys.readouterr()
+    now[0] = finished_at + timedelta(seconds=86_400)
+    reopened_state = ControlledAdapterState()
+    reopened_factory = ControlledAdaptersFactory(reopened_state)
+    reopened_application = _application(
+        migrated_database_path,
+        tmp_path / "reopened-media",
+        reopened_factory,
+        clock=lambda: now[0],
+    )
+    async with reopened_application.router.lifespan_context(reopened_application):
+        assert reopened_application.state.ready is True
+        with sqlite3.connect(migrated_database_path) as connection:
+            assert _job_storage_counts(connection, internal_job_id) == (0, 0, 0, 0)
+        transport = ASGITransport(app=reopened_application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            _assert_safe_error(await client.get(location), 404, "job_not_found")
+
+    assert reopened_factory.calls == 1
+    assert reopened_state.metadata_calls == []
+    assert reopened_state.caption_calls == []
+    assert reopened_state.download_calls == []
+    assert reopened_state.native_include_segments == []
+    output = capsys.readouterr().err
+    for sentinel in (
+        submission["id"],
+        location,
+        f"{location}/cancellation",
+        submitted_url,
+        str(media_root),
+        "source.description",
+        transcript_sentinel,
+    ):
+        assert sentinel not in output
+
+
+async def test_api_rolls_back_failed_startup_terminal_retention_cleanup(
+    capsys: pytest.CaptureFixture[str],
+    migrated_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Leave every retained row intact when startup terminal cleanup cannot commit."""
+    initial = datetime(2026, 8, 24, tzinfo=UTC)
+    finished_at = initial + timedelta(minutes=10)
+    now = [initial]
+    first_state = ControlledAdapterState(block_metadata=True)
+    first_application = _application(
+        migrated_database_path,
+        tmp_path / "first-media",
+        ControlledAdaptersFactory(first_state),
+        clock=lambda: now[0],
+    )
+
+    async with first_application.router.lifespan_context(first_application):
+        transport = ASGITransport(app=first_application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            submission = _assert_submission(
+                await client.post(
+                    "/api/transcription-jobs",
+                    json={
+                        "url": f"{TIKTOK_URL}?retention-startup-delete=blocked",
+                        "exclude": ["source.description"],
+                    },
+                )
+            )
+            location = submission["links"]["self"]
+            await _wait_for_thread_event(first_state.metadata_entered)
+            now[0] = finished_at
+            first_state.metadata_release.set()
+            _assert_succeeded(
+                await _poll_until_finished(client, location),
+                location,
+            )
+
+    with sqlite3.connect(migrated_database_path) as connection:
+        internal_job_id = _internal_job_id_for_public_id(connection, submission["id"])
+        before_cleanup = _job_storage_counts(connection, internal_job_id)
+        connection.execute(
+            """
+            CREATE TRIGGER abort_terminal_retention_cleanup
+            BEFORE DELETE ON transcription_job
+            WHEN OLD.status = 'finished'
+            BEGIN SELECT RAISE(ABORT, 'terminal retention cleanup blocked'); END
+            """
+        )
+
+    capsys.readouterr()
+    now[0] = finished_at + timedelta(seconds=86_400)
+    failed_factory = ControlledAdaptersFactory(ControlledAdapterState())
+    failed_application = _application(
+        migrated_database_path,
+        tmp_path / "failed-cleanup-media",
+        failed_factory,
+        clock=lambda: now[0],
+    )
+    with pytest.raises(TranscriptionJobStoreUnavailableError):
+        async with failed_application.router.lifespan_context(failed_application):
+            pass
+
+    assert failed_application.state.ready is False
+    assert failed_factory.calls == 0
+    with sqlite3.connect(migrated_database_path) as connection:
+        assert _job_storage_counts(connection, internal_job_id) == before_cleanup
+        connection.execute("DROP TRIGGER abort_terminal_retention_cleanup")
+
+    output = capsys.readouterr().err
+    assert "transcription job retention cleanup failed" in output
+    assert "code=job_store_unavailable" in output
+    assert submission["id"] not in output
+    assert location not in output
+
+
+async def test_api_periodically_deletes_expired_terminal_jobs_and_checkpoints_wal(
+    capsys: pytest.CaptureFixture[str],
+    migrated_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Delete terminal cascades without hiding queued or processing jobs."""
+    initial = datetime(2026, 8, 24, tzinfo=UTC)
+    now = [initial]
+    transcript_sentinel = "terminal-retention-periodic-transcript-sentinel"
+    terminal_url = f"{YOUTUBE_URL}&terminal-retention-url-sentinel=periodic"
+    processing_url = f"{TIKTOK_URL}?terminal-retention-processing-sentinel"
+    queued_url = f"{TIKTOK_URL}?terminal-retention-queued-sentinel"
+    media_root = tmp_path / "terminal-retention-local-media-sentinel"
+    state = ControlledAdapterState(
+        caption_segments=((0.0, 1.0, transcript_sentinel),),
+    )
+    application = _application(
+        migrated_database_path,
+        media_root,
+        ControlledAdaptersFactory(state),
+        clock=lambda: now[0],
+        retention_cleanup_interval=timedelta(milliseconds=250),
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = ASGITransport(app=application)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            terminal_submission = _assert_submission(
+                await client.post(
+                    "/api/transcription-jobs",
+                    json={"url": terminal_url, "exclude": ["source.description"]},
+                )
+            )
+            terminal_location = terminal_submission["links"]["self"]
+            terminal_payload = _assert_succeeded(
+                await _poll_until_finished(client, terminal_location),
+                terminal_location,
+            )
+            terminal_finished_at = datetime.fromisoformat(
+                cast(str, terminal_payload["finished_at"])
+            )
+            with sqlite3.connect(migrated_database_path) as connection:
+                terminal_internal_id = _internal_job_id_for_public_id(
+                    connection,
+                    terminal_submission["id"],
+                )
+                assert _job_storage_counts(connection, terminal_internal_id) == (
+                    1,
+                    1,
+                    1,
+                    1,
+                )
+
+            state.block_metadata = True
+            state.metadata_entered.clear()
+            state.metadata_release.clear()
+            try:
+                processing_submission = _assert_submission(
+                    await client.post(
+                        "/api/transcription-jobs",
+                        json={"url": processing_url},
+                    )
+                )
+                processing_location = processing_submission["links"]["self"]
+                await _wait_for_thread_event(state.metadata_entered)
+                queued_submission = _assert_submission(
+                    await client.post(
+                        "/api/transcription-jobs",
+                        json={"url": queued_url},
+                    )
+                )
+                queued_location = queued_submission["links"]["self"]
+
+                retention_lock = sqlite3.connect(migrated_database_path)
+                try:
+                    retention_lock.execute("BEGIN IMMEDIATE")
+                    now[0] = terminal_finished_at + timedelta(seconds=86_400)
+                    _assert_safe_error(
+                        await client.get(terminal_location),
+                        404,
+                        "job_not_found",
+                    )
+                    with sqlite3.connect(migrated_database_path) as connection:
+                        assert _job_storage_counts(
+                            connection,
+                            terminal_internal_id,
+                        ) == (1, 1, 1, 1)
+                finally:
+                    retention_lock.rollback()
+                    retention_lock.close()
+
+                await _wait_until(
+                    lambda: _terminal_job_rows_are_deleted(
+                        migrated_database_path,
+                        terminal_internal_id,
+                    ),
+                    "Periodic terminal retention cleanup did not delete the job.",
+                )
+
+                _assert_processing(
+                    await client.get(processing_location),
+                    processing_location,
+                )
+                assert (await client.get(queued_location)).json() == queued_submission
+                with sqlite3.connect(migrated_database_path) as connection:
+                    assert _job_storage_counts(connection, terminal_internal_id) == (
+                        0,
+                        0,
+                        0,
+                        0,
+                    )
+                await _wait_until(
+                    lambda: _wal_is_checkpointed(migrated_database_path),
+                    "Periodic terminal retention cleanup did not checkpoint the WAL.",
+                )
+            finally:
+                state.metadata_release.set()
+
+    output = capsys.readouterr().err
+    for sentinel in (
+        terminal_submission["id"],
+        terminal_location,
+        f"{terminal_location}/cancellation",
+        terminal_url,
+        str(media_root),
+        "source.description",
+        transcript_sentinel,
+    ):
+        assert sentinel not in output
+
+
+def _terminal_job_rows_are_deleted(
+    database_path: Path,
+    internal_job_id: int,
+) -> bool:
+    """Return whether a terminal job and all cascade-owned rows are absent."""
+    with sqlite3.connect(database_path) as connection:
+        return _job_storage_counts(connection, internal_job_id) == (0, 0, 0, 0)
+
+
+def _wal_is_checkpointed(database_path: Path) -> bool:
+    """Return whether every current WAL page has already been checkpointed."""
+    with sqlite3.connect(database_path) as connection:
+        checkpoint = connection.execute("PRAGMA wal_checkpoint(NOOP)").fetchone()
+    return (
+        checkpoint is not None and checkpoint[0] == 0 and checkpoint[1] == checkpoint[2]
+    )

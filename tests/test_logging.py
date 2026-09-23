@@ -46,6 +46,7 @@ def test_configured_logging_renders_only_safe_request_fields(
             extra={
                 "stage": "request",
                 "elapsed_seconds": 0.25,
+                "internal_job_id": 73,
                 **sensitive_values,
             },
         )
@@ -61,6 +62,7 @@ def test_configured_logging_renders_only_safe_request_fields(
         "method",
         "platform",
         "request_id",
+        "internal_job_id",
         "source_id",
         "stage",
     }
@@ -69,6 +71,7 @@ def test_configured_logging_renders_only_safe_request_fields(
         "duration_seconds=12",
         "elapsed_seconds=0.25",
         "method=faster_whisper",
+        "internal_job_id=73",
         "platform=tiktok",
         "request_id=request-id-sentinel",
         "source_id=source-id-sentinel",
