@@ -448,7 +448,8 @@ async def test_api_closes_storage_before_adapter_construction_failure(
 
     assert application.state.ready is False
     assert factory_calls == 1
-    assert not hasattr(application.state, "transcription_job_coordinator")
+    assert not hasattr(application.state, "transcription_job_service")
+    assert not hasattr(application.state, "transcription_job_runner")
 
 
 @pytest.mark.asyncio
@@ -504,7 +505,8 @@ async def test_api_closes_partially_scheduled_job_tasks(
     gc.collect()
     assert application.state.ready is False
     assert factory.calls == 1
-    assert not hasattr(application.state, "transcription_job_coordinator")
+    assert not hasattr(application.state, "transcription_job_service")
+    assert not hasattr(application.state, "transcription_job_runner")
     assert created_tasks
     assert all(task.done() for task in created_tasks)
     assert not [

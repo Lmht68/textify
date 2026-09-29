@@ -20,7 +20,7 @@ from yt_dlp.utils import DownloadCancelled
 
 from textify.config import AppConfig, Environment
 from textify.jobs.config import JobConfig
-from textify.jobs.repository import TranscriptionJobStoreUnavailableError
+from textify.jobs.contracts import TranscriptionJobStoreUnavailableError
 from textify.jobs.service import utc_now
 from textify.main import create_app
 from textify.transcription import inspection
@@ -2555,7 +2555,7 @@ async def test_api_recovers_every_durable_state_without_retries(
             )
 
             shutdown_task = asyncio.create_task(
-                first_application.state.transcription_job_coordinator.shutdown()
+                first_application.state.transcription_job_runner.shutdown()
             )
             await asyncio.sleep(0)
             first_state.metadata_release.set()
@@ -2901,7 +2901,7 @@ async def test_api_shutdown_closes_admission_and_preserves_queued_deadline(
                     )
                 )
                 shutdown_task = asyncio.create_task(
-                    first_application.state.transcription_job_coordinator.shutdown()
+                    first_application.state.transcription_job_runner.shutdown()
                 )
                 await asyncio.sleep(0)
                 rejected = await client.post(
@@ -2966,7 +2966,7 @@ async def test_api_shutdown_wakes_idle_consumers(
     async with application.router.lifespan_context(application):
         await asyncio.sleep(0)
         async with asyncio.timeout(1):
-            await application.state.transcription_job_coordinator.shutdown()
+            await application.state.transcription_job_runner.shutdown()
 
 
 async def test_api_shutdown_waits_for_retained_native_finalizers(
@@ -3009,7 +3009,7 @@ async def test_api_shutdown_waits_for_retained_native_finalizers(
                 )
 
                 shutdown_task = asyncio.create_task(
-                    application.state.transcription_job_coordinator.shutdown()
+                    application.state.transcription_job_runner.shutdown()
                 )
                 await asyncio.sleep(0)
                 assert shutdown_task.done() is False

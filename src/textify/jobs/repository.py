@@ -35,6 +35,11 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from textify.errors import ErrorDetail
+from textify.jobs.contracts import (
+    TranscriptionJobAlreadyFinishedError,
+    TranscriptionJobCapacityError,
+    TranscriptionJobStoreUnavailableError,
+)
 from textify.jobs.exceptions import QueueTimeoutError, WorkerInterruptedError
 from textify.jobs.types import (
     CancellationResult,
@@ -262,18 +267,6 @@ _TRANSCRIPT_RESULT_COLUMNS = (
     ("transcript.language", "language", "transcript_language"),
     ("transcript.text", "text", "transcript_text"),
 )
-
-
-class TranscriptionJobCapacityError(RuntimeError):
-    """Indicate durable job admission has reached its configured maximum."""
-
-
-class TranscriptionJobStoreUnavailableError(RuntimeError):
-    """Indicate SQLite could not safely persist or read a Transcription Job."""
-
-
-class TranscriptionJobAlreadyFinishedError(RuntimeError):
-    """Indicate a cancellation request targeted a completed non-cancelled job."""
 
 
 class SqliteTranscriptionJobRepository:

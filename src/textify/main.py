@@ -25,22 +25,21 @@ from textify.errors import (
     unhandled_error_handler,
 )
 from textify.jobs.config import JobConfig
+from textify.jobs.contracts import TranscriptionJobStoreUnavailableError
 from textify.jobs.database import (
     create_application_engine,
     verify_application_database,
 )
 from textify.jobs.exceptions import JobStoreUnavailableError
 from textify.jobs.http import TranscriptionJobHeadersMiddleware
-from textify.jobs.repository import (
-    SqliteTranscriptionJobRepository,
-    TranscriptionJobStoreUnavailableError,
-)
+from textify.jobs.repository import SqliteTranscriptionJobRepository
 from textify.jobs.router import router as transcription_job_router
-from textify.jobs.service import (
-    TranscriptionJobCoordinator,
+from textify.jobs.runner import (
+    InProcessTranscriptionJobRunner,
     recover_transcription_jobs,
-    utc_now,
 )
+from textify.jobs.runtime import TranscriptionJobLifecycleState
+from textify.jobs.service import TranscriptionJobService, utc_now
 from textify.logging import configure_logging, request_log_context
 from textify.ops import router as operations_router
 from textify.transcription.config import TranscriptionConfig
@@ -273,21 +272,24 @@ def create_app(
                 """Make readiness fail after a durable-store failure."""
                 application.state.ready = False
 
-            coordinator = TranscriptionJobCoordinator(
+            lifecycle_state = TranscriptionJobLifecycleState(mark_application_unready)
+            runner = InProcessTranscriptionJobRunner(
                 repository,
                 executor,
                 resolved_job_config.job_worker_count,
                 retention_cleanup_interval,
-                on_store_unavailable=mark_application_unready,
+                lifecycle_state,
             )
-            await coordinator.start()
-            application.state.transcription_job_coordinator = coordinator
+            service = TranscriptionJobService(repository, runner, lifecycle_state)
+            await runner.start()
+            application.state.transcription_job_service = service
+            application.state.transcription_job_runner = runner
             application.state.ready = True
             try:
                 yield
             finally:
                 application.state.ready = False
-                await coordinator.shutdown()
+                await runner.shutdown()
         finally:
             await engine.dispose()
 

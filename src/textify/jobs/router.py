@@ -15,7 +15,7 @@ from textify.jobs.schemas import (
     SucceededTranscriptionJobResponse,
     TranscriptionJobResponse,
 )
-from textify.jobs.service import TranscriptionJobCoordinator
+from textify.jobs.service import TranscriptionJobService
 from textify.jobs.types import (
     CancelledTranscriptionJob,
     FailedTranscriptionJob,
@@ -29,31 +29,29 @@ from textify.transcription.schemas import TranscriptRequest
 router = APIRouter(prefix="/api/transcription-jobs")
 
 
-async def get_transcription_job_coordinator(
+async def get_transcription_job_service(
     request: Request,
-) -> TranscriptionJobCoordinator:
-    """Return the lifespan-owned durable job coordinator.
+) -> TranscriptionJobService:
+    """Return the lifespan-owned durable job service.
 
     Args:
         request: Current HTTP request with application state.
 
     Returns:
-        Application-owned durable job coordinator.
+        Application-owned durable job service.
 
     Raises:
-        RuntimeError: If the application lifespan has not initialized the coordinator.
+        RuntimeError: If the application lifespan has not initialized the service.
     """
-    coordinator = getattr(request.app.state, "transcription_job_coordinator", None)
-    if coordinator is None:
-        raise RuntimeError(
-            "Transcription Job coordinator is unavailable before startup."
-        )
-    return cast(TranscriptionJobCoordinator, coordinator)
+    service = getattr(request.app.state, "transcription_job_service", None)
+    if service is None:
+        raise RuntimeError("Transcription Job service is unavailable before startup.")
+    return cast(TranscriptionJobService, service)
 
 
-type TranscriptionJobCoordinatorDependency = Annotated[
-    TranscriptionJobCoordinator,
-    Depends(get_transcription_job_coordinator),
+type TranscriptionJobServiceDependency = Annotated[
+    TranscriptionJobService,
+    Depends(get_transcription_job_service),
 ]
 
 JobCapability = Annotated[
@@ -154,19 +152,19 @@ async def _require_empty_request_body(request: Request) -> None:
 async def create_transcription_job(
     request: TranscriptRequest,
     response: Response,
-    coordinator: TranscriptionJobCoordinatorDependency,
+    service: TranscriptionJobServiceDependency,
 ) -> QueuedTranscriptionJobResponse:
     """Accept one valid Supported Platform URL as a durable queued job.
 
     Args:
         request: Strict submission payload with immutable response exclusions.
         response: Outgoing response used to publish acceptance headers.
-        coordinator: Lifespan-owned durable job coordinator.
+        service: Lifespan-owned durable job service.
 
     Returns:
         Committed queued-job capability representation.
     """
-    queued_job = await coordinator.submit(request.url, frozenset(request.exclude))
+    queued_job = await service.submit(request.url, frozenset(request.exclude))
     queued_response = _queued_response(queued_job)
     response.headers["Location"] = queued_response.links.self
     response.headers["Retry-After"] = "2"
@@ -215,19 +213,19 @@ async def create_transcription_job(
 async def get_transcription_job(
     job_id: JobCapability,
     response: Response,
-    coordinator: TranscriptionJobCoordinatorDependency,
+    service: TranscriptionJobServiceDependency,
 ) -> TranscriptionJobResponse:
     """Inspect one Transcription Job through its bearer capability.
 
     Args:
-        job_id: Opaque path capability parsed by the coordinator.
+        job_id: Opaque path capability parsed by the service.
         response: Outgoing response used to publish safe caching headers.
-        coordinator: Lifespan-owned durable job coordinator.
+        service: Lifespan-owned durable job service.
 
     Returns:
         Current typed job representation for the capability.
     """
-    job = await coordinator.get_status(job_id)
+    job = await service.get_status(job_id)
     job_response = _job_response(job)
     if isinstance(job, (QueuedTranscriptionJob, ProcessingTranscriptionJob)):
         response.headers["Retry-After"] = "2"
@@ -286,21 +284,21 @@ async def cancel_transcription_job(
     job_id: JobCapability,
     request: Request,
     response: Response,
-    coordinator: TranscriptionJobCoordinatorDependency,
+    service: TranscriptionJobServiceDependency,
 ) -> ProcessingTranscriptionJobResponse | CancelledTranscriptionJobResponse:
     """Accept cancellation for one queued or processing Transcription Job.
 
     Args:
-        job_id: Opaque path capability parsed by the coordinator.
+        job_id: Opaque path capability parsed by the service.
         request: Raw request used to reject every nonempty body.
         response: Outgoing response used to publish processing retry guidance.
-        coordinator: Lifespan-owned durable job coordinator.
+        service: Lifespan-owned durable job service.
 
     Returns:
         Current processing or cancelled terminal representation for the capability.
     """
     await _require_empty_request_body(request)
-    job = await coordinator.cancel(job_id)
+    job = await service.cancel(job_id)
     if isinstance(job, ProcessingTranscriptionJob):
         response.status_code = status.HTTP_202_ACCEPTED
         response.headers["Retry-After"] = "2"
