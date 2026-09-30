@@ -10,10 +10,11 @@ ENV UV_PYTHON=python3.12 \
     HF_HOME=/var/cache/textify/huggingface \
     TEXTIFY_HOST=0.0.0.0 \
     TEXTIFY_TEMPORARY_MEDIA_ROOT=/var/lib/textify/media \
-    TEXTIFY_JOB_WORKER_COUNT=4 \
+    TEXTIFY_WORKER_CONCURRENCY=4 \
     TEXTIFY_MAX_OUTSTANDING_JOBS=8 \
     TEXTIFY_JOB_QUEUE_TIMEOUT_SECONDS=20 \
     TEXTIFY_JOB_RETENTION_SECONDS=86400 \
+    TEXTIFY_RECONCILER_INTERVAL_SECONDS=1.0 \
     TEXTIFY_TRANSCRIPTION_CONCURRENCY=2 \
     TEXTIFY_MAX_MEDIA_BYTES=536870912 \
     TEXTIFY_WHISPER_MODEL=large-v3-turbo \
@@ -43,4 +44,4 @@ RUN uv sync --frozen --no-dev --no-editable
 VOLUME ["/var/cache/textify/huggingface", "/var/lib/textify"]
 EXPOSE 8182
 USER 10001:10001
-CMD ["sh", "-c", "alembic upgrade head && exec textify"]
+CMD ["textify"]

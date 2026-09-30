@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import AsyncIterator, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import uuid1, uuid4
+from uuid import UUID, uuid1, uuid4
 
 import pytest
 from alembic import command
@@ -21,11 +21,13 @@ from textify.jobs.database import EXPECTED_DATABASE_REVISION, create_application
 PROJECT_ROOT = Path(__file__).parent.parent
 APPLICATION_TABLES = {
     "transcription_job",
+    "transcription_job_execution_attempt",
     "transcription_job_exclusion",
     "transcription_job_result",
     "transcription_job_segment",
 }
 _STORAGE_TRIGGER_NAMES = {
+    "transcription_job_storage_execution_attempt_check",
     "transcription_job_storage_job_check",
     "transcription_job_storage_exclusion_check",
     "transcription_job_storage_result_check",
@@ -39,6 +41,7 @@ _CHECK_CONSTRAINT_NAMES = {
     "transcription_job_timestamp_order_check",
     "transcription_job_error_pair_check",
     "transcription_job_lifecycle_check",
+    "transcription_job_execution_attempt_token_uuid4_check",
     "transcription_job_exclusion_field_path_check",
     "transcription_job_result_platform_check",
     "transcription_job_result_method_check",
@@ -98,6 +101,78 @@ async def test_initial_migration_round_trip(
         await engine.dispose()
 
 
+async def test_execution_attempt_migration_backfills_and_round_trips_populated_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+    postgresql_database_url: str,
+) -> None:
+    """Backfill one UUIDv4 attempt per existing job and retain downgrade support."""
+    monkeypatch.setenv("TEXTIFY_DATABASE_URL", postgresql_database_url)
+    alembic_config = Config(str(PROJECT_ROOT / "alembic.ini"))
+    engine = create_application_engine(postgresql_database_url)
+    now = datetime.now(UTC)
+    try:
+        await asyncio.to_thread(
+            command.upgrade,
+            alembic_config,
+            "0001_postgresql_jobs",
+        )
+        async with engine.begin() as connection:
+            first_job_id = await _insert_job(
+                connection,
+                _queued_values(now),
+                with_execution_attempt=False,
+            )
+            second_job_id = await _insert_job(
+                connection,
+                _queued_values(now),
+                with_execution_attempt=False,
+            )
+
+        await asyncio.to_thread(command.upgrade, alembic_config, "head")
+        async with engine.connect() as connection:
+            attempt_rows = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT job_id, execution_attempt_token "
+                            "FROM transcription_job_execution_attempt "
+                            "ORDER BY job_id"
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        assert await _revision_rows(engine) == [EXPECTED_DATABASE_REVISION]
+        assert [row["job_id"] for row in attempt_rows] == [
+            first_job_id,
+            second_job_id,
+        ]
+        for attempt_row in attempt_rows:
+            token = attempt_row["execution_attempt_token"]
+            assert isinstance(token, UUID)
+            assert token.version == 4
+
+        await asyncio.to_thread(
+            command.downgrade,
+            alembic_config,
+            "0001_postgresql_jobs",
+        )
+        assert await _revision_rows(engine) == ["0001_postgresql_jobs"]
+        assert await _application_table_names(engine) == (
+            APPLICATION_TABLES - {"transcription_job_execution_attempt"}
+        )
+
+        await asyncio.to_thread(command.upgrade, alembic_config, "head")
+        async with engine.connect() as connection:
+            reupgraded_attempt_count = await connection.scalar(
+                text("SELECT count(*) FROM transcription_job_execution_attempt")
+            )
+        assert reupgraded_attempt_count == 2
+    finally:
+        await engine.dispose()
+
+
 async def test_postgresql_baseline_uses_required_native_schema(
     migrated_engine: AsyncEngine,
 ) -> None:
@@ -114,6 +189,24 @@ async def test_postgresql_baseline_uses_required_native_schema(
                             "FROM information_schema.columns "
                             "WHERE table_schema = 'public' "
                             "AND table_name = 'transcription_job'"
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        }
+        execution_attempt_columns = {
+            row["column_name"]: row
+            for row in (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT column_name, data_type, udt_name "
+                            "FROM information_schema.columns "
+                            "WHERE table_schema = 'public' "
+                            "AND table_name = "
+                            "'transcription_job_execution_attempt'"
                         )
                     )
                 )
@@ -206,6 +299,8 @@ async def test_postgresql_baseline_uses_required_native_schema(
     assert columns["id"]["identity_generation"] == "BY DEFAULT"
     assert columns["public_id"]["udt_name"] == "uuid"
     assert columns["cancellation_requested"]["udt_name"] == "bool"
+    assert execution_attempt_columns["job_id"]["udt_name"] == "int8"
+    assert execution_attempt_columns["execution_attempt_token"]["udt_name"] == "uuid"
     for timestamp_column in (
         "submitted_at",
         "queue_deadline_at",
@@ -220,6 +315,7 @@ async def test_postgresql_baseline_uses_required_native_schema(
     }
     assert check_constraint_names == _CHECK_CONSTRAINT_NAMES
     assert foreign_keys == {
+        ("transcription_job_execution_attempt", "transcription_job", "c"),
         ("transcription_job_exclusion", "transcription_job", "c"),
         ("transcription_job_result", "transcription_job", "c"),
         ("transcription_job_segment", "transcription_job_result", "c"),
@@ -236,7 +332,6 @@ async def test_postgresql_baseline_uses_required_native_schema(
         "account",
         "billing",
         "owner",
-        "execution_attempt",
     }
     assert not application_columns & {
         "user_id",
@@ -321,6 +416,58 @@ async def test_postgresql_baseline_accepts_all_legal_lifecycle_origins(
             text("SELECT count(*) FROM transcription_job")
         )
     assert job_count == 7
+
+
+async def test_postgresql_rejects_invalid_and_duplicate_execution_attempt_tokens(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """Require unique UUIDv4 tokens for each persisted Execution Attempt."""
+    now = datetime.now(UTC)
+    with pytest.raises(IntegrityError):
+        async with migrated_engine.begin() as connection:
+            job_id = await _insert_job(
+                connection,
+                _queued_values(now),
+                with_execution_attempt=False,
+            )
+            await _insert_execution_attempt(connection, job_id, uuid1())
+
+    with pytest.raises(IntegrityError):
+        async with migrated_engine.begin() as connection:
+            first_job_id = await _insert_job(
+                connection,
+                _queued_values(now),
+                with_execution_attempt=False,
+            )
+            second_job_id = await _insert_job(
+                connection,
+                _queued_values(now),
+                with_execution_attempt=False,
+            )
+            execution_attempt_token = uuid4()
+            await _insert_execution_attempt(
+                connection,
+                first_job_id,
+                execution_attempt_token,
+            )
+            await _insert_execution_attempt(
+                connection,
+                second_job_id,
+                execution_attempt_token,
+            )
+
+
+async def test_postgresql_requires_exactly_one_execution_attempt_per_job(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """Reject a committed Transcription Job missing its Execution Attempt."""
+    with pytest.raises(IntegrityError):
+        async with migrated_engine.begin() as connection:
+            await _insert_job(
+                connection,
+                _queued_values(datetime.now(UTC)),
+                with_execution_attempt=False,
+            )
 
 
 @pytest.mark.parametrize(
@@ -461,10 +608,10 @@ async def test_postgresql_baseline_rejects_projection_and_segment_mismatches(
             )
 
 
-async def test_postgresql_baseline_cascades_success_projection_deletion(
+async def test_postgresql_cascades_execution_attempt_and_success_projection_deletion(
     migrated_engine: AsyncEngine,
 ) -> None:
-    """Delete normalized result and segment rows when their successful job is removed."""
+    """Delete private attempts and normalized results with their retained job."""
     now = datetime.now(UTC)
     async with migrated_engine.begin() as connection:
         job_id = await _insert_succeeded_job(connection, now)
@@ -474,6 +621,13 @@ async def test_postgresql_baseline_cascades_success_projection_deletion(
     async with migrated_engine.begin() as connection:
         await connection.execute(
             text("DELETE FROM transcription_job WHERE id = :job_id"),
+            {"job_id": job_id},
+        )
+        execution_attempt_count = await connection.scalar(
+            text(
+                "SELECT count(*) FROM transcription_job_execution_attempt "
+                "WHERE job_id = :job_id"
+            ),
             {"job_id": job_id},
         )
         result_count = await connection.scalar(
@@ -489,6 +643,7 @@ async def test_postgresql_baseline_cascades_success_projection_deletion(
             {"job_id": job_id},
         )
 
+    assert execution_attempt_count == 0
     assert result_count == 0
     assert segment_count == 0
 
@@ -538,8 +693,20 @@ def _queued_values(now: datetime) -> dict[str, object]:
 async def _insert_job(
     connection: AsyncConnection,
     values: Mapping[str, object],
+    *,
+    with_execution_attempt: bool = True,
 ) -> int:
-    """Insert one complete job storage row and return its internal identifier."""
+    """Insert one job and, by default, its required Execution Attempt.
+
+    Args:
+        connection: Open transaction receiving the durable storage rows.
+        values: Complete values for the Transcription Job row.
+        with_execution_attempt: Whether to create the required attempt in this
+            transaction.
+
+    Returns:
+        The generated private Transcription Job identifier.
+    """
     job_id = await connection.scalar(
         text(
             "INSERT INTO transcription_job ("
@@ -555,7 +722,28 @@ async def _insert_job(
     )
     assert not isinstance(job_id, bool)
     assert isinstance(job_id, int)
+    if with_execution_attempt:
+        await _insert_execution_attempt(connection, job_id, uuid4())
     return job_id
+
+
+async def _insert_execution_attempt(
+    connection: AsyncConnection,
+    job_id: int,
+    execution_attempt_token: UUID,
+) -> None:
+    """Insert one private Execution Attempt for an existing Transcription Job."""
+    await connection.execute(
+        text(
+            "INSERT INTO transcription_job_execution_attempt "
+            "(job_id, execution_attempt_token) VALUES "
+            "(:job_id, :execution_attempt_token)"
+        ),
+        {
+            "job_id": job_id,
+            "execution_attempt_token": execution_attempt_token,
+        },
+    )
 
 
 async def _insert_succeeded_job(

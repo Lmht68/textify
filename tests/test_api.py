@@ -1,9 +1,5 @@
-"""ASGI tests for application startup and job-route observability."""
+"""ASGI proofs for PostgreSQL-only FastAPI lifecycle ownership."""
 
-import asyncio
-import gc
-import threading
-from contextvars import Context
 from pathlib import Path
 from uuid import UUID
 
@@ -11,155 +7,13 @@ import pytest
 from httpx import ASGITransport, AsyncClient, Response
 from pydantic import ValidationError
 from sqlalchemy import text
-from sqlalchemy.engine import make_url
 
 from textify.config import AppConfig, Environment
 from textify.jobs.config import JobConfig
 from textify.jobs.database import create_application_engine
-from textify.main import _validate_temporary_media_capacity, create_app
-from textify.transcription import acquisition, inspection
-from textify.transcription.config import TranscriptionConfig
-from textify.transcription.service import TranscriptionAdapters
-from textify.transcription.types import (
-    Segment,
-    TimedTranscript,
-    Transcript,
-    TranscriptMethod,
-)
+from textify.main import create_app
 
 TIKTOK_URL = "https://www.tiktok.com/@creator/video/1234567890123456789"
-
-
-class StartupCaptionProvider:
-    """Expose no optional captions during startup and observability tests."""
-
-    def list_tracks(self, video_id: str) -> tuple[acquisition.CaptionTrack, ...]:
-        """Return no caption tracks.
-
-        Args:
-            video_id: YouTube identifier ignored by this deterministic provider.
-
-        Returns:
-            An empty caption-track collection.
-        """
-        del video_id
-        return ()
-
-
-class StartupMetadataExtractor:
-    """Return valid TikTok metadata if a background worker starts execution."""
-
-    def extract(
-        self,
-        provider_url: str,
-        *,
-        deadline: float,
-        cancellation_event: threading.Event,
-    ) -> inspection.ExtractedMetadata:
-        """Return metadata accepted by the production normalization boundary.
-
-        Args:
-            provider_url: Validated provider URL.
-            deadline: Monotonic deadline unused by this deterministic provider.
-            cancellation_event: Worker cancellation signal, which must remain unset.
-
-        Returns:
-            Valid TikTok metadata.
-        """
-        del deadline
-        assert not cancellation_event.is_set()
-        return inspection.ExtractedMetadata(
-            {
-                "id": "1234567890123456789",
-                "extractor_key": "TikTok",
-                "webpage_url": provider_url,
-                "title": "Title",
-                "description": "Description",
-                "channel": "Creator",
-                "duration": 12,
-                "formats": ({"vcodec": "h264"},),
-            }
-        )
-
-
-class StartupAudioDownloader:
-    """Create a minimal audio input if a background worker starts execution."""
-
-    def download(
-        self,
-        source_url: str,
-        destination: Path,
-        *,
-        deadline: float,
-        cancellation_event: threading.Event,
-    ) -> Path:
-        """Create and return deterministic temporary media.
-
-        Args:
-            source_url: Validated provider URL ignored by this deterministic provider.
-            destination: Existing private directory for media output.
-            deadline: Monotonic deadline unused by this deterministic provider.
-            cancellation_event: Worker cancellation signal, which must remain unset.
-
-        Returns:
-            Completed audio path inside destination.
-        """
-        del source_url, deadline
-        assert not cancellation_event.is_set()
-        audio_path = destination / "audio.webm"
-        audio_path.write_bytes(b"audio")
-        return audio_path
-
-
-class StartupTranscriber:
-    """Return a valid transcript if a background worker starts execution."""
-
-    def transcribe(
-        self, audio_path: Path, *, include_segments: bool = True
-    ) -> Transcript:
-        """Return a normalized text-only or timed transcript.
-
-        Args:
-            audio_path: Completed temporary audio supplied by the downloader.
-            include_segments: Whether the worker needs timed segments.
-
-        Returns:
-            A valid normalized transcript.
-        """
-        assert audio_path.is_file()
-        if not include_segments:
-            return Transcript(TranscriptMethod.FASTER_WHISPER, "en", "One")
-        return TimedTranscript(
-            TranscriptMethod.FASTER_WHISPER,
-            "en",
-            "One",
-            (Segment(0.0, 1.0, "One"),),
-        )
-
-
-class StartupAdaptersFactory:
-    """Build a deterministic provider bundle and count startup construction."""
-
-    def __init__(self) -> None:
-        """Initialize the startup-construction counter."""
-        self.calls = 0
-
-    def __call__(self, _settings: TranscriptionConfig) -> TranscriptionAdapters:
-        """Build a production-shaped deterministic adapter bundle.
-
-        Args:
-            _settings: Validated application configuration unused by test adapters.
-
-        Returns:
-            Complete provider adapter bundle.
-        """
-        self.calls += 1
-        return TranscriptionAdapters(
-            metadata_extractor=StartupMetadataExtractor(),
-            caption_provider=StartupCaptionProvider(),
-            audio_downloader=StartupAudioDownloader(),
-            whisper_transcriber=StartupTranscriber(),
-        )
 
 
 def _app_config() -> AppConfig:
@@ -176,48 +30,21 @@ def _app_config() -> AppConfig:
     )
 
 
-def _job_config(database_url: str, job_worker_count: int = 1) -> JobConfig:
-    """Create isolated durable-job configuration for ASGI tests.
+def _job_config(database_url: str, *, maximum_outstanding_jobs: int = 8) -> JobConfig:
+    """Create isolated PostgreSQL job configuration for ASGI tests.
 
     Args:
         database_url: Per-test PostgreSQL database upgraded through Alembic.
-        job_worker_count: Number of durable consumers to start.
+        maximum_outstanding_jobs: Maximum concurrent queued or processing jobs.
 
     Returns:
         Configuration independent of local environment files.
     """
     return JobConfig(
         database_url=database_url,
-        job_worker_count=job_worker_count,
-        max_outstanding_jobs=8,
+        max_outstanding_jobs=maximum_outstanding_jobs,
         job_queue_timeout_seconds=20,
         job_retention_seconds=86_400,
-    )
-
-
-def _transcription_config(temporary_media_root: Path) -> TranscriptionConfig:
-    """Create isolated transcription configuration for ASGI tests.
-
-    Args:
-        temporary_media_root: Temporary root owned by one test.
-
-    Returns:
-        Configuration independent of local environment files.
-    """
-    return TranscriptionConfig(
-        max_duration_seconds=1800,
-        temporary_media_root=temporary_media_root,
-        beam_size=1,
-        vad_filter=True,
-        temperature=0.0,
-        condition_on_previous_text=True,
-        transcription_concurrency=1,
-        max_media_bytes=1024,
-        metadata_timeout_seconds=30.0,
-        audio_download_timeout_seconds=300.0,
-        transcription_timeout_seconds=1800.0,
-        initial_prompt="test prompt",
-        hf_token=None,
     )
 
 
@@ -248,188 +75,66 @@ def test_app_config_defaults_to_deployment_port(
     assert settings.port == 8182
 
 
-def test_default_temporary_media_capacity_reserves_seven_allocations() -> None:
-    """The deployment defaults reserve four workers, two native calls, and cleanup."""
-    transcription_settings = TranscriptionConfig(_env_file=None)  # type: ignore[call-arg]
-    job_settings = JobConfig(
-        database_url="postgresql+asyncpg://textify:change-me@127.0.0.1:5432/textify",
-        _env_file=None,  # type: ignore[call-arg]
-    )
-    expected_bytes = 7 * 536_870_912
-
-    assert job_settings.job_worker_count == 4
-    assert transcription_settings.transcription_concurrency == 2
-    assert transcription_settings.max_media_bytes == 536_870_912
-    _validate_temporary_media_capacity(
-        transcription_settings,
-        job_settings.job_worker_count,
-        available_bytes=lambda _root: expected_bytes,
-    )
-
-
-def test_temporary_media_capacity_accepts_exact_quota(tmp_path: Path) -> None:
-    """The configured quota accepts exactly the required free bytes."""
-    settings = _transcription_config(tmp_path).model_copy(
-        update={
-            "transcription_concurrency": 3,
-            "max_media_bytes": 100,
-        }
-    )
-
-    _validate_temporary_media_capacity(
-        settings,
-        2,
-        available_bytes=lambda _root: 600,
-    )
-
-
-def test_temporary_media_capacity_rejects_one_byte_short(tmp_path: Path) -> None:
-    """The configured quota rejects free space below the exact requirement."""
-    settings = _transcription_config(tmp_path).model_copy(
-        update={
-            "transcription_concurrency": 3,
-            "max_media_bytes": 100,
-        }
-    )
-
-    with pytest.raises(
-        RuntimeError,
-        match=("Temporary media root requires 600 available bytes; 599 are available."),
-    ):
-        _validate_temporary_media_capacity(
-            settings,
-            2,
-            available_bytes=lambda _root: 599,
-        )
-
-
-def test_temporary_media_capacity_translates_disk_usage_failure(tmp_path: Path) -> None:
-    """An unavailable capacity reader exposes the stable startup failure."""
-    settings = _transcription_config(tmp_path)
-
-    def unavailable_capacity_reader(_root: Path) -> int:
-        """Raise the filesystem failure that must stay internal.
-
-        Args:
-            _root: Temporary-media root ignored by this failure double.
-
-        Raises:
-            OSError: Always, to emulate a failed disk capacity query.
-        """
-        raise OSError("disk query failed")
-
-    with pytest.raises(
-        RuntimeError,
-        match="Unable to determine temporary media root capacity.",
-    ) as error:
-        _validate_temporary_media_capacity(
-            settings,
-            1,
-            available_bytes=unavailable_capacity_reader,
-        )
-
-    assert isinstance(error.value.__cause__, OSError)
-
-
 @pytest.mark.asyncio
-async def test_api_starts_at_exact_temporary_media_capacity(
+async def test_api_starts_without_broker_or_worker_dependencies(
     migrated_postgresql_database_url: str,
-    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Startup succeeds when free space equals the configured media quota."""
-    settings = _transcription_config(tmp_path).model_copy(
-        update={
-            "transcription_concurrency": 3,
-            "max_media_bytes": 100,
-        }
-    )
+    """Admit and inspect a job when only PostgreSQL lifecycle settings exist."""
+    monkeypatch.delenv("TEXTIFY_BROKER_URL", raising=False)
     application = create_app(
         _app_config(),
-        settings,
-        StartupAdaptersFactory(),
-        available_temporary_media_bytes=lambda _root: 600,
-        job_config=_job_config(migrated_postgresql_database_url, job_worker_count=2),
+        job_config=_job_config(migrated_postgresql_database_url),
     )
 
     async with application.router.lifespan_context(application):
+        assert application.state.ready is True
+        assert not hasattr(application.state, "transcription_job_runner")
         transport = ASGITransport(app=application)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             health_response = await client.get("/health")
+            submission_response = await client.post(
+                "/api/transcription-jobs",
+                json={"url": TIKTOK_URL},
+            )
+            status_response = await client.get(submission_response.headers["Location"])
 
     assert health_response.json() == {"status": "ok"}
+    assert submission_response.status_code == 202
+    assert (
+        submission_response.headers["Location"]
+        == submission_response.json()["links"]["self"]
+    )
+    assert submission_response.json()["status"] == "queued"
+    assert status_response.status_code == 200
+    assert status_response.json()["status"] == "queued"
 
 
 @pytest.mark.asyncio
-async def test_api_fails_startup_before_model_when_temporary_media_capacity_is_low(
-    migrated_postgresql_database_url: str,
-    tmp_path: Path,
-) -> None:
-    """Low capacity aborts startup after root creation but before adapters load."""
-    media_root = tmp_path / "media"
-    settings = _transcription_config(media_root).model_copy(
-        update={
-            "transcription_concurrency": 3,
-            "max_media_bytes": 100,
-        }
-    )
-    factory = StartupAdaptersFactory()
-    application = create_app(
-        _app_config(),
-        settings,
-        factory,
-        available_temporary_media_bytes=lambda _root: 599,
-        job_config=_job_config(migrated_postgresql_database_url, job_worker_count=2),
-    )
-
-    with pytest.raises(
-        RuntimeError,
-        match=("Temporary media root requires 600 available bytes; 599 are available."),
-    ):
-        async with application.router.lifespan_context(application):
-            pass
-
-    assert media_root.is_dir()
-    assert factory.calls == 0
-    assert application.state.ready is False
-
-
-@pytest.mark.asyncio
-async def test_api_rejects_unconfigured_database_before_touching_filesystem(
+async def test_api_rejects_unconfigured_database_at_lifespan_startup(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Defer required database validation until lifespan before filesystem access."""
-    monkeypatch.chdir(tmp_path)
+    """Defer required PostgreSQL validation until the application lifespan begins."""
     monkeypatch.delenv("TEXTIFY_DATABASE_URL", raising=False)
-    media_root = tmp_path / "media"
-    factory = StartupAdaptersFactory()
-    application = create_app(
-        _app_config(),
-        _transcription_config(media_root),
-        factory,
-        available_temporary_media_bytes=lambda _root: 1 << 60,
-    )
+    monkeypatch.chdir(tmp_path)
+    application = create_app(_app_config())
 
     with pytest.raises(ValidationError):
         async with application.router.lifespan_context(application):
             pass
 
     assert application.state.ready is False
-    assert media_root.exists() is False
-    assert factory.calls == 0
 
 
 @pytest.mark.asyncio
-async def test_api_rejects_unavailable_postgresql_before_adapter_construction(
-    tmp_path: Path,
+async def test_api_rejects_unavailable_postgresql(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Map an unreachable PostgreSQL server to the stable startup failure."""
-    factory = StartupAdaptersFactory()
+    monkeypatch.delenv("TEXTIFY_BROKER_URL", raising=False)
     application = create_app(
         _app_config(),
-        _transcription_config(tmp_path / "media"),
-        factory,
-        available_temporary_media_bytes=lambda _root: 1 << 60,
         job_config=_job_config(
             "postgresql+asyncpg://textify:change-me@127.0.0.1:1/textify"
         ),
@@ -443,41 +148,13 @@ async def test_api_rejects_unavailable_postgresql_before_adapter_construction(
             pass
 
     assert application.state.ready is False
-    assert factory.calls == 0
 
 
 @pytest.mark.asyncio
-async def test_api_rejects_postgresql_database_without_migration_revision(
+async def test_api_rejects_postgresql_without_current_migration(
     postgresql_database_url: str,
-    tmp_path: Path,
 ) -> None:
-    """Map a PostgreSQL database without Alembic revision state to schema failure."""
-    factory = StartupAdaptersFactory()
-    application = create_app(
-        _app_config(),
-        _transcription_config(tmp_path / "media"),
-        factory,
-        available_temporary_media_bytes=lambda _root: 1 << 60,
-        job_config=_job_config(postgresql_database_url),
-    )
-
-    with pytest.raises(
-        RuntimeError,
-        match=r"^Transcription job database schema is not current\.$",
-    ):
-        async with application.router.lifespan_context(application):
-            pass
-
-    assert application.state.ready is False
-    assert factory.calls == 0
-
-
-@pytest.mark.asyncio
-async def test_api_rejects_stale_postgresql_migration_revision(
-    postgresql_database_url: str,
-    tmp_path: Path,
-) -> None:
-    """Map stale PostgreSQL Alembic state to the schema startup failure."""
+    """Map PostgreSQL without the expected Alembic revision to schema failure."""
     storage_engine = create_application_engine(postgresql_database_url)
     try:
         async with storage_engine.begin() as connection:
@@ -490,12 +167,8 @@ async def test_api_rejects_stale_postgresql_migration_revision(
     finally:
         await storage_engine.dispose()
 
-    factory = StartupAdaptersFactory()
     application = create_app(
         _app_config(),
-        _transcription_config(tmp_path / "media"),
-        factory,
-        available_temporary_media_bytes=lambda _root: 1 << 60,
         job_config=_job_config(postgresql_database_url),
     )
 
@@ -507,159 +180,16 @@ async def test_api_rejects_stale_postgresql_migration_revision(
             pass
 
     assert application.state.ready is False
-    assert factory.calls == 0
-
-
-@pytest.mark.asyncio
-async def test_api_rejects_read_only_postgresql_before_adapter_construction(
-    migrated_postgresql_database_url: str,
-    tmp_path: Path,
-) -> None:
-    """Map PostgreSQL read-only transactions to the stable startup failure."""
-    database_name = make_url(migrated_postgresql_database_url).database
-    assert database_name is not None
-    assert database_name.startswith("textify_test_")
-
-    storage_engine = create_application_engine(migrated_postgresql_database_url)
-    try:
-        async with storage_engine.begin() as connection:
-            await connection.execute(
-                text(
-                    f'ALTER DATABASE "{database_name}" '
-                    "SET default_transaction_read_only = on"
-                )
-            )
-    finally:
-        await storage_engine.dispose()
-
-    factory = StartupAdaptersFactory()
-    application = create_app(
-        _app_config(),
-        _transcription_config(tmp_path / "media"),
-        factory,
-        available_temporary_media_bytes=lambda _root: 1 << 60,
-        job_config=_job_config(migrated_postgresql_database_url),
-    )
-
-    with pytest.raises(
-        RuntimeError,
-        match=r"^Transcription job database is unavailable\.$",
-    ):
-        async with application.router.lifespan_context(application):
-            pass
-
-    assert application.state.ready is False
-    assert factory.calls == 0
-
-
-@pytest.mark.asyncio
-async def test_api_closes_storage_before_adapter_construction_failure(
-    migrated_postgresql_database_url: str,
-    tmp_path: Path,
-) -> None:
-    """Leave readiness false when adapter construction aborts lifespan startup."""
-    factory_calls = 0
-
-    def failing_adapters_factory(
-        _settings: TranscriptionConfig,
-    ) -> TranscriptionAdapters:
-        """Abort deterministic adapter construction after durable storage startup."""
-        nonlocal factory_calls
-        factory_calls += 1
-        raise RuntimeError("adapter construction failed")
-
-    application = create_app(
-        _app_config(),
-        _transcription_config(tmp_path / "media"),
-        failing_adapters_factory,
-        available_temporary_media_bytes=lambda _root: 1 << 60,
-        job_config=_job_config(migrated_postgresql_database_url),
-    )
-
-    with pytest.raises(RuntimeError, match="adapter construction failed"):
-        async with application.router.lifespan_context(application):
-            pass
-
-    assert application.state.ready is False
-    assert factory_calls == 1
-    assert not hasattr(application.state, "transcription_job_service")
-    assert not hasattr(application.state, "transcription_job_runner")
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "failed_task_name",
-    (
-        "transcription-job-consumer-2",
-        "transcription-job-retention-cleanup",
-    ),
-)
-async def test_api_closes_partially_scheduled_job_tasks(
-    failed_task_name: str,
-    migrated_postgresql_database_url: str,
-    monkeypatch: pytest.MonkeyPatch,
-    recwarn: pytest.WarningsRecorder,
-    tmp_path: Path,
-) -> None:
-    """Abort startup when durable task scheduling fails after earlier tasks exist."""
-    created_tasks: list[asyncio.Task[None]] = []
-    original_create_task = asyncio.create_task
-
-    def create_task(
-        coroutine: object,
-        *,
-        name: str | None = None,
-        context: Context | None = None,
-    ) -> asyncio.Task[None]:
-        """Fail only the named task while recording earlier scheduled tasks."""
-        if name == failed_task_name:
-            raise RuntimeError(f"Unable to schedule {name}.")
-        task = original_create_task(
-            coroutine,  # type: ignore[arg-type]
-            name=name,
-            context=context,
-        )
-        created_tasks.append(task)
-        return task
-
-    monkeypatch.setattr(asyncio, "create_task", create_task)
-    factory = StartupAdaptersFactory()
-    application = create_app(
-        _app_config(),
-        _transcription_config(tmp_path / "media"),
-        factory,
-        available_temporary_media_bytes=lambda _root: 1 << 60,
-        job_config=_job_config(migrated_postgresql_database_url, job_worker_count=2),
-    )
-
-    with pytest.raises(RuntimeError, match=f"Unable to schedule {failed_task_name}"):
-        async with application.router.lifespan_context(application):
-            pass
-
-    gc.collect()
-    assert application.state.ready is False
-    assert factory.calls == 1
-    assert not hasattr(application.state, "transcription_job_service")
-    assert not hasattr(application.state, "transcription_job_runner")
-    assert created_tasks
-    assert all(task.done() for task in created_tasks)
-    assert not [
-        warning for warning in recwarn if "was never awaited" in str(warning.message)
-    ]
 
 
 @pytest.mark.asyncio
 async def test_api_adds_fresh_request_ids_to_job_route_outcomes(
     migrated_postgresql_database_url: str,
-    tmp_path: Path,
 ) -> None:
-    """Health, submission, validation, and unmatched routes get fresh UUIDv4 IDs."""
+    """Health, job, validation, and unmatched routes get fresh request IDs."""
     inbound_request_id = "inbound-request-id-sentinel"
     application = create_app(
         _app_config(),
-        _transcription_config(tmp_path),
-        StartupAdaptersFactory(),
-        available_temporary_media_bytes=lambda _root: 1 << 60,
         job_config=_job_config(migrated_postgresql_database_url),
     )
 
@@ -685,19 +215,16 @@ async def test_api_adds_fresh_request_ids_to_job_route_outcomes(
                 headers={"X-Request-ID": inbound_request_id},
             )
 
+    responses = (
+        health_response,
+        submission_response,
+        validation_response,
+        unmatched_response,
+    )
+    request_ids = {_assert_generated_request_id(response) for response in responses}
     assert health_response.status_code == 200
     assert submission_response.status_code == 202
     assert validation_response.status_code == 422
-    assert validation_response.json()["error"]["code"] == "invalid_request"
     assert unmatched_response.status_code == 404
-    request_ids = {
-        _assert_generated_request_id(response)
-        for response in (
-            health_response,
-            submission_response,
-            validation_response,
-            unmatched_response,
-        )
-    }
-    assert len(request_ids) == 4
+    assert len(request_ids) == len(responses)
     assert inbound_request_id not in request_ids

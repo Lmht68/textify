@@ -6,7 +6,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
-EXPECTED_DATABASE_REVISION = "0001_postgresql_jobs"
+EXPECTED_DATABASE_REVISION = "0002_execution_attempts"
 
 
 def create_application_engine(database_url: str) -> AsyncEngine:

@@ -6,11 +6,14 @@ import asyncio
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import pytest
 from alembic import command
 from alembic.config import Config
+from redis.asyncio import Redis
+from redis.exceptions import RedisError
 from sqlalchemy import text
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ArgumentError, SQLAlchemyError
@@ -160,3 +163,32 @@ async def migrated_postgresql_database_url(
     alembic_config = Config(str(PROJECT_ROOT / "alembic.ini"))
     await asyncio.to_thread(command.upgrade, alembic_config, "head")
     yield postgresql_database_url
+
+
+@pytest.fixture
+async def redis_broker_url() -> AsyncIterator[str]:
+    """Require a reachable Redis broker reserved for real Celery delivery tests.
+
+    Yields:
+        Redis broker URL supplied through ``TEXTIFY_TEST_BROKER_URL``.
+    """
+    raw_url = os.getenv("TEXTIFY_TEST_BROKER_URL")
+    if raw_url is None:
+        pytest.fail(
+            "TEXTIFY_TEST_BROKER_URL is required for Redis-Celery integration tests."
+        )
+        raise AssertionError("pytest.fail must stop fixture setup.")
+    if urlsplit(raw_url).scheme not in {"redis", "rediss"}:
+        pytest.fail("TEXTIFY_TEST_BROKER_URL must use the redis or rediss scheme.")
+        raise AssertionError("pytest.fail must stop fixture setup.")
+
+    redis_client = Redis.from_url(raw_url)
+    try:
+        await redis_client.ping()
+    except RedisError as exc:
+        pytest.fail("TEXTIFY_TEST_BROKER_URL must identify a reachable Redis broker.")
+        raise AssertionError("pytest.fail must stop fixture setup.") from exc
+    try:
+        yield raw_url
+    finally:
+        await redis_client.aclose()

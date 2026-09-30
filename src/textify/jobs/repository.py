@@ -27,6 +27,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     delete,
+    exists,
     func,
     insert,
     select,
@@ -44,19 +45,17 @@ from textify.jobs.contracts import (
     TranscriptionJobCapacityError,
     TranscriptionJobStoreUnavailableError,
 )
-from textify.jobs.exceptions import QueueTimeoutError, WorkerInterruptedError
+from textify.jobs.exceptions import QueueTimeoutError
 from textify.jobs.types import (
-    CancellationResult,
     CancelledTranscriptionJob,
     ClaimedTranscriptionJob,
     FailedTranscriptionJob,
+    JobDispatch,
     JobOutcome,
     JobStatus,
     NewQueuedTranscriptionJob,
-    ProcessingCancellation,
     ProcessingTranscriptionJob,
     QueuedTranscriptionJob,
-    RecoveredTranscriptionJobs,
     SucceededTranscriptionJob,
     TranscriptionJob,
 )
@@ -162,6 +161,31 @@ Index(
     "transcription_job_status_finished_at_idx",
     transcription_job.c.status,
     transcription_job.c.finished_at,
+)
+
+transcription_job_execution_attempt = Table(
+    "transcription_job_execution_attempt",
+    metadata,
+    Column(
+        "job_id",
+        BigInteger,
+        ForeignKey("transcription_job.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column(
+        "execution_attempt_token",
+        PostgreSQLUUID(as_uuid=True),
+        nullable=False,
+    ),
+    UniqueConstraint(
+        "execution_attempt_token",
+        name="transcription_job_execution_attempt_token_key",
+    ),
+    CheckConstraint(
+        "(get_byte(uuid_send(execution_attempt_token), 6) & 240) = 64 "
+        "AND (get_byte(uuid_send(execution_attempt_token), 8) & 192) = 128",
+        name="transcription_job_execution_attempt_token_uuid4_check",
+    ),
 )
 
 transcription_job_exclusion = Table(
@@ -376,6 +400,7 @@ class PostgresTranscriptionJobRepository:
                 submitted_at = _as_utc(self._clock())
                 queue_deadline_at = submitted_at + self._queue_timeout
                 public_id = uuid4()
+                execution_attempt_token = uuid4()
                 internal_id = await connection.scalar(
                     insert(transcription_job)
                     .values(
@@ -398,6 +423,12 @@ class PostgresTranscriptionJobRepository:
                             for field_path in job.exclusions
                         ],
                     )
+                await connection.execute(
+                    insert(transcription_job_execution_attempt).values(
+                        job_id=internal_id,
+                        execution_attempt_token=execution_attempt_token,
+                    )
+                )
         except TranscriptionJobCapacityError:
             raise
         except TranscriptionJobStoreUnavailableError:
@@ -412,145 +443,145 @@ class PostgresTranscriptionJobRepository:
             queue_deadline_at=queue_deadline_at,
         )
 
-    async def claim_next(self) -> ClaimedTranscriptionJob | None:
-        """Claim the oldest eligible queued job without provider work.
+    async def list_queued_dispatches(self) -> tuple[JobDispatch, ...]:
+        """List queued Job Dispatches without selecting provider inputs.
 
         Returns:
-            Private committed execution inputs, or ``None`` when none is eligible.
+            Private dispatches ordered deterministically by submission time and ID.
+
+        Raises:
+            TranscriptionJobStoreUnavailableError: If PostgreSQL cannot list safely.
+        """
+        try:
+            async with self._engine.connect() as connection:
+                rows = (
+                    (
+                        await connection.execute(
+                            select(
+                                transcription_job.c.id,
+                                transcription_job_execution_attempt.c.execution_attempt_token,
+                            )
+                            .join(
+                                transcription_job_execution_attempt,
+                                transcription_job.c.id
+                                == transcription_job_execution_attempt.c.job_id,
+                            )
+                            .where(transcription_job.c.status == "queued")
+                            .order_by(
+                                transcription_job.c.submitted_at,
+                                transcription_job.c.id,
+                            )
+                        )
+                    )
+                    .mappings()
+                    .all()
+                )
+        except (OSError, SQLAlchemyError) as exc:
+            raise TranscriptionJobStoreUnavailableError() from exc
+        return tuple(_dispatch_from_row(row) for row in rows)
+
+    async def claim_dispatch(
+        self,
+        dispatch: JobDispatch,
+    ) -> ClaimedTranscriptionJob | None:
+        """Claim one delivered Job Dispatch before loading private execution inputs.
+
+        Args:
+            dispatch: Private identifier and token supplied by the broker.
+
+        Returns:
+            Private execution inputs for one committed claim, or ``None`` when stale.
 
         Raises:
             TranscriptionJobStoreUnavailableError: If PostgreSQL cannot claim safely.
         """
+        attempt_matches_dispatch = exists(
+            select(transcription_job_execution_attempt.c.job_id).where(
+                transcription_job_execution_attempt.c.job_id
+                == dispatch.internal_job_id,
+                transcription_job_execution_attempt.c.execution_attempt_token
+                == dispatch.execution_attempt_token,
+            )
+        )
         try:
             async with self._serialized_lifecycle_transaction() as connection:
                 now = _as_utc(self._clock())
-                await self._expire_queued_jobs(connection, now)
-                candidate = (
+                claim_transition = await connection.execute(
+                    update(transcription_job)
+                    .where(
+                        transcription_job.c.id == dispatch.internal_job_id,
+                        transcription_job.c.status == "queued",
+                        transcription_job.c.cancellation_requested.is_(False),
+                        transcription_job.c.queue_deadline_at > now,
+                        attempt_matches_dispatch,
+                    )
+                    .values(status="processing", started_at=now)
+                )
+                if claim_transition.rowcount == 1:
+                    claimed = True
+                elif claim_transition.rowcount == 0:
+                    claimed = False
+                else:
+                    raise TranscriptionJobStoreUnavailableError()
+
+                if not claimed:
+                    timeout_transition = await connection.execute(
+                        update(transcription_job)
+                        .where(
+                            transcription_job.c.id == dispatch.internal_job_id,
+                            transcription_job.c.status == "queued",
+                            transcription_job.c.cancellation_requested.is_(False),
+                            transcription_job.c.queue_deadline_at <= now,
+                            attempt_matches_dispatch,
+                        )
+                        .values(
+                            status="finished",
+                            outcome="failed",
+                            finished_at=now,
+                            error_code=QueueTimeoutError.code,
+                            error_message=QueueTimeoutError.message,
+                        )
+                    )
+                    if timeout_transition.rowcount not in {0, 1}:
+                        raise TranscriptionJobStoreUnavailableError()
+                    return None
+
+            async with self._engine.connect() as connection:
+                claimed_row = (
                     (
                         await connection.execute(
                             select(
                                 transcription_job.c.id,
                                 transcription_job.c.submitted_url,
                             )
+                            .join(
+                                transcription_job_execution_attempt,
+                                transcription_job.c.id
+                                == transcription_job_execution_attempt.c.job_id,
+                            )
                             .where(
-                                transcription_job.c.status == "queued",
-                                transcription_job.c.queue_deadline_at > now,
+                                transcription_job.c.id == dispatch.internal_job_id,
+                                transcription_job_execution_attempt.c.execution_attempt_token
+                                == dispatch.execution_attempt_token,
+                                transcription_job.c.status == "processing",
+                                transcription_job.c.cancellation_requested.is_(False),
                             )
-                            .order_by(
-                                transcription_job.c.submitted_at,
-                                transcription_job.c.id,
-                            )
-                            .limit(1)
                         )
                     )
                     .mappings()
                     .one_or_none()
                 )
-                if candidate is None:
+                if claimed_row is None:
                     return None
-
-                internal_id, submitted_url = _claimed_input_from_row(candidate)
-                exclusions = await self._load_exclusions(connection, internal_id)
-                transition = await connection.execute(
-                    update(transcription_job)
-                    .where(
-                        transcription_job.c.id == internal_id,
-                        transcription_job.c.status == "queued",
-                    )
-                    .values(status="processing", started_at=now)
-                )
-                if transition.rowcount != 1:
+                internal_id, submitted_url = _claimed_input_from_row(claimed_row)
+                if internal_id != dispatch.internal_job_id:
                     raise TranscriptionJobStoreUnavailableError()
+                exclusions = await self._load_exclusions(connection, internal_id)
         except TranscriptionJobStoreUnavailableError:
             raise
         except (OSError, SQLAlchemyError) as exc:
             raise TranscriptionJobStoreUnavailableError() from exc
-
-        return _claimed_job(internal_id, submitted_url, exclusions)
-
-    async def recover_interrupted_jobs(self) -> RecoveredTranscriptionJobs:
-        """Terminalize jobs interrupted before this application started.
-
-        Returns:
-            Private identifiers grouped by committed recovery transition.
-
-        Raises:
-            TranscriptionJobStoreUnavailableError: If recovery cannot commit safely.
-        """
-        try:
-            async with self._serialized_lifecycle_transaction() as connection:
-                now = _as_utc(self._clock())
-                expired_queued_internal_ids = await self._expire_queued_jobs(
-                    connection,
-                    now,
-                )
-                interrupted_processing_internal_ids = (
-                    await self._select_recovery_processing_ids(
-                        connection,
-                        cancellation_requested=False,
-                    )
-                )
-                if interrupted_processing_internal_ids:
-                    transition = await connection.execute(
-                        update(transcription_job)
-                        .where(
-                            transcription_job.c.id.in_(
-                                interrupted_processing_internal_ids
-                            ),
-                            transcription_job.c.status == "processing",
-                            transcription_job.c.cancellation_requested.is_(False),
-                        )
-                        .values(
-                            status="finished",
-                            outcome="failed",
-                            finished_at=now,
-                            error_code=WorkerInterruptedError.code,
-                            error_message=WorkerInterruptedError.message,
-                        )
-                    )
-                    if transition.rowcount != len(interrupted_processing_internal_ids):
-                        raise TranscriptionJobStoreUnavailableError()
-
-                cancelled_processing_internal_ids = (
-                    await self._select_recovery_processing_ids(
-                        connection,
-                        cancellation_requested=True,
-                    )
-                )
-                if cancelled_processing_internal_ids:
-                    transition = await connection.execute(
-                        update(transcription_job)
-                        .where(
-                            transcription_job.c.id.in_(
-                                cancelled_processing_internal_ids
-                            ),
-                            transcription_job.c.status == "processing",
-                            transcription_job.c.cancellation_requested.is_(True),
-                        )
-                        .values(
-                            status="finished",
-                            outcome="cancelled",
-                            finished_at=now,
-                        )
-                    )
-                    if transition.rowcount != len(cancelled_processing_internal_ids):
-                        raise TranscriptionJobStoreUnavailableError()
-        except TranscriptionJobStoreUnavailableError:
-            raise
-        except (
-            OSError,
-            SQLAlchemyError,
-            TypeError,
-            ValidationError,
-            ValueError,
-        ) as exc:
-            raise TranscriptionJobStoreUnavailableError() from exc
-
-        return RecoveredTranscriptionJobs(
-            expired_queued_internal_ids=expired_queued_internal_ids,
-            interrupted_processing_internal_ids=interrupted_processing_internal_ids,
-            cancelled_processing_internal_ids=cancelled_processing_internal_ids,
-        )
+        return _claimed_job(dispatch, submitted_url, exclusions)
 
     async def delete_expired_terminal_jobs(self) -> None:
         """Delete terminal jobs whose finished time has reached retention cutoff.
@@ -576,15 +607,15 @@ class PostgresTranscriptionJobRepository:
     async def request_cancellation(
         self,
         public_id: UUID,
-    ) -> CancellationResult | None:
+    ) -> ProcessingTranscriptionJob | CancelledTranscriptionJob | None:
         """Durably accept one cancellation through its public capability.
 
         Args:
             public_id: Canonical UUIDv4 capability supplied by the coordinator.
 
         Returns:
-            Processing cancellation details, a cancelled terminal snapshot, or ``None``
-            when the capability is unknown.
+            Processing or cancelled snapshot, or ``None`` when the capability is
+            unknown.
 
         Raises:
             TranscriptionJobAlreadyFinishedError: If the job has a non-cancelled
@@ -670,10 +701,7 @@ class PostgresTranscriptionJobRepository:
                     )
                     if processing_row is None:
                         raise TranscriptionJobStoreUnavailableError()
-                    return ProcessingCancellation(
-                        job=_processing_job_from_row(processing_row),
-                        internal_id=internal_id,
-                    )
+                    return _processing_job_from_row(processing_row)
 
                 if status != "finished":
                     raise TranscriptionJobStoreUnavailableError()
@@ -689,11 +717,11 @@ class PostgresTranscriptionJobRepository:
         except (OSError, SQLAlchemyError) as exc:
             raise TranscriptionJobStoreUnavailableError() from exc
 
-    async def publish_cancelled(self, internal_id: int) -> bool:
+    async def publish_cancelled(self, dispatch: JobDispatch) -> bool:
         """Publish cancellation after active provider work has cleaned up.
 
         Args:
-            internal_id: Private identifier held only by the claiming consumer.
+            dispatch: Private identifier and token from the committed claim.
 
         Returns:
             ``True`` when cancellation committed the terminal outcome, otherwise
@@ -702,15 +730,24 @@ class PostgresTranscriptionJobRepository:
         Raises:
             TranscriptionJobStoreUnavailableError: If PostgreSQL cannot publish safely.
         """
+        attempt_matches_dispatch = exists(
+            select(transcription_job_execution_attempt.c.job_id).where(
+                transcription_job_execution_attempt.c.job_id
+                == dispatch.internal_job_id,
+                transcription_job_execution_attempt.c.execution_attempt_token
+                == dispatch.execution_attempt_token,
+            )
+        )
         try:
             async with self._serialized_lifecycle_transaction() as connection:
                 finished_at = _as_utc(self._clock())
                 transition = await connection.execute(
                     update(transcription_job)
                     .where(
-                        transcription_job.c.id == internal_id,
+                        transcription_job.c.id == dispatch.internal_job_id,
                         transcription_job.c.status == "processing",
                         transcription_job.c.cancellation_requested.is_(True),
+                        attempt_matches_dispatch,
                     )
                     .values(
                         status="finished",
@@ -728,13 +765,13 @@ class PostgresTranscriptionJobRepository:
 
     async def publish_success(
         self,
-        internal_id: int,
+        dispatch: JobDispatch,
         projected_result: TranscriptionResponse,
     ) -> bool:
         """Atomically persist one projected result and succeeded terminal transition.
 
         Args:
-            internal_id: Private identifier held only by the claiming consumer.
+            dispatch: Private identifier and token from the committed claim.
             projected_result: Fully projected and validated public result.
 
         Returns:
@@ -745,17 +782,26 @@ class PostgresTranscriptionJobRepository:
             TranscriptionJobStoreUnavailableError: If PostgreSQL cannot publish safely.
         """
         validated_result = _validate_response(projected_result)
-        result_values = _result_values(internal_id, validated_result)
-        segment_values = _segment_values(internal_id, validated_result)
+        result_values = _result_values(dispatch.internal_job_id, validated_result)
+        segment_values = _segment_values(dispatch.internal_job_id, validated_result)
+        attempt_matches_dispatch = exists(
+            select(transcription_job_execution_attempt.c.job_id).where(
+                transcription_job_execution_attempt.c.job_id
+                == dispatch.internal_job_id,
+                transcription_job_execution_attempt.c.execution_attempt_token
+                == dispatch.execution_attempt_token,
+            )
+        )
         try:
             async with self._serialized_lifecycle_transaction() as connection:
                 finished_at = _as_utc(self._clock())
                 transition = await connection.execute(
                     update(transcription_job)
                     .where(
-                        transcription_job.c.id == internal_id,
+                        transcription_job.c.id == dispatch.internal_job_id,
                         transcription_job.c.status == "processing",
                         transcription_job.c.cancellation_requested.is_(False),
+                        attempt_matches_dispatch,
                     )
                     .values(
                         status="finished",
@@ -781,14 +827,14 @@ class PostgresTranscriptionJobRepository:
 
     async def publish_failure(
         self,
-        internal_id: int,
+        dispatch: JobDispatch,
         error_code: str,
         error_message: str,
     ) -> bool:
         """Atomically persist one safe failed terminal transition.
 
         Args:
-            internal_id: Private identifier held only by the claiming consumer.
+            dispatch: Private identifier and token from the committed claim.
             error_code: Validated stable public error code.
             error_message: Validated safe nonempty public error message.
 
@@ -801,15 +847,24 @@ class PostgresTranscriptionJobRepository:
                 publication cannot complete safely.
         """
         error = _validate_error_detail(error_code, error_message)
+        attempt_matches_dispatch = exists(
+            select(transcription_job_execution_attempt.c.job_id).where(
+                transcription_job_execution_attempt.c.job_id
+                == dispatch.internal_job_id,
+                transcription_job_execution_attempt.c.execution_attempt_token
+                == dispatch.execution_attempt_token,
+            )
+        )
         try:
             async with self._serialized_lifecycle_transaction() as connection:
                 finished_at = _as_utc(self._clock())
                 transition = await connection.execute(
                     update(transcription_job)
                     .where(
-                        transcription_job.c.id == internal_id,
+                        transcription_job.c.id == dispatch.internal_job_id,
                         transcription_job.c.status == "processing",
                         transcription_job.c.cancellation_requested.is_(False),
+                        attempt_matches_dispatch,
                     )
                     .values(
                         status="finished",
@@ -954,76 +1009,23 @@ class PostgresTranscriptionJobRepository:
             raise TranscriptionJobStoreUnavailableError()
         return count
 
-    async def _expire_queued_jobs(
-        self,
-        connection: AsyncConnection,
-        now: datetime,
-    ) -> tuple[int, ...]:
-        """Fail every queued job whose immutable deadline has passed."""
-        expired_rows = (
-            (
-                await connection.execute(
-                    select(transcription_job.c.id)
-                    .where(
-                        transcription_job.c.status == "queued",
-                        transcription_job.c.queue_deadline_at <= now,
-                    )
-                    .order_by(transcription_job.c.id)
-                )
-            )
-            .mappings()
-            .all()
-        )
-        expired_internal_ids = tuple(_internal_id_from_row(row) for row in expired_rows)
-        if not expired_internal_ids:
-            return ()
-        transition = await connection.execute(
-            update(transcription_job)
-            .where(
-                transcription_job.c.id.in_(expired_internal_ids),
-                transcription_job.c.status == "queued",
-                transcription_job.c.queue_deadline_at <= now,
-            )
-            .values(
-                status="finished",
-                outcome="failed",
-                finished_at=now,
-                error_code=QueueTimeoutError.code,
-                error_message=QueueTimeoutError.message,
-            )
-        )
-        if transition.rowcount != len(expired_internal_ids):
-            raise TranscriptionJobStoreUnavailableError()
-        return expired_internal_ids
 
-    async def _select_recovery_processing_ids(
-        self,
-        connection: AsyncConnection,
-        *,
-        cancellation_requested: bool,
-    ) -> tuple[int, ...]:
-        """Return interrupted processing identifiers with one cancellation state."""
-        rows = (
-            (
-                await connection.execute(
-                    select(transcription_job.c.id)
-                    .where(
-                        transcription_job.c.status == "processing",
-                        transcription_job.c.cancellation_requested.is_(
-                            cancellation_requested
-                        ),
-                    )
-                    .order_by(transcription_job.c.id)
-                )
-            )
-            .mappings()
-            .all()
-        )
-        return tuple(_internal_id_from_row(row) for row in rows)
+def _dispatch_from_row(row: RowMapping) -> JobDispatch:
+    """Translate one private dispatch-only SQL row into a Job Dispatch."""
+    execution_attempt_token = row["execution_attempt_token"]
+    if (
+        not isinstance(execution_attempt_token, UUID)
+        or execution_attempt_token.version != 4
+    ):
+        raise TranscriptionJobStoreUnavailableError()
+    return JobDispatch(
+        internal_job_id=_internal_id_from_row(row),
+        execution_attempt_token=execution_attempt_token,
+    )
 
 
 def _claimed_input_from_row(row: RowMapping) -> tuple[int, str]:
-    """Validate private claim inputs selected under the writer lock."""
+    """Validate private claim inputs selected after a successful state transition."""
     internal_id = _internal_id_from_row(row)
     submitted_url = row["submitted_url"]
     if not isinstance(submitted_url, str) or not submitted_url:
@@ -1032,14 +1034,13 @@ def _claimed_input_from_row(row: RowMapping) -> tuple[int, str]:
 
 
 def _claimed_job(
-    internal_id: int,
+    dispatch: JobDispatch,
     submitted_url: str,
     exclusions: tuple[ResponseFieldPath, ...],
 ) -> ClaimedTranscriptionJob:
-    """Construct a private committed claim snapshot."""
-
+    """Construct one private committed claim snapshot."""
     return ClaimedTranscriptionJob(
-        internal_id=internal_id,
+        dispatch=dispatch,
         submitted_url=submitted_url,
         exclusions=exclusions,
     )

@@ -20,6 +20,8 @@ dependencies = [
     "sqlalchemy==2.0.54",
     "youtube-transcript-api==1.2.4",
     "yt-dlp==2026.7.4",
+    "celery[redis]==5.6.3",
+    "redis==6.4.0",
 ]
 
 [dependency-groups]
@@ -33,6 +35,8 @@ dev = [
 
 [project.scripts]
 textify = "textify.main:main"
+textify-reconciler = "textify.jobs.reconciler:main"
+textify-worker = "textify.jobs.worker:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -49,7 +53,16 @@ python_version = "3.12"
 strict = true
 
 [[tool.mypy.overrides]]
-module = ["ctranslate2", "faster_whisper", "yt_dlp", "yt_dlp.*"]
+module = [
+    "celery",
+    "celery.*",
+    "kombu",
+    "kombu.*",
+    "ctranslate2",
+    "faster_whisper",
+    "yt_dlp",
+    "yt_dlp.*",
+]
 ignore_missing_imports = true
 
 [build-system]

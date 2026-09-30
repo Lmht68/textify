@@ -3,6 +3,8 @@
 -e .
 alembic==1.20.0
     # via textify
+amqp==5.4.0
+    # via kombu
 annotated-doc==0.0.4
     # via
     #   fastapi
@@ -22,6 +24,10 @@ av==18.1.0
     # via
     #   faster-whisper
     #   textify
+billiard==4.3.0
+    # via celery
+celery==5.6.3
+    # via textify
 certifi==2026.7.22
     # via
     #   httpcore
@@ -32,9 +38,19 @@ charset-normalizer==3.5.1
     # via requests
 click==8.4.2
     # via
+    #   celery
+    #   click-didyoumean
+    #   click-plugins
+    #   click-repl
     #   huggingface-hub
     #   rich-toolkit
     #   uvicorn
+click-didyoumean==0.3.1
+    # via celery
+click-plugins==1.1.1.2
+    # via celery
+click-repl==0.4.0
+    # via celery
 colorama==0.4.6 ; sys_platform == 'win32'
     # via
     #   click
@@ -104,6 +120,8 @@ iniconfig==2.3.0
     # via pytest
 jinja2==3.1.6
     # via fastapi
+kombu==5.6.2
+    # via celery
 langcodes==3.5.1
     # via textify
 librt==0.15.0 ; platform_python_implementation != 'PyPy'
@@ -130,12 +148,15 @@ onnxruntime==1.30.0
 packaging==26.3
     # via
     #   huggingface-hub
+    #   kombu
     #   onnxruntime
     #   pytest
 pathspec==1.1.1
     # via mypy
 pluggy==1.6.0
     # via pytest
+prompt-toolkit==3.0.53
+    # via click-repl
 protobuf==7.36.1
     # via onnxruntime
 pydantic==2.13.4
@@ -159,6 +180,8 @@ pygments==2.20.0
 pytest==9.1.1
     # via pytest-asyncio
 pytest-asyncio==1.4.0
+python-dateutil==2.9.0.post0
+    # via celery
 python-dotenv==1.2.2
     # via
     #   pydantic-settings
@@ -170,6 +193,10 @@ pyyaml==6.0.3
     #   ctranslate2
     #   huggingface-hub
     #   uvicorn
+redis==6.4.0
+    # via
+    #   kombu
+    #   textify
 requests==2.34.2
     # via
     #   textify
@@ -189,6 +216,8 @@ sentry-sdk==2.66.1
     # via fastapi-cloud-cli
 shellingham==1.5.4
     # via typer
+six==1.17.0
+    # via python-dateutil
 sqlalchemy==2.0.54
     # via
     #   alembic
@@ -209,6 +238,7 @@ typing-extensions==4.16.0
     # via
     #   alembic
     #   anyio
+    #   click-repl
     #   fastapi
     #   huggingface-hub
     #   mypy
@@ -225,6 +255,12 @@ typing-inspection==0.4.2
     #   fastapi
     #   pydantic
     #   pydantic-settings
+tzdata==2026.4
+    # via
+    #   kombu
+    #   tzlocal
+tzlocal==5.4.4
+    # via celery
 urllib3==2.7.0
     # via
     #   requests
@@ -236,8 +272,15 @@ uvicorn==0.51.0
     #   fastapi-cloud-cli
 uvloop==0.22.1 ; platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'
     # via uvicorn
+vine==5.1.0
+    # via
+    #   amqp
+    #   celery
+    #   kombu
 watchfiles==1.2.0
     # via uvicorn
+wcwidth==0.9.1
+    # via prompt-toolkit
 websockets==16.1.1
     # via uvicorn
 youtube-transcript-api==1.2.4

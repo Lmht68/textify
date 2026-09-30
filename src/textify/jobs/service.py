@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -9,7 +11,6 @@ from textify.jobs.contracts import (
     TranscriptionJobAlreadyFinishedError,
     TranscriptionJobApiRepository,
     TranscriptionJobCapacityError,
-    TranscriptionJobExecutionSignals,
     TranscriptionJobStoreUnavailableError,
 )
 from textify.jobs.exceptions import (
@@ -18,11 +19,9 @@ from textify.jobs.exceptions import (
     JobStoreUnavailableError,
     TranscriptionCapacityExceededError,
 )
-from textify.jobs.runtime import TranscriptionJobLifecycleState
 from textify.jobs.types import (
     CancelledTranscriptionJob,
     NewQueuedTranscriptionJob,
-    ProcessingCancellation,
     ProcessingTranscriptionJob,
     QueuedTranscriptionJob,
     TranscriptionJob,
@@ -43,24 +42,30 @@ class TranscriptionJobService:
     def __init__(
         self,
         repository: TranscriptionJobApiRepository,
-        execution_signals: TranscriptionJobExecutionSignals,
-        lifecycle_state: TranscriptionJobLifecycleState,
+        on_store_unavailable: Callable[[], None],
     ) -> None:
         """Initialize Transcription Job HTTP lifecycle operations.
 
         Args:
             repository: Durable persistence boundary for HTTP lifecycle operations.
-            execution_signals: Narrow execution notifications and store-failure latch.
-            lifecycle_state: Shared admission and durable-store health state.
+            on_store_unavailable: Readiness callback for the first store failure.
         """
         self._repository = repository
-        self._execution_signals = execution_signals
-        self._lifecycle_state = lifecycle_state
+        self._on_store_unavailable = on_store_unavailable
+        self._lock = asyncio.Lock()
+        self._store_available = True
 
     def _require_store_available(self) -> None:
-        """Raise when the caller holds the lifecycle lock after a store failure."""
-        if not self._lifecycle_state.store_available:
+        """Raise after a durable-store failure has latched service unavailability."""
+        if not self._store_available:
             raise JobStoreUnavailableError()
+
+    async def _mark_store_unavailable(self) -> None:
+        """Latch the first durable-store failure and make readiness unavailable."""
+        async with self._lock:
+            if self._store_available:
+                self._store_available = False
+                self._on_store_unavailable()
 
     async def submit(
         self,
@@ -89,17 +94,14 @@ class TranscriptionJobService:
             exclusions=tuple(sorted(exclusions)),
         )
         try:
-            async with self._lifecycle_state.lock:
+            async with self._lock:
                 self._require_store_available()
-                if not self._lifecycle_state.admission_open:
-                    raise TranscriptionCapacityExceededError()
                 queued_job = await self._repository.create_queued(new_job)
         except TranscriptionJobCapacityError as exc:
             raise TranscriptionCapacityExceededError() from exc
         except TranscriptionJobStoreUnavailableError as exc:
-            await self._execution_signals.mark_store_unavailable()
+            await self._mark_store_unavailable()
             raise JobStoreUnavailableError() from exc
-        self._execution_signals.notify_work_available()
         return queued_job
 
     async def get_status(self, capability: str) -> TranscriptionJob:
@@ -117,11 +119,11 @@ class TranscriptionJobService:
         """
         public_id = _parse_capability(capability)
         try:
-            async with self._lifecycle_state.lock:
+            async with self._lock:
                 self._require_store_available()
                 job = await self._repository.get_job(public_id)
         except TranscriptionJobStoreUnavailableError as exc:
-            await self._execution_signals.mark_store_unavailable()
+            await self._mark_store_unavailable()
             raise JobStoreUnavailableError() from exc
         if job is None:
             raise JobNotFoundError()
@@ -146,27 +148,18 @@ class TranscriptionJobService:
             JobStoreUnavailableError: If durable cancellation cannot commit safely.
         """
         public_id = _parse_capability(capability)
-        job: ProcessingTranscriptionJob | CancelledTranscriptionJob
         try:
-            async with self._lifecycle_state.lock:
+            async with self._lock:
                 self._require_store_available()
                 cancellation = await self._repository.request_cancellation(public_id)
-                if cancellation is None:
-                    raise JobNotFoundError()
-                if isinstance(cancellation, ProcessingCancellation):
-                    self._execution_signals.request_execution_cancellation(
-                        cancellation.internal_id
-                    )
-                    job = cancellation.job
-                else:
-                    job = cancellation
         except TranscriptionJobAlreadyFinishedError as exc:
             raise JobAlreadyFinishedError() from exc
         except TranscriptionJobStoreUnavailableError as exc:
-            await self._execution_signals.mark_store_unavailable()
+            await self._mark_store_unavailable()
             raise JobStoreUnavailableError() from exc
-        self._execution_signals.notify_work_available()
-        return job
+        if cancellation is None:
+            raise JobNotFoundError()
+        return cancellation
 
 
 def _parse_capability(capability: str) -> UUID:

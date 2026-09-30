@@ -1,6 +1,6 @@
 """Durable Transcription Job environment configuration."""
 
-from pydantic import Field, PostgresDsn, field_validator
+from pydantic import Field, PostgresDsn, RedisDsn, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -36,7 +36,21 @@ class JobConfig(BaseSettings):
             )
         return value
 
-    job_worker_count: int = Field(default=4, gt=0)
     max_outstanding_jobs: int = Field(default=8, gt=0)
     job_queue_timeout_seconds: int = Field(default=20, gt=0)
     job_retention_seconds: int = Field(default=86_400, gt=0)
+
+
+class JobDispatchConfig(BaseSettings):
+    """Validate settings used to deliver and process Job Dispatches."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="TEXTIFY_",
+        env_file=".env",
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+    broker_url: RedisDsn
+    worker_concurrency: int = Field(default=4, gt=0)
+    reconciler_interval_seconds: float = Field(default=1.0, gt=0)

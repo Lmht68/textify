@@ -1,6 +1,8 @@
 """Lifecycle types for durable Transcription Jobs."""
 
-from dataclasses import dataclass
+from __future__ import annotations
+
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from uuid import UUID
@@ -27,6 +29,65 @@ class JobOutcome(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class JobDispatch:
+    """Identify one private Execution Attempt delivered for processing."""
+
+    internal_job_id: int
+    execution_attempt_token: UUID = field(repr=False)
+
+    def to_payload(self) -> dict[str, int | str]:
+        """Serialize the exact JSON object permitted on the delivery broker.
+
+        Returns:
+            The private internal job identifier and canonical UUIDv4 attempt token.
+        """
+        return {
+            "internal_job_id": self.internal_job_id,
+            "execution_attempt_token": str(self.execution_attempt_token),
+        }
+
+    @classmethod
+    def from_payload(cls, payload: object) -> JobDispatch | None:
+        """Parse one exact, canonical broker dispatch payload.
+
+        Args:
+            payload: Deserialized JSON object received from the delivery broker.
+
+        Returns:
+            A validated private dispatch, or ``None`` when the payload is invalid.
+        """
+        if not isinstance(payload, dict) or set(payload) != {
+            "internal_job_id",
+            "execution_attempt_token",
+        }:
+            return None
+
+        internal_job_id = payload["internal_job_id"]
+        serialized_token = payload["execution_attempt_token"]
+        if (
+            isinstance(internal_job_id, bool)
+            or not isinstance(internal_job_id, int)
+            or internal_job_id <= 0
+            or not isinstance(serialized_token, str)
+        ):
+            return None
+
+        try:
+            execution_attempt_token = UUID(serialized_token)
+        except ValueError:
+            return None
+        if (
+            str(execution_attempt_token) != serialized_token
+            or execution_attempt_token.version != 4
+        ):
+            return None
+        return cls(
+            internal_job_id=internal_job_id,
+            execution_attempt_token=execution_attempt_token,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class NewQueuedTranscriptionJob:
     """Hold private data required to persist one newly admitted job."""
 
@@ -36,20 +97,11 @@ class NewQueuedTranscriptionJob:
 
 @dataclass(frozen=True, slots=True)
 class ClaimedTranscriptionJob:
-    """Hold private execution inputs durably claimed by one consumer."""
+    """Hold private execution inputs claimed for one Job Dispatch."""
 
-    internal_id: int
+    dispatch: JobDispatch
     submitted_url: str
     exclusions: tuple[ResponseFieldPath, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class RecoveredTranscriptionJobs:
-    """Group private job identifiers terminalized during startup recovery."""
-
-    expired_queued_internal_ids: tuple[int, ...]
-    interrupted_processing_internal_ids: tuple[int, ...]
-    cancelled_processing_internal_ids: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,14 +127,6 @@ class ProcessingTranscriptionJob:
 
 
 @dataclass(frozen=True, slots=True)
-class ProcessingCancellation:
-    """Hold an accepted cancellation with its private active-worker identity."""
-
-    job: ProcessingTranscriptionJob
-    internal_id: int
-
-
-@dataclass(frozen=True, slots=True)
 class CancelledTranscriptionJob:
     """Hold the safe persisted projection of a cancelled finished job."""
 
@@ -92,9 +136,6 @@ class CancelledTranscriptionJob:
     submitted_at: datetime
     started_at: datetime | None
     finished_at: datetime
-
-
-type CancellationResult = ProcessingCancellation | CancelledTranscriptionJob
 
 
 @dataclass(frozen=True, slots=True)
