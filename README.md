@@ -5,18 +5,20 @@ It uses an eligible YouTube caption track when available and otherwise uses Fast
 
 ## Deployment boundary
 
-One Textify process owns one SQLite database and one loaded GPU model.
-Run one process or one container per GPU.
-Do not run multiple Textify processes or containers against the same SQLite database path or durable volume.
-SQLite provides the durable queue only within that single-instance boundary.
+One Textify process owns one loaded GPU model and its in-process Transcription Job runner.
+PostgreSQL is the sole durable Transcription Job store.
+Run one Textify process or one container per GPU.
+Do not run multiple full Textify processes or containers against the same PostgreSQL database.
+Startup recovery intentionally terminalizes processing jobs from a prior process.
+Distributed execution ownership is deferred until the later Celery work.
 
 Textify requires Python 3.12 and [uv](https://docs.astral.sh/uv/) for source deployments.
 Container deployments require Docker, NVIDIA Container Toolkit, and a GPU exposed to the container.
 
 ## Persistent state and migrations
 
-`TEXTIFY_DATABASE_PATH` is required when migrations or application lifespan run.
-Set it to a durable SQLite file that survives process replacement.
+`TEXTIFY_DATABASE_URL` is required when migrations or application lifespan run.
+It must use `postgresql+asyncpg` and reach an externally managed PostgreSQL database.
 Importing `textify.main.app` and requesting `/openapi.json` do not read this setting.
 
 Run the source migration before starting the API.
@@ -24,6 +26,7 @@ Run the source migration before starting the API.
 ```shell
 uv sync --frozen
 cp .env.example .env
+export TEXTIFY_DATABASE_URL='postgresql+asyncpg://textify:change-me@127.0.0.1:5432/textify'
 uv run alembic upgrade head
 uv run textify
 ```
@@ -41,51 +44,34 @@ The default source listener is `http://127.0.0.1:8182`.
 
 ## Run with Docker
 
-The image migrates the durable SQLite database before it starts Textify.
-Mount one persistent volume at `/var/lib/textify`.
-That directory contains the default database at `/var/lib/textify/textify.sqlite3` and the default temporary media root at `/var/lib/textify/media`.
+The image migrates the configured PostgreSQL database before it starts Textify.
+Pass `TEXTIFY_DATABASE_URL` at runtime with a hostname reachable from the container.
 
 ```shell
 docker build -t textify .
 
-docker volume create textify-data
 docker volume create textify-model-cache
 
 docker run --rm \
   --gpus "device=0" \
   -p 8182:8182 \
-  -v textify-data:/var/lib/textify \
+  -e TEXTIFY_DATABASE_URL='postgresql+asyncpg://textify:change-me@postgres:5432/textify' \
   -v textify-model-cache:/var/cache/textify/huggingface \
   textify
 ```
 
 The container runs as UID and GID `10001`.
-For a bind mount, create the directory and grant that identity ownership before starting the container.
-
-```shell
-mkdir -p ./textify-data
-sudo chown 10001:10001 ./textify-data
-
-docker run --rm \
-  --gpus "device=0" \
-  -p 8182:8182 \
-  -v "$(pwd)/textify-data:/var/lib/textify" \
-  -v textify-model-cache:/var/cache/textify/huggingface \
-  textify
-```
-
 The default container command is `alembic upgrade head && exec textify`.
 Run a reversible downgrade by overriding that command while no application container owns the database.
 
 ```shell
 docker run --rm \
-  -v textify-data:/var/lib/textify \
+  -e TEXTIFY_DATABASE_URL='postgresql+asyncpg://textify:change-me@postgres:5432/textify' \
   textify \
   alembic downgrade -1
 ```
 
 Choose another GPU device in `--gpus "device=N"` for another isolated deployment.
-Do not share the same `/var/lib/textify` volume between those deployments.
 
 ## Configuration
 
@@ -94,7 +80,7 @@ Keep `.env` private, especially `TEXTIFY_HF_TOKEN` when a model requires Hugging
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `TEXTIFY_DATABASE_PATH` | Required | Durable SQLite database file. The container sets `/var/lib/textify/textify.sqlite3`. |
+| `TEXTIFY_DATABASE_URL` | Required | PostgreSQL durable-job URL using the `postgresql+asyncpg` driver. |
 | `TEXTIFY_JOB_WORKER_COUNT` | `4` | In-process Transcription Job consumers. |
 | `TEXTIFY_MAX_OUTSTANDING_JOBS` | `8` | Maximum queued and processing jobs. |
 | `TEXTIFY_JOB_QUEUE_TIMEOUT_SECONDS` | `20` | Maximum time a queued job may wait before it fails with `queue_timeout`. |
@@ -158,7 +144,17 @@ Interrupted processing jobs finish as `worker_interrupted`, and interrupted acce
 Terminal jobs remain addressable for `86400` seconds by default.
 Startup and hourly retention cleanup remove expired terminal jobs and their related persisted result data.
 After expiration, status and cancellation return the same `404 job_not_found` response as an unknown capability.
-SQLite `secure_delete=ON` and application-level deletion do not guarantee physical erasure from storage media, snapshots, backups, or filesystems.
+
+## Durable test database
+
+Durable tests create, migrate, and drop uniquely named PostgreSQL databases through `TEXTIFY_TEST_DATABASE_URL`.
+Point it at a disposable PostgreSQL administration database, never an application or production database.
+The configured role needs `CREATEDB` permission.
+
+```shell
+export TEXTIFY_TEST_DATABASE_URL='postgresql+asyncpg://textify:change-me@127.0.0.1:5432/postgres'
+uv run pytest -m "not live"
+```
 
 ## Live API contract check
 
