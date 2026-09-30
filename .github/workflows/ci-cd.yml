@@ -18,6 +18,22 @@ jobs:
   validate:
     name: Validate Python package
     runs-on: ubuntu-latest
+    env:
+      TEXTIFY_TEST_DATABASE_URL: postgresql+asyncpg://textify:textify@127.0.0.1:5432/postgres
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_PASSWORD: textify
+          POSTGRES_USER: textify
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U textify -d postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683

@@ -9,7 +9,6 @@ ENV UV_PYTHON=python3.12 \
     PATH=/opt/textify/.venv/bin:$PATH \
     HF_HOME=/var/cache/textify/huggingface \
     TEXTIFY_HOST=0.0.0.0 \
-    TEXTIFY_DATABASE_PATH=/var/lib/textify/textify.sqlite3 \
     TEXTIFY_TEMPORARY_MEDIA_ROOT=/var/lib/textify/media \
     TEXTIFY_JOB_WORKER_COUNT=4 \
     TEXTIFY_MAX_OUTSTANDING_JOBS=8 \

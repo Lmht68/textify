@@ -10,9 +10,12 @@ from uuid import UUID
 import pytest
 from httpx import ASGITransport, AsyncClient, Response
 from pydantic import ValidationError
+from sqlalchemy import text
+from sqlalchemy.engine import make_url
 
 from textify.config import AppConfig, Environment
 from textify.jobs.config import JobConfig
+from textify.jobs.database import create_application_engine
 from textify.main import _validate_temporary_media_capacity, create_app
 from textify.transcription import acquisition, inspection
 from textify.transcription.config import TranscriptionConfig
@@ -173,18 +176,18 @@ def _app_config() -> AppConfig:
     )
 
 
-def _job_config(database_path: Path, job_worker_count: int = 1) -> JobConfig:
+def _job_config(database_url: str, job_worker_count: int = 1) -> JobConfig:
     """Create isolated durable-job configuration for ASGI tests.
 
     Args:
-        database_path: Per-test SQLite database upgraded through Alembic.
+        database_url: Per-test PostgreSQL database upgraded through Alembic.
         job_worker_count: Number of durable consumers to start.
 
     Returns:
         Configuration independent of local environment files.
     """
     return JobConfig(
-        database_path=database_path,
+        database_url=database_url,
         job_worker_count=job_worker_count,
         max_outstanding_jobs=8,
         job_queue_timeout_seconds=20,
@@ -245,13 +248,11 @@ def test_app_config_defaults_to_deployment_port(
     assert settings.port == 8182
 
 
-def test_default_temporary_media_capacity_reserves_seven_allocations(
-    tmp_path: Path,
-) -> None:
+def test_default_temporary_media_capacity_reserves_seven_allocations() -> None:
     """The deployment defaults reserve four workers, two native calls, and cleanup."""
     transcription_settings = TranscriptionConfig(_env_file=None)  # type: ignore[call-arg]
     job_settings = JobConfig(
-        database_path=tmp_path / "textify.sqlite3",
+        database_url="postgresql+asyncpg://textify:change-me@127.0.0.1:5432/textify",
         _env_file=None,  # type: ignore[call-arg]
     )
     expected_bytes = 7 * 536_870_912
@@ -332,7 +333,7 @@ def test_temporary_media_capacity_translates_disk_usage_failure(tmp_path: Path) 
 
 @pytest.mark.asyncio
 async def test_api_starts_at_exact_temporary_media_capacity(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Startup succeeds when free space equals the configured media quota."""
@@ -347,7 +348,7 @@ async def test_api_starts_at_exact_temporary_media_capacity(
         settings,
         StartupAdaptersFactory(),
         available_temporary_media_bytes=lambda _root: 600,
-        job_config=_job_config(migrated_database_path, job_worker_count=2),
+        job_config=_job_config(migrated_postgresql_database_url, job_worker_count=2),
     )
 
     async with application.router.lifespan_context(application):
@@ -360,7 +361,7 @@ async def test_api_starts_at_exact_temporary_media_capacity(
 
 @pytest.mark.asyncio
 async def test_api_fails_startup_before_model_when_temporary_media_capacity_is_low(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Low capacity aborts startup after root creation but before adapters load."""
@@ -377,7 +378,7 @@ async def test_api_fails_startup_before_model_when_temporary_media_capacity_is_l
         settings,
         factory,
         available_temporary_media_bytes=lambda _root: 599,
-        job_config=_job_config(migrated_database_path, job_worker_count=2),
+        job_config=_job_config(migrated_postgresql_database_url, job_worker_count=2),
     )
 
     with pytest.raises(
@@ -399,7 +400,7 @@ async def test_api_rejects_unconfigured_database_before_touching_filesystem(
 ) -> None:
     """Defer required database validation until lifespan before filesystem access."""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("TEXTIFY_DATABASE_PATH", raising=False)
+    monkeypatch.delenv("TEXTIFY_DATABASE_URL", raising=False)
     media_root = tmp_path / "media"
     factory = StartupAdaptersFactory()
     application = create_app(
@@ -419,8 +420,141 @@ async def test_api_rejects_unconfigured_database_before_touching_filesystem(
 
 
 @pytest.mark.asyncio
+async def test_api_rejects_unavailable_postgresql_before_adapter_construction(
+    tmp_path: Path,
+) -> None:
+    """Map an unreachable PostgreSQL server to the stable startup failure."""
+    factory = StartupAdaptersFactory()
+    application = create_app(
+        _app_config(),
+        _transcription_config(tmp_path / "media"),
+        factory,
+        available_temporary_media_bytes=lambda _root: 1 << 60,
+        job_config=_job_config(
+            "postgresql+asyncpg://textify:change-me@127.0.0.1:1/textify"
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^Transcription job database is unavailable\.$",
+    ):
+        async with application.router.lifespan_context(application):
+            pass
+
+    assert application.state.ready is False
+    assert factory.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_api_rejects_postgresql_database_without_migration_revision(
+    postgresql_database_url: str,
+    tmp_path: Path,
+) -> None:
+    """Map a PostgreSQL database without Alembic revision state to schema failure."""
+    factory = StartupAdaptersFactory()
+    application = create_app(
+        _app_config(),
+        _transcription_config(tmp_path / "media"),
+        factory,
+        available_temporary_media_bytes=lambda _root: 1 << 60,
+        job_config=_job_config(postgresql_database_url),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^Transcription job database schema is not current\.$",
+    ):
+        async with application.router.lifespan_context(application):
+            pass
+
+    assert application.state.ready is False
+    assert factory.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_api_rejects_stale_postgresql_migration_revision(
+    postgresql_database_url: str,
+    tmp_path: Path,
+) -> None:
+    """Map stale PostgreSQL Alembic state to the schema startup failure."""
+    storage_engine = create_application_engine(postgresql_database_url)
+    try:
+        async with storage_engine.begin() as connection:
+            await connection.execute(
+                text("CREATE TABLE alembic_version (version_num varchar(32) NOT NULL)")
+            )
+            await connection.execute(
+                text("INSERT INTO alembic_version (version_num) VALUES ('0000_stale')")
+            )
+    finally:
+        await storage_engine.dispose()
+
+    factory = StartupAdaptersFactory()
+    application = create_app(
+        _app_config(),
+        _transcription_config(tmp_path / "media"),
+        factory,
+        available_temporary_media_bytes=lambda _root: 1 << 60,
+        job_config=_job_config(postgresql_database_url),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^Transcription job database schema is not current\.$",
+    ):
+        async with application.router.lifespan_context(application):
+            pass
+
+    assert application.state.ready is False
+    assert factory.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_api_rejects_read_only_postgresql_before_adapter_construction(
+    migrated_postgresql_database_url: str,
+    tmp_path: Path,
+) -> None:
+    """Map PostgreSQL read-only transactions to the stable startup failure."""
+    database_name = make_url(migrated_postgresql_database_url).database
+    assert database_name is not None
+    assert database_name.startswith("textify_test_")
+
+    storage_engine = create_application_engine(migrated_postgresql_database_url)
+    try:
+        async with storage_engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f'ALTER DATABASE "{database_name}" '
+                    "SET default_transaction_read_only = on"
+                )
+            )
+    finally:
+        await storage_engine.dispose()
+
+    factory = StartupAdaptersFactory()
+    application = create_app(
+        _app_config(),
+        _transcription_config(tmp_path / "media"),
+        factory,
+        available_temporary_media_bytes=lambda _root: 1 << 60,
+        job_config=_job_config(migrated_postgresql_database_url),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^Transcription job database is unavailable\.$",
+    ):
+        async with application.router.lifespan_context(application):
+            pass
+
+    assert application.state.ready is False
+    assert factory.calls == 0
+
+
+@pytest.mark.asyncio
 async def test_api_closes_storage_before_adapter_construction_failure(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Leave readiness false when adapter construction aborts lifespan startup."""
@@ -439,7 +573,7 @@ async def test_api_closes_storage_before_adapter_construction_failure(
         _transcription_config(tmp_path / "media"),
         failing_adapters_factory,
         available_temporary_media_bytes=lambda _root: 1 << 60,
-        job_config=_job_config(migrated_database_path),
+        job_config=_job_config(migrated_postgresql_database_url),
     )
 
     with pytest.raises(RuntimeError, match="adapter construction failed"):
@@ -462,7 +596,7 @@ async def test_api_closes_storage_before_adapter_construction_failure(
 )
 async def test_api_closes_partially_scheduled_job_tasks(
     failed_task_name: str,
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     monkeypatch: pytest.MonkeyPatch,
     recwarn: pytest.WarningsRecorder,
     tmp_path: Path,
@@ -495,7 +629,7 @@ async def test_api_closes_partially_scheduled_job_tasks(
         _transcription_config(tmp_path / "media"),
         factory,
         available_temporary_media_bytes=lambda _root: 1 << 60,
-        job_config=_job_config(migrated_database_path, job_worker_count=2),
+        job_config=_job_config(migrated_postgresql_database_url, job_worker_count=2),
     )
 
     with pytest.raises(RuntimeError, match=f"Unable to schedule {failed_task_name}"):
@@ -516,7 +650,7 @@ async def test_api_closes_partially_scheduled_job_tasks(
 
 @pytest.mark.asyncio
 async def test_api_adds_fresh_request_ids_to_job_route_outcomes(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Health, submission, validation, and unmatched routes get fresh UUIDv4 IDs."""
@@ -526,7 +660,7 @@ async def test_api_adds_fresh_request_ids_to_job_route_outcomes(
         _transcription_config(tmp_path),
         StartupAdaptersFactory(),
         available_temporary_media_bytes=lambda _root: 1 << 60,
-        job_config=_job_config(migrated_database_path),
+        job_config=_job_config(migrated_postgresql_database_url),
     )
 
     async with application.router.lifespan_context(application):

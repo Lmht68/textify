@@ -2,10 +2,9 @@
 
 import asyncio
 import logging
-import sqlite3
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -15,12 +14,15 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient, Response
+from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from starlette.types import Message
 from yt_dlp.utils import DownloadCancelled
 
 from textify.config import AppConfig, Environment
 from textify.jobs.config import JobConfig
 from textify.jobs.contracts import TranscriptionJobStoreUnavailableError
+from textify.jobs.database import create_application_engine
 from textify.jobs.service import utc_now
 from textify.main import create_app
 from textify.transcription import inspection
@@ -639,7 +641,7 @@ def _app_config() -> AppConfig:
 
 
 def _job_config(
-    database_path: Path | None,
+    database_url: str,
     *,
     job_worker_count: int = 1,
     job_queue_timeout_seconds: int = 20,
@@ -647,7 +649,7 @@ def _job_config(
 ) -> JobConfig:
     """Create isolated durable-job configuration for durable-job tests."""
     return JobConfig(
-        database_path=database_path,
+        database_url=database_url,
         job_worker_count=job_worker_count,
         max_outstanding_jobs=8,
         job_queue_timeout_seconds=job_queue_timeout_seconds,
@@ -675,7 +677,7 @@ def _transcription_config(
 
 
 def _application(
-    database_path: Path | None,
+    database_url: str,
     temporary_media_root: Path,
     factory: ControlledAdaptersFactory,
     *,
@@ -693,11 +695,55 @@ def _application(
         factory,
         available_temporary_media_bytes=lambda _root: 1 << 60,
         job_config=(
-            job_config if job_config is not None else _job_config(database_path)
+            job_config if job_config is not None else _job_config(database_url)
         ),
         clock=clock,
         retention_cleanup_interval=retention_cleanup_interval,
     )
+
+
+async def _storage_rows(
+    database_url: str,
+    statement: str,
+    parameters: Mapping[str, object] | None = None,
+) -> list[tuple[object, ...]]:
+    """Execute a PostgreSQL read and return rows as stable positional tuples.
+
+    Args:
+        database_url: Isolated migrated PostgreSQL database URL.
+        statement: SQL query using named bind parameters when required.
+        parameters: Optional bind values for the SQL query.
+
+    Returns:
+        Query result rows in selected-column order.
+    """
+    engine = create_application_engine(database_url)
+    try:
+        async with engine.connect() as connection:
+            result = await connection.execute(text(statement), parameters)
+            return [tuple(row) for row in result.all()]
+    finally:
+        await engine.dispose()
+
+
+async def _execute_storage_statement(
+    database_url: str,
+    statement: str,
+    parameters: Mapping[str, object] | None = None,
+) -> None:
+    """Commit one PostgreSQL data-definition or data-manipulation statement.
+
+    Args:
+        database_url: Isolated migrated PostgreSQL database URL.
+        statement: SQL statement using named bind parameters when required.
+        parameters: Optional bind values for the SQL statement.
+    """
+    engine = create_application_engine(database_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(text(statement), parameters)
+    finally:
+        await engine.dispose()
 
 
 async def _wait_for_thread_event(event: threading.Event) -> None:
@@ -910,14 +956,14 @@ def _assert_safe_error(
 
 
 async def test_api_processes_persists_and_reopens_successful_job(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Publish one blocked job atomically, then read it after application restart."""
     first_state = ControlledAdapterState(block_metadata=True)
     first_factory = ControlledAdaptersFactory(first_state)
     first_application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "first-media",
         first_factory,
     )
@@ -944,16 +990,18 @@ async def test_api_processes_persists_and_reopens_successful_job(
     assert expected_result["source"]["platform"] == "tiktok"
     assert expected_result["transcript"]["text"] == "One"
     assert first_state.native_include_segments == [True]
-    with sqlite3.connect(migrated_database_path) as connection:
-        lifecycle = connection.execute(
-            "SELECT status, outcome FROM transcription_job"
-        ).fetchall()
-        result_rows = connection.execute(
-            "SELECT * FROM transcription_job_result"
-        ).fetchall()
-        segments = connection.execute(
-            "SELECT ordinal, text FROM transcription_job_segment ORDER BY ordinal"
-        ).fetchall()
+    lifecycle = await _storage_rows(
+        migrated_postgresql_database_url,
+        "SELECT status, outcome FROM transcription_job",
+    )
+    result_rows = await _storage_rows(
+        migrated_postgresql_database_url,
+        "SELECT * FROM transcription_job_result",
+    )
+    segments = await _storage_rows(
+        migrated_postgresql_database_url,
+        "SELECT ordinal, text FROM transcription_job_segment ORDER BY ordinal",
+    )
     assert lifecycle == [("finished", "succeeded")]
     assert len(result_rows) == 1
     assert segments == [(0, "One")]
@@ -961,7 +1009,7 @@ async def test_api_processes_persists_and_reopens_successful_job(
     reopened_state = ControlledAdapterState()
     reopened_factory = ControlledAdaptersFactory(reopened_state)
     reopened_application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "reopened-media",
         reopened_factory,
     )
@@ -993,14 +1041,16 @@ async def test_api_processes_persists_and_reopens_successful_job(
     ),
 )
 async def test_api_persists_every_requested_projection_exclusion(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
     excluded_path: str,
 ) -> None:
     """Persist each response-field exclusion without dropping retained typed values."""
     state = ControlledAdapterState()
     application = _application(
-        migrated_database_path, tmp_path / "media", ControlledAdaptersFactory(state)
+        migrated_postgresql_database_url,
+        tmp_path / "media",
+        ControlledAdaptersFactory(state),
     )
     async with application.router.lifespan_context(application):
         transport = ASGITransport(app=application)
@@ -1029,10 +1079,12 @@ async def test_api_persists_every_requested_projection_exclusion(
             {"start": 0.0, "end": 1.0, "text": "One"}
         ]
     assert state.native_include_segments == [excluded_path != "transcript.segments"]
-    with sqlite3.connect(migrated_database_path) as connection:
-        segment_count = connection.execute(
-            "SELECT COUNT(*) FROM transcription_job_segment"
-        ).fetchone()[0]
+    segment_count = (
+        await _storage_rows(
+            migrated_postgresql_database_url,
+            "SELECT COUNT(*) FROM transcription_job_segment",
+        )
+    )[0][0]
     assert segment_count == (0 if excluded_path == "transcript.segments" else 1)
 
 
@@ -1047,7 +1099,7 @@ async def test_api_persists_every_requested_projection_exclusion(
     ),
 )
 async def test_api_executes_supported_platforms_through_submission_and_polling(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
     submitted_url: str,
     expected_platform: str,
@@ -1058,7 +1110,9 @@ async def test_api_executes_supported_platforms_through_submission_and_polling(
         caption_segments=((0.0, 1.0, "Caption"),) if uses_caption else ()
     )
     application = _application(
-        migrated_database_path, tmp_path / "media", ControlledAdaptersFactory(state)
+        migrated_postgresql_database_url,
+        tmp_path / "media",
+        ControlledAdaptersFactory(state),
     )
     async with application.router.lifespan_context(application):
         transport = ASGITransport(app=application)
@@ -1079,13 +1133,15 @@ async def test_api_executes_supported_platforms_through_submission_and_polling(
 
 
 async def test_api_keeps_minimum_and_empty_projection_contracts(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Retain valid minimum projections and preserve an explicit empty projection list."""
     state = ControlledAdapterState()
     application = _application(
-        migrated_database_path, tmp_path / "media", ControlledAdaptersFactory(state)
+        migrated_postgresql_database_url,
+        tmp_path / "media",
+        ControlledAdaptersFactory(state),
     )
     minimum_exclusions = [
         "source.video_id",
@@ -1143,7 +1199,7 @@ async def test_api_keeps_minimum_and_empty_projection_contracts(
 
 
 async def test_api_uses_native_fallback_when_youtube_captions_are_unrelated(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Keep caption selection and native fallback behavior under worker ownership."""
@@ -1152,7 +1208,9 @@ async def test_api_uses_native_fallback_when_youtube_captions_are_unrelated(
         caption_language="fr",
     )
     application = _application(
-        migrated_database_path, tmp_path / "media", ControlledAdaptersFactory(state)
+        migrated_postgresql_database_url,
+        tmp_path / "media",
+        ControlledAdaptersFactory(state),
     )
     async with application.router.lifespan_context(application):
         transport = ASGITransport(app=application)
@@ -1171,13 +1229,15 @@ async def test_api_uses_native_fallback_when_youtube_captions_are_unrelated(
 
 
 async def test_api_rejects_invalid_unknown_and_failed_admission_safely(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Keep immediate validation and durable-store errors outside provider execution."""
     state = ControlledAdapterState()
     application = _application(
-        migrated_database_path, tmp_path / "media", ControlledAdaptersFactory(state)
+        migrated_postgresql_database_url,
+        tmp_path / "media",
+        ControlledAdaptersFactory(state),
     )
     async with application.router.lifespan_context(application):
         transport = ASGITransport(app=application)
@@ -1199,13 +1259,15 @@ async def test_api_rejects_invalid_unknown_and_failed_admission_safely(
 
 
 async def test_api_bounds_outstanding_jobs_while_the_consumer_is_blocked(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Keep eight durable jobs outstanding and reject the ninth admission."""
     state = ControlledAdapterState(block_metadata=True)
     application = _application(
-        migrated_database_path, tmp_path / "media", ControlledAdaptersFactory(state)
+        migrated_postgresql_database_url,
+        tmp_path / "media",
+        ControlledAdaptersFactory(state),
     )
     async with application.router.lifespan_context(application):
         transport = ASGITransport(app=application)
@@ -1230,17 +1292,19 @@ async def test_api_bounds_outstanding_jobs_while_the_consumer_is_blocked(
             assert len(accepted) == 7
             assert len(rejected) == 1
             _assert_safe_error(rejected[0], 503, "transcription_capacity_exceeded")
-            with sqlite3.connect(migrated_database_path) as connection:
-                outstanding_count = connection.execute(
+            outstanding_count = (
+                await _storage_rows(
+                    migrated_postgresql_database_url,
                     "SELECT COUNT(*) FROM transcription_job "
-                    "WHERE status IN ('queued', 'processing')"
-                ).fetchone()[0]
+                    "WHERE status IN ('queued', 'processing')",
+                )
+            )[0][0]
             assert outstanding_count == 8
             state.metadata_release.set()
 
 
 async def test_api_rolls_back_result_when_terminal_transition_is_aborted(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Fail closed, preserve work, and recover without retrying interrupted jobs."""
@@ -1249,7 +1313,7 @@ async def test_api_rolls_back_result_when_terminal_transition_is_aborted(
     rejected_url = f"{TIKTOK_URL}?terminal-rollback=rejected"
     first_state = ControlledAdapterState(block_metadata=True)
     first_application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "first-media",
         ControlledAdaptersFactory(first_state),
     )
@@ -1269,20 +1333,35 @@ async def test_api_rolls_back_result_when_terminal_transition_is_aborted(
                 )
                 processing_location = processing_submission["links"]["self"]
                 await _wait_for_thread_event(first_state.metadata_entered)
-                with sqlite3.connect(migrated_database_path) as connection:
-                    connection.executescript(
-                        """
-                        CREATE TRIGGER transcription_job_finish_abort
-                        BEFORE UPDATE OF status ON transcription_job
-                        WHEN OLD.status = 'processing'
-                            AND NEW.status = 'finished'
-                            AND NEW.outcome = 'succeeded'
-                            AND OLD.submitted_url LIKE '%terminal-rollback=processing'
-                        BEGIN
-                            SELECT RAISE(ABORT, 'blocked finish');
-                        END;
-                        """
-                    )
+                await _execute_storage_statement(
+                    migrated_postgresql_database_url,
+                    """
+                    CREATE FUNCTION abort_successful_job_finish()
+                    RETURNS trigger
+                    LANGUAGE plpgsql
+                    AS $$
+                    BEGIN
+                        IF OLD.status = 'processing'
+                        AND NEW.status = 'finished'
+                        AND NEW.outcome = 'succeeded'
+                        AND OLD.submitted_url LIKE '%terminal-rollback=processing'
+                        THEN
+                            RAISE EXCEPTION 'blocked finish';
+                        END IF;
+                        RETURN NEW;
+                    END;
+                    $$;
+                    """,
+                )
+                await _execute_storage_statement(
+                    migrated_postgresql_database_url,
+                    """
+                    CREATE TRIGGER transcription_job_finish_abort
+                    BEFORE UPDATE OF status ON transcription_job
+                    FOR EACH ROW
+                    EXECUTE FUNCTION abort_successful_job_finish()
+                    """,
+                )
                 queued_submission = _assert_submission(
                     await client.post(
                         "/api/transcription-jobs",
@@ -1299,16 +1378,22 @@ async def test_api_rolls_back_result_when_terminal_transition_is_aborted(
 
                 health_response = await client.get("/health")
                 assert health_response.status_code == 503
-                with sqlite3.connect(migrated_database_path) as connection:
-                    result_count = connection.execute(
-                        "SELECT COUNT(*) FROM transcription_job_result"
-                    ).fetchone()[0]
-                    segment_count = connection.execute(
-                        "SELECT COUNT(*) FROM transcription_job_segment"
-                    ).fetchone()[0]
-                    rows_before_rejection = connection.execute(
-                        "SELECT public_id, status FROM transcription_job ORDER BY id"
-                    ).fetchall()
+                result_count = (
+                    await _storage_rows(
+                        migrated_postgresql_database_url,
+                        "SELECT COUNT(*) FROM transcription_job_result",
+                    )
+                )[0][0]
+                segment_count = (
+                    await _storage_rows(
+                        migrated_postgresql_database_url,
+                        "SELECT COUNT(*) FROM transcription_job_segment",
+                    )
+                )[0][0]
+                rows_before_rejection = await _storage_rows(
+                    migrated_postgresql_database_url,
+                    "SELECT public_id::text, status FROM transcription_job ORDER BY id",
+                )
 
                 rejected_submission = await client.post(
                     "/api/transcription-jobs",
@@ -1320,10 +1405,10 @@ async def test_api_rolls_back_result_when_terminal_transition_is_aborted(
                     "job_store_unavailable",
                 )
 
-                with sqlite3.connect(migrated_database_path) as connection:
-                    rows_after_rejection = connection.execute(
-                        "SELECT public_id, status FROM transcription_job ORDER BY id"
-                    ).fetchall()
+                rows_after_rejection = await _storage_rows(
+                    migrated_postgresql_database_url,
+                    "SELECT public_id::text, status FROM transcription_job ORDER BY id",
+                )
 
                 assert result_count == 0
                 assert segment_count == 0
@@ -1337,7 +1422,7 @@ async def test_api_rolls_back_result_when_terminal_transition_is_aborted(
 
     recovered_state = ControlledAdapterState()
     recovered_application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "recovered-media",
         ControlledAdaptersFactory(recovered_state),
     )
@@ -1364,13 +1449,13 @@ async def test_api_rolls_back_result_when_terminal_transition_is_aborted(
 
 
 async def test_api_completes_submission_after_response_delivery_disconnect(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Keep an accepted job independent from the client that submitted it."""
     state = ControlledAdapterState(block_metadata=True)
     application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "media",
         ControlledAdaptersFactory(state),
     )
@@ -1446,44 +1531,73 @@ async def test_api_completes_submission_after_response_delivery_disconnect(
     _assert_succeeded(finished, committed_location)
 
 
-@pytest.mark.parametrize("failure_case", ("missing", "empty", "stale", "read_only"))
+@pytest.mark.parametrize("failure_case", ("missing", "empty", "stale"))
 async def test_api_fails_startup_before_adapter_construction_for_invalid_storage(
     failure_case: str,
-    migrated_database_path: Path,
+    postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
-    """Reject invalid durable storage before creating provider adapters."""
-    database_path: Path | None
+    """Reject unavailable, uninitialized, and stale PostgreSQL storage."""
     if failure_case == "missing":
-        database_path = tmp_path / "missing.sqlite3"
-    elif failure_case == "empty":
-        database_path = tmp_path / "empty.sqlite3"
-        database_path.touch()
-    elif failure_case == "stale":
-        database_path = tmp_path / "stale.sqlite3"
-        with sqlite3.connect(database_path) as connection:
-            connection.execute("CREATE TABLE alembic_version (version_num VARCHAR(32))")
-            connection.execute("INSERT INTO alembic_version VALUES ('0000_stale')")
+        database_url = "postgresql+asyncpg://textify:change-me@127.0.0.1:1/textify"
     else:
-        database_path = migrated_database_path
-        database_path.chmod(0o444)
+        database_url = postgresql_database_url
+        if failure_case == "stale":
+            await _execute_storage_statement(
+                database_url,
+                "CREATE TABLE alembic_version (version_num varchar(32) NOT NULL)",
+            )
+            await _execute_storage_statement(
+                database_url,
+                "INSERT INTO alembic_version (version_num) VALUES ('0000_stale')",
+            )
 
     factory = ControlledAdaptersFactory(ControlledAdapterState())
-    application = _application(database_path, tmp_path / "media", factory)
+    application = _application(database_url, tmp_path / "media", factory)
+    with pytest.raises(RuntimeError):
+        async with application.router.lifespan_context(application):
+            pass
+
+    assert factory.calls == 0
+    assert application.state.ready is False
+
+
+async def test_api_fails_startup_before_adapter_construction_for_read_only_storage(
+    migrated_postgresql_database_url: str,
+    tmp_path: Path,
+) -> None:
+    """Reject a PostgreSQL database configured as read-only."""
+    database_name = make_url(migrated_postgresql_database_url).database
+    assert database_name is not None
+    assert database_name.startswith("textify_test_")
+    storage_engine = create_application_engine(migrated_postgresql_database_url)
     try:
-        with pytest.raises(RuntimeError):
-            async with application.router.lifespan_context(application):
-                pass
+        async with storage_engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f'ALTER DATABASE "{database_name}" '
+                    "SET default_transaction_read_only = on"
+                )
+            )
     finally:
-        if failure_case == "read_only":
-            database_path.chmod(0o644)
+        await storage_engine.dispose()
+
+    factory = ControlledAdaptersFactory(ControlledAdapterState())
+    application = _application(
+        migrated_postgresql_database_url,
+        tmp_path / "media",
+        factory,
+    )
+    with pytest.raises(RuntimeError):
+        async with application.router.lifespan_context(application):
+            pass
 
     assert factory.calls == 0
     assert application.state.ready is False
 
 
 async def test_api_claims_each_job_once_in_fifo_order_with_four_consumers(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Claim queued caption jobs once and in FIFO order across four consumers."""
@@ -1501,11 +1615,11 @@ async def test_api_claims_each_job_once_in_fifo_order_with_four_consumers(
         transcription_concurrency=2,
     )
     application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "media",
         factory,
         settings=settings,
-        job_config=_job_config(migrated_database_path, job_worker_count=4),
+        job_config=_job_config(migrated_postgresql_database_url, job_worker_count=4),
     )
     async with application.router.lifespan_context(application):
         transport = ASGITransport(app=application)
@@ -1584,7 +1698,7 @@ async def test_api_claims_each_job_once_in_fifo_order_with_four_consumers(
 
 
 async def test_api_limits_native_inference_to_two_while_captions_bypass_permits(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Keep native inference at two calls while caption jobs bypass its permits."""
@@ -1603,11 +1717,11 @@ async def test_api_limits_native_inference_to_two_while_captions_bypass_permits(
         transcription_concurrency=2,
     )
     application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "media",
         factory,
         settings=settings,
-        job_config=_job_config(migrated_database_path, job_worker_count=4),
+        job_config=_job_config(migrated_postgresql_database_url, job_worker_count=4),
     )
     async with application.router.lifespan_context(application):
         transport = ASGITransport(app=application)
@@ -1660,7 +1774,7 @@ async def test_api_limits_native_inference_to_two_while_captions_bypass_permits(
 
 
 async def test_api_retains_timed_out_native_permits_until_underlying_calls_finish(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Retain timed-out native permits until their underlying threads complete."""
@@ -1685,11 +1799,11 @@ async def test_api_retains_timed_out_native_permits_until_underlying_calls_finis
         transcription_timeout_seconds=0.05,
     )
     application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "media",
         factory,
         settings=settings,
-        job_config=_job_config(migrated_database_path, job_worker_count=4),
+        job_config=_job_config(migrated_postgresql_database_url, job_worker_count=4),
     )
     async with application.router.lifespan_context(application):
         transport = ASGITransport(app=application)
@@ -1813,7 +1927,7 @@ async def test_api_retains_timed_out_native_permits_until_underlying_calls_finis
 async def test_api_persists_each_safe_execution_failure(
     stage: str,
     error_type: type[TranscriptionError],
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Expose every safe worker failure as one durable failed job."""
@@ -1826,7 +1940,7 @@ async def test_api_persists_each_safe_execution_failure(
     else:
         state.native_error = error
     application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "media",
         ControlledAdaptersFactory(state),
     )
@@ -1854,7 +1968,7 @@ async def test_api_persists_each_safe_execution_failure(
 
 
 async def test_api_expires_queue_waits_at_the_deadline_without_provider_work(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Claim before a deadline and expire equal-deadline work without execution."""
@@ -1868,7 +1982,7 @@ async def test_api_expires_queue_waits_at_the_deadline_without_provider_work(
     )
     state = ControlledAdapterState(probe=probe)
     application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "media",
         ControlledAdaptersFactory(state),
         clock=lambda: now[0],
@@ -1927,7 +2041,7 @@ async def test_api_expires_queue_waits_at_the_deadline_without_provider_work(
 
 
 async def test_api_gives_each_processing_stage_its_full_deadline_after_queueing(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Keep queue delay outside metadata, download, and native stage budgets."""
@@ -1947,7 +2061,7 @@ async def test_api_gives_each_processing_stage_its_full_deadline_after_queueing(
         transcription_timeout_seconds=stage_timeout,
     )
     application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "media",
         ControlledAdaptersFactory(state),
         settings=settings,
@@ -2002,7 +2116,7 @@ class _UnexpectedProviderError(Exception):
 
 async def test_api_publishes_unexpected_worker_failures_without_provider_details(
     caplog: pytest.LogCaptureFixture,
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Publish only internal_error when an unknown provider exception escapes."""
@@ -2011,7 +2125,7 @@ async def test_api_publishes_unexpected_worker_failures_without_provider_details
         native_error=_UnexpectedProviderError(sensitive_sentinel)
     )
     application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "media",
         ControlledAdaptersFactory(state),
     )
@@ -2037,13 +2151,13 @@ async def test_api_publishes_unexpected_worker_failures_without_provider_details
 
 
 async def test_api_publishes_failure_only_after_request_media_cleanup(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Finish a native failure only after its request directory is removed."""
     state = ControlledAdapterState(native_error=TranscriptionFailedError())
     application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "media",
         ControlledAdaptersFactory(state),
     )
@@ -2064,7 +2178,7 @@ async def test_api_publishes_failure_only_after_request_media_cleanup(
 
 
 async def test_api_cancels_queued_jobs_and_rejects_nonempty_bodies(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Cancel queued work without invoking providers or accepting ignored bodies."""
@@ -2072,7 +2186,7 @@ async def test_api_cancels_queued_jobs_and_rejects_nonempty_bodies(
     queued_url = f"{TIKTOK_URL}?queued_cancellation=second"
     state = ControlledAdapterState(block_metadata=True)
     application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "media",
         ControlledAdaptersFactory(state),
     )
@@ -2136,7 +2250,7 @@ async def test_api_cancels_queued_jobs_and_rejects_nonempty_bodies(
 
 
 async def test_api_cancels_metadata_after_late_prepared_media_cleanup(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Publish cancellation only after cooperative metadata media is removed."""
@@ -2146,7 +2260,7 @@ async def test_api_cancels_metadata_after_late_prepared_media_cleanup(
         metadata_cancellation_prepared_directory=prepared_directory,
     )
     application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "media",
         ControlledAdaptersFactory(state),
     )
@@ -2168,11 +2282,6 @@ async def test_api_cancels_metadata_after_late_prepared_media_cleanup(
                     expected_status=202,
                     cancellation_requested=True,
                 )
-                with sqlite3.connect(migrated_database_path) as connection:
-                    lifecycle = connection.execute(
-                        "SELECT status, cancellation_requested FROM transcription_job"
-                    ).fetchone()
-                assert lifecycle == ("processing", 1)
                 await _wait_for_thread_event(state.metadata_cancellation_observed)
                 await _wait_until(
                     lambda: not prepared_directory.exists(),
@@ -2188,13 +2297,13 @@ async def test_api_cancels_metadata_after_late_prepared_media_cleanup(
 
 
 async def test_api_cancels_download_without_starting_native_work(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Resolve cooperative download cancellation after partial-media cleanup."""
     state = ControlledAdapterState(block_download_until_cancellation=True)
     application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "media",
         ControlledAdaptersFactory(state),
     )
@@ -2224,7 +2333,7 @@ async def test_api_cancels_download_without_starting_native_work(
 
 
 async def test_api_retains_cancelled_native_work_until_cleanup_releases_its_permit(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Keep cancelled native work processing until retained inference can clean up."""
@@ -2238,11 +2347,11 @@ async def test_api_retains_cancelled_native_work_until_cleanup_releases_its_perm
         transcription_timeout_seconds=0.5,
     )
     application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "media",
         ControlledAdaptersFactory(state),
         settings=settings,
-        job_config=_job_config(migrated_database_path, job_worker_count=2),
+        job_config=_job_config(migrated_postgresql_database_url, job_worker_count=2),
     )
     async with application.router.lifespan_context(application):
         transport = ASGITransport(app=application)
@@ -2306,21 +2415,28 @@ async def test_api_retains_cancelled_native_work_until_cleanup_releases_its_perm
                     started=True,
                 )
                 assert not first_audio_path.exists()
-                with sqlite3.connect(migrated_database_path) as connection:
-                    result_count = connection.execute(
+                result_count = (
+                    await _storage_rows(
+                        migrated_postgresql_database_url,
                         "SELECT COUNT(*) FROM transcription_job_result "
                         "WHERE job_id = ("
-                        "SELECT id FROM transcription_job WHERE public_id = ?"
+                        "SELECT id FROM transcription_job "
+                        "WHERE public_id = CAST(:public_id AS uuid)"
                         ")",
-                        (first_submission["id"],),
-                    ).fetchone()[0]
-                    segment_count = connection.execute(
+                        {"public_id": first_submission["id"]},
+                    )
+                )[0][0]
+                segment_count = (
+                    await _storage_rows(
+                        migrated_postgresql_database_url,
                         "SELECT COUNT(*) FROM transcription_job_segment "
                         "WHERE job_id = ("
-                        "SELECT id FROM transcription_job WHERE public_id = ?"
+                        "SELECT id FROM transcription_job "
+                        "WHERE public_id = CAST(:public_id AS uuid)"
                         ")",
-                        (first_submission["id"],),
-                    ).fetchone()[0]
+                        {"public_id": first_submission["id"]},
+                    )
+                )[0][0]
                 assert result_count == 0
                 assert segment_count == 0
 
@@ -2343,13 +2459,13 @@ async def test_api_retains_cancelled_native_work_until_cleanup_releases_its_perm
 
 
 async def test_api_rejects_completed_unknown_and_deleted_cancellation_capabilities(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Preserve completed outcomes and hide malformed, unknown, and deleted jobs."""
     succeeded_state = ControlledAdapterState()
     succeeded_application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "succeeded-media",
         ControlledAdaptersFactory(succeeded_state),
     )
@@ -2371,7 +2487,7 @@ async def test_api_rejects_completed_unknown_and_deleted_cancellation_capabiliti
 
     failed_state = ControlledAdapterState(metadata_error=MetadataRetrievalFailedError())
     failed_application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "failed-media",
         ControlledAdaptersFactory(failed_state),
     )
@@ -2403,11 +2519,12 @@ async def test_api_rejects_completed_unknown_and_deleted_cancellation_capabiliti
                 "/api/transcription-jobs/00000000-0000-4000-8000-000000000000/"
                 "cancellation"
             )
-            with sqlite3.connect(migrated_database_path) as connection:
-                connection.execute(
-                    "DELETE FROM transcription_job WHERE public_id = ?",
-                    (failed_submission["id"],),
-                )
+            await _execute_storage_statement(
+                migrated_postgresql_database_url,
+                "DELETE FROM transcription_job "
+                "WHERE public_id = CAST(:public_id AS uuid)",
+                {"public_id": failed_submission["id"]},
+            )
             deleted = await client.put(f"{failed_location}/cancellation")
 
     for response in (malformed, unknown, deleted):
@@ -2429,7 +2546,7 @@ async def test_api_rejects_completed_unknown_and_deleted_cancellation_capabiliti
 
 async def test_api_recovers_every_durable_state_without_retries(
     capsys: pytest.CaptureFixture[str],
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Recover durable state without resubmitting or retrying interrupted jobs."""
@@ -2451,7 +2568,7 @@ async def test_api_recovers_every_durable_state_without_retries(
         caption_segments=((0.0, 1.0, transcript_sentinel),)
     )
     first_application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "first-media",
         ControlledAdaptersFactory(first_state),
         clock=lambda: first_clock[0],
@@ -2568,13 +2685,6 @@ async def test_api_recovers_every_durable_state_without_retries(
     recovery_clock = initial + timedelta(seconds=5)
     first_deadline = recovery_clock + timedelta(seconds=10)
     second_deadline = recovery_clock + timedelta(seconds=20)
-    recovery_database_time = recovery_clock.replace(tzinfo=None).isoformat(sep=" ")
-    first_deadline_database_time = first_deadline.replace(tzinfo=None).isoformat(
-        sep=" "
-    )
-    second_deadline_database_time = second_deadline.replace(tzinfo=None).isoformat(
-        sep=" "
-    )
     queued_submissions = (
         expired_submission,
         first_preserved_submission,
@@ -2582,37 +2692,64 @@ async def test_api_recovers_every_durable_state_without_retries(
         interrupted_submission,
         cancelling_submission,
     )
-    with sqlite3.connect(migrated_database_path) as connection:
-        internal_ids = {
-            public_id: internal_id
-            for internal_id, public_id in connection.execute(
-                "SELECT id, public_id FROM transcription_job"
-            )
-        }
-        connection.execute(
-            "UPDATE transcription_job SET queue_deadline_at = ? WHERE public_id = ?",
-            (recovery_database_time, expired_submission["id"]),
+    internal_ids = {
+        str(public_id): internal_id
+        for internal_id, public_id in await _storage_rows(
+            migrated_postgresql_database_url,
+            "SELECT id, public_id::text FROM transcription_job",
         )
-        connection.execute(
-            "UPDATE transcription_job SET queue_deadline_at = ? WHERE public_id = ?",
-            (first_deadline_database_time, first_preserved_submission["id"]),
-        )
-        connection.execute(
-            "UPDATE transcription_job SET queue_deadline_at = ? WHERE public_id = ?",
-            (second_deadline_database_time, second_preserved_submission["id"]),
-        )
-        connection.execute(
-            "UPDATE transcription_job "
-            "SET status = 'processing', started_at = ? "
-            "WHERE public_id = ?",
-            (recovery_database_time, interrupted_submission["id"]),
-        )
-        connection.execute(
-            "UPDATE transcription_job "
-            "SET status = 'processing', started_at = ?, cancellation_requested = 1 "
-            "WHERE public_id = ?",
-            (recovery_database_time, cancelling_submission["id"]),
-        )
+    }
+    await _execute_storage_statement(
+        migrated_postgresql_database_url,
+        "UPDATE transcription_job "
+        "SET queue_deadline_at = :queue_deadline_at "
+        "WHERE public_id = CAST(:public_id AS uuid)",
+        {
+            "queue_deadline_at": recovery_clock,
+            "public_id": expired_submission["id"],
+        },
+    )
+    await _execute_storage_statement(
+        migrated_postgresql_database_url,
+        "UPDATE transcription_job "
+        "SET queue_deadline_at = :queue_deadline_at "
+        "WHERE public_id = CAST(:public_id AS uuid)",
+        {
+            "queue_deadline_at": first_deadline,
+            "public_id": first_preserved_submission["id"],
+        },
+    )
+    await _execute_storage_statement(
+        migrated_postgresql_database_url,
+        "UPDATE transcription_job "
+        "SET queue_deadline_at = :queue_deadline_at "
+        "WHERE public_id = CAST(:public_id AS uuid)",
+        {
+            "queue_deadline_at": second_deadline,
+            "public_id": second_preserved_submission["id"],
+        },
+    )
+    await _execute_storage_statement(
+        migrated_postgresql_database_url,
+        "UPDATE transcription_job "
+        "SET status = 'processing', started_at = :started_at "
+        "WHERE public_id = CAST(:public_id AS uuid)",
+        {
+            "started_at": recovery_clock,
+            "public_id": interrupted_submission["id"],
+        },
+    )
+    await _execute_storage_statement(
+        migrated_postgresql_database_url,
+        "UPDATE transcription_job "
+        "SET status = 'processing', started_at = :started_at, "
+        "cancellation_requested = true "
+        "WHERE public_id = CAST(:public_id AS uuid)",
+        {
+            "started_at": recovery_clock,
+            "public_id": cancelling_submission["id"],
+        },
+    )
 
     capsys.readouterr()
     second_clock = [recovery_clock]
@@ -2621,10 +2758,10 @@ async def test_api_recovers_every_durable_state_without_retries(
     )
     second_state = ControlledAdapterState(probe=second_probe)
     second_application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "second-media",
         ControlledAdaptersFactory(second_state),
-        job_config=_job_config(migrated_database_path, job_worker_count=1),
+        job_config=_job_config(migrated_postgresql_database_url, job_worker_count=1),
         clock=lambda: second_clock[0],
     )
     try:
@@ -2750,71 +2887,94 @@ async def test_api_recovers_every_durable_state_without_retries(
 
 
 async def test_api_rolls_back_failed_startup_recovery(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Abort startup when any durable recovery transition cannot commit."""
     submitted_at = datetime(2026, 8, 24, tzinfo=UTC)
     recovery_clock = submitted_at + timedelta(seconds=5)
-    submitted_database_time = submitted_at.replace(tzinfo=None).isoformat(sep=" ")
-    recovery_database_time = recovery_clock.replace(tzinfo=None).isoformat(sep=" ")
-    future_database_time = (
-        (submitted_at + timedelta(seconds=20)).replace(tzinfo=None).isoformat(sep=" ")
+    expired_id = uuid4()
+    interrupted_id = uuid4()
+    cancelling_id = uuid4()
+    recovery_rows = (
+        {
+            "public_id": expired_id,
+            "submitted_url": f"{TIKTOK_URL}?recovery_rollback=expired",
+            "status": "queued",
+            "submitted_at": submitted_at,
+            "queue_deadline_at": recovery_clock,
+            "started_at": None,
+            "cancellation_requested": False,
+        },
+        {
+            "public_id": interrupted_id,
+            "submitted_url": f"{TIKTOK_URL}?recovery_rollback=interrupted",
+            "status": "processing",
+            "submitted_at": submitted_at,
+            "queue_deadline_at": submitted_at + timedelta(seconds=20),
+            "started_at": recovery_clock,
+            "cancellation_requested": False,
+        },
+        {
+            "public_id": cancelling_id,
+            "submitted_url": f"{TIKTOK_URL}?recovery_rollback=cancelling",
+            "status": "processing",
+            "submitted_at": submitted_at,
+            "queue_deadline_at": submitted_at + timedelta(seconds=20),
+            "started_at": recovery_clock,
+            "cancellation_requested": True,
+        },
     )
-    expired_id = str(uuid4())
-    interrupted_id = str(uuid4())
-    cancelling_id = str(uuid4())
-    rows = (
-        (
-            expired_id,
-            f"{TIKTOK_URL}?recovery_rollback=expired",
-            "queued",
-            submitted_database_time,
-            recovery_database_time,
-            None,
-            0,
-        ),
-        (
-            interrupted_id,
-            f"{TIKTOK_URL}?recovery_rollback=interrupted",
-            "processing",
-            submitted_database_time,
-            future_database_time,
-            recovery_database_time,
-            0,
-        ),
-        (
-            cancelling_id,
-            f"{TIKTOK_URL}?recovery_rollback=cancelling",
-            "processing",
-            submitted_database_time,
-            future_database_time,
-            recovery_database_time,
-            1,
-        ),
+    storage_engine = create_application_engine(migrated_postgresql_database_url)
+    try:
+        async with storage_engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO transcription_job ("
+                    "public_id, submitted_url, status, submitted_at, "
+                    "queue_deadline_at, started_at, cancellation_requested"
+                    ") VALUES ("
+                    ":public_id, :submitted_url, :status, :submitted_at, "
+                    ":queue_deadline_at, :started_at, :cancellation_requested)"
+                ),
+                recovery_rows,
+            )
+    finally:
+        await storage_engine.dispose()
+    before_recovery = await _storage_rows(
+        migrated_postgresql_database_url,
+        "SELECT * FROM transcription_job ORDER BY id",
     )
-    with sqlite3.connect(migrated_database_path) as connection:
-        connection.executemany(
-            "INSERT INTO transcription_job ("
-            "public_id, submitted_url, status, submitted_at, queue_deadline_at, "
-            "started_at, cancellation_requested"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?)",
-            rows,
-        )
-        before_recovery = connection.execute(
-            "SELECT * FROM transcription_job ORDER BY id"
-        ).fetchall()
-        connection.execute(
-            "CREATE TRIGGER abort_processing_recovery "
-            "BEFORE UPDATE OF status ON transcription_job "
-            "WHEN OLD.status = 'processing' "
-            "BEGIN SELECT RAISE(ABORT, 'recovery update aborted'); END"
-        )
+    await _execute_storage_statement(
+        migrated_postgresql_database_url,
+        """
+        CREATE FUNCTION abort_processing_recovery_update()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF OLD.status = 'processing' THEN
+                RAISE EXCEPTION 'recovery update aborted';
+            END IF;
+            RETURN NEW;
+        END;
+        $$;
+        """,
+    )
+    await _execute_storage_statement(
+        migrated_postgresql_database_url,
+        """
+        CREATE TRIGGER abort_processing_recovery
+        BEFORE UPDATE OF status ON transcription_job
+        FOR EACH ROW
+        EXECUTE FUNCTION abort_processing_recovery_update()
+        """,
+    )
 
     failed_state = ControlledAdapterState()
     failed_factory = ControlledAdaptersFactory(failed_state)
     failed_application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "failed-recovery-media",
         failed_factory,
         clock=lambda: recovery_clock,
@@ -2824,17 +2984,24 @@ async def test_api_rolls_back_failed_startup_recovery(
             pass
     assert failed_application.state.ready is False
     assert failed_factory.calls == 0
-    with sqlite3.connect(migrated_database_path) as connection:
-        after_failed_recovery = connection.execute(
-            "SELECT * FROM transcription_job ORDER BY id"
-        ).fetchall()
-        connection.execute("DROP TRIGGER abort_processing_recovery")
+    after_failed_recovery = await _storage_rows(
+        migrated_postgresql_database_url,
+        "SELECT * FROM transcription_job ORDER BY id",
+    )
+    await _execute_storage_statement(
+        migrated_postgresql_database_url,
+        "DROP TRIGGER abort_processing_recovery ON transcription_job",
+    )
+    await _execute_storage_statement(
+        migrated_postgresql_database_url,
+        "DROP FUNCTION abort_processing_recovery_update()",
+    )
     assert after_failed_recovery == before_recovery
 
     recovered_state = ControlledAdapterState()
     recovered_factory = ControlledAdaptersFactory(recovered_state)
     recovered_application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "recovered-media",
         recovered_factory,
         clock=lambda: recovery_clock,
@@ -2866,7 +3033,7 @@ async def test_api_rolls_back_failed_startup_recovery(
 
 
 async def test_api_shutdown_closes_admission_and_preserves_queued_deadline(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Finish active work without claiming queued work or extending its deadline."""
@@ -2877,7 +3044,7 @@ async def test_api_shutdown_closes_admission_and_preserves_queued_deadline(
     rejected_url = f"{TIKTOK_URL}?shutdown_deadline=rejected"
     first_state = ControlledAdapterState(block_metadata=True)
     first_application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "first-media",
         ControlledAdaptersFactory(first_state),
         clock=lambda: first_clock[0],
@@ -2927,7 +3094,7 @@ async def test_api_shutdown_closes_admission_and_preserves_queued_deadline(
 
     second_state = ControlledAdapterState()
     second_application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "second-media",
         ControlledAdaptersFactory(second_state),
         clock=lambda: initial + timedelta(seconds=20),
@@ -2953,15 +3120,15 @@ async def test_api_shutdown_closes_admission_and_preserves_queued_deadline(
 
 
 async def test_api_shutdown_wakes_idle_consumers(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Wake every idle consumer before the lifespan invokes idempotent shutdown."""
     application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "media",
         ControlledAdaptersFactory(ControlledAdapterState()),
-        job_config=_job_config(migrated_database_path, job_worker_count=4),
+        job_config=_job_config(migrated_postgresql_database_url, job_worker_count=4),
     )
     async with application.router.lifespan_context(application):
         await asyncio.sleep(0)
@@ -2970,7 +3137,7 @@ async def test_api_shutdown_wakes_idle_consumers(
 
 
 async def test_api_shutdown_waits_for_retained_native_finalizers(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Wait for retained native ownership before returning from shutdown."""
@@ -2983,7 +3150,7 @@ async def test_api_shutdown_waits_for_retained_native_finalizers(
         transcription_timeout_seconds=0.05,
     )
     application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "media",
         ControlledAdaptersFactory(state),
         settings=settings,
@@ -3024,53 +3191,50 @@ async def test_api_shutdown_waits_for_retained_native_finalizers(
                 probe.release_native()
 
 
-def _internal_job_id_for_public_id(
-    connection: sqlite3.Connection,
+async def _internal_job_id_for_public_id(
+    database_url: str,
     public_id: str,
 ) -> int:
     """Return one persisted internal identifier for a public capability."""
-    row = connection.execute(
-        "SELECT id FROM transcription_job WHERE public_id = ?",
-        (public_id,),
-    ).fetchone()
-    assert row is not None
-    return int(row[0])
+    rows = await _storage_rows(
+        database_url,
+        "SELECT id FROM transcription_job WHERE public_id = CAST(:public_id AS uuid)",
+        {"public_id": public_id},
+    )
+    assert rows
+    internal_job_id = rows[0][0]
+    assert isinstance(internal_job_id, int)
+    return internal_job_id
 
 
-def _job_storage_counts(
-    connection: sqlite3.Connection,
+async def _job_storage_counts(
+    database_url: str,
     internal_job_id: int,
 ) -> tuple[int, int, int, int]:
     """Count one job and its cascade-owned rows by durable internal identifier."""
-    parent_count = connection.execute(
-        "SELECT COUNT(*) FROM transcription_job WHERE id = ?",
-        (internal_job_id,),
-    ).fetchone()[0]
-    exclusion_count = connection.execute(
-        "SELECT COUNT(*) FROM transcription_job_exclusion WHERE job_id = ?",
-        (internal_job_id,),
-    ).fetchone()[0]
-    result_count = connection.execute(
-        "SELECT COUNT(*) FROM transcription_job_result WHERE job_id = ?",
-        (internal_job_id,),
-    ).fetchone()[0]
-    segment_count = connection.execute(
-        "SELECT COUNT(*) FROM transcription_job_segment WHERE job_id = ?",
-        (internal_job_id,),
-    ).fetchone()[0]
-    return (
-        int(parent_count),
-        int(exclusion_count),
-        int(result_count),
-        int(segment_count),
+    rows = await _storage_rows(
+        database_url,
+        """
+        SELECT
+            (SELECT count(*) FROM transcription_job WHERE id = :job_id),
+            (SELECT count(*) FROM transcription_job_exclusion WHERE job_id = :job_id),
+            (SELECT count(*) FROM transcription_job_result WHERE job_id = :job_id),
+            (SELECT count(*) FROM transcription_job_segment WHERE job_id = :job_id)
+        """,
+        {"job_id": internal_job_id},
     )
+    assert rows
+    counts = rows[0]
+    assert len(counts) == 4
+    assert all(isinstance(count, int) for count in counts)
+    return cast(tuple[int, int, int, int], counts)
 
 
 @pytest.mark.parametrize("outcome", ("succeeded", "failed", "cancelled"))
 async def test_api_hides_terminal_jobs_at_the_retention_cutoff(
     outcome: str,
     capsys: pytest.CaptureFixture[str],
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Retain each terminal outcome through, but not at, its finish-based cutoff."""
@@ -3082,7 +3246,7 @@ async def test_api_hides_terminal_jobs_at_the_retention_cutoff(
         state.metadata_error = MetadataRetrievalFailedError()
     submitted_url = f"{TIKTOK_URL}?retention-cutoff={outcome}"
     application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "media",
         ControlledAdaptersFactory(state),
         clock=lambda: now[0],
@@ -3155,14 +3319,15 @@ async def test_api_hides_terminal_jobs_at_the_retention_cutoff(
                 _assert_safe_error(response, 404, "job_not_found")
             assert expired_status.json() == unknown_status.json()
             assert expired_cancellation.json() == unknown_cancellation.json()
-            with sqlite3.connect(migrated_database_path) as connection:
-                assert (
-                    connection.execute(
-                        "SELECT COUNT(*) FROM transcription_job WHERE public_id = ?",
-                        (submission["id"],),
-                    ).fetchone()[0]
-                    == 1
+            persisted_job_count = (
+                await _storage_rows(
+                    migrated_postgresql_database_url,
+                    "SELECT COUNT(*) FROM transcription_job "
+                    "WHERE public_id = CAST(:public_id AS uuid)",
+                    {"public_id": submission["id"]},
                 )
+            )[0][0]
+            assert persisted_job_count == 1
 
     output = capsys.readouterr().err
     for sentinel in (
@@ -3176,7 +3341,7 @@ async def test_api_hides_terminal_jobs_at_the_retention_cutoff(
 
 async def test_api_deletes_expired_terminal_job_cascades_during_startup(
     capsys: pytest.CaptureFixture[str],
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Delete expired successful jobs and every owned row before restart traffic."""
@@ -3191,7 +3356,7 @@ async def test_api_deletes_expired_terminal_job_cascades_during_startup(
         caption_segments=((0.0, 1.0, transcript_sentinel),),
     )
     first_application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         media_root,
         ControlledAdaptersFactory(first_state),
         clock=lambda: now[0],
@@ -3219,24 +3384,31 @@ async def test_api_deletes_expired_terminal_job_cascades_during_startup(
                 == finished_at
             )
 
-    with sqlite3.connect(migrated_database_path) as connection:
-        internal_job_id = _internal_job_id_for_public_id(connection, submission["id"])
-        assert _job_storage_counts(connection, internal_job_id) == (1, 1, 1, 1)
+    internal_job_id = await _internal_job_id_for_public_id(
+        migrated_postgresql_database_url,
+        submission["id"],
+    )
+    assert await _job_storage_counts(
+        migrated_postgresql_database_url,
+        internal_job_id,
+    ) == (1, 1, 1, 1)
 
     capsys.readouterr()
     now[0] = finished_at + timedelta(seconds=86_400)
     reopened_state = ControlledAdapterState()
     reopened_factory = ControlledAdaptersFactory(reopened_state)
     reopened_application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "reopened-media",
         reopened_factory,
         clock=lambda: now[0],
     )
     async with reopened_application.router.lifespan_context(reopened_application):
         assert reopened_application.state.ready is True
-        with sqlite3.connect(migrated_database_path) as connection:
-            assert _job_storage_counts(connection, internal_job_id) == (0, 0, 0, 0)
+        assert await _job_storage_counts(
+            migrated_postgresql_database_url,
+            internal_job_id,
+        ) == (0, 0, 0, 0)
         transport = ASGITransport(app=reopened_application)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             _assert_safe_error(await client.get(location), 404, "job_not_found")
@@ -3261,7 +3433,7 @@ async def test_api_deletes_expired_terminal_job_cascades_during_startup(
 
 async def test_api_rolls_back_failed_startup_terminal_retention_cleanup(
     capsys: pytest.CaptureFixture[str],
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Leave every retained row intact when startup terminal cleanup cannot commit."""
@@ -3270,7 +3442,7 @@ async def test_api_rolls_back_failed_startup_terminal_retention_cleanup(
     now = [initial]
     first_state = ControlledAdapterState(block_metadata=True)
     first_application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "first-media",
         ControlledAdaptersFactory(first_state),
         clock=lambda: now[0],
@@ -3297,23 +3469,45 @@ async def test_api_rolls_back_failed_startup_terminal_retention_cleanup(
                 location,
             )
 
-    with sqlite3.connect(migrated_database_path) as connection:
-        internal_job_id = _internal_job_id_for_public_id(connection, submission["id"])
-        before_cleanup = _job_storage_counts(connection, internal_job_id)
-        connection.execute(
-            """
-            CREATE TRIGGER abort_terminal_retention_cleanup
-            BEFORE DELETE ON transcription_job
-            WHEN OLD.status = 'finished'
-            BEGIN SELECT RAISE(ABORT, 'terminal retention cleanup blocked'); END
-            """
-        )
+    internal_job_id = await _internal_job_id_for_public_id(
+        migrated_postgresql_database_url,
+        submission["id"],
+    )
+    before_cleanup = await _job_storage_counts(
+        migrated_postgresql_database_url,
+        internal_job_id,
+    )
+    await _execute_storage_statement(
+        migrated_postgresql_database_url,
+        """
+        CREATE FUNCTION abort_terminal_retention_cleanup_delete()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF OLD.status = 'finished' THEN
+                RAISE EXCEPTION 'terminal retention cleanup blocked';
+            END IF;
+            RETURN OLD;
+        END;
+        $$;
+        """,
+    )
+    await _execute_storage_statement(
+        migrated_postgresql_database_url,
+        """
+        CREATE TRIGGER abort_terminal_retention_cleanup
+        BEFORE DELETE ON transcription_job
+        FOR EACH ROW
+        EXECUTE FUNCTION abort_terminal_retention_cleanup_delete()
+        """,
+    )
 
     capsys.readouterr()
     now[0] = finished_at + timedelta(seconds=86_400)
     failed_factory = ControlledAdaptersFactory(ControlledAdapterState())
     failed_application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "failed-cleanup-media",
         failed_factory,
         clock=lambda: now[0],
@@ -3324,9 +3518,21 @@ async def test_api_rolls_back_failed_startup_terminal_retention_cleanup(
 
     assert failed_application.state.ready is False
     assert failed_factory.calls == 0
-    with sqlite3.connect(migrated_database_path) as connection:
-        assert _job_storage_counts(connection, internal_job_id) == before_cleanup
-        connection.execute("DROP TRIGGER abort_terminal_retention_cleanup")
+    assert (
+        await _job_storage_counts(
+            migrated_postgresql_database_url,
+            internal_job_id,
+        )
+        == before_cleanup
+    )
+    await _execute_storage_statement(
+        migrated_postgresql_database_url,
+        "DROP TRIGGER abort_terminal_retention_cleanup ON transcription_job",
+    )
+    await _execute_storage_statement(
+        migrated_postgresql_database_url,
+        "DROP FUNCTION abort_terminal_retention_cleanup_delete()",
+    )
 
     output = capsys.readouterr().err
     assert "transcription job retention cleanup failed" in output
@@ -3335,9 +3541,9 @@ async def test_api_rolls_back_failed_startup_terminal_retention_cleanup(
     assert location not in output
 
 
-async def test_api_periodically_deletes_expired_terminal_jobs_and_checkpoints_wal(
+async def test_api_periodically_deletes_expired_terminal_jobs(
     capsys: pytest.CaptureFixture[str],
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Delete terminal cascades without hiding queued or processing jobs."""
@@ -3352,7 +3558,7 @@ async def test_api_periodically_deletes_expired_terminal_jobs_and_checkpoints_wa
         caption_segments=((0.0, 1.0, transcript_sentinel),),
     )
     application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         media_root,
         ControlledAdaptersFactory(state),
         clock=lambda: now[0],
@@ -3376,17 +3582,14 @@ async def test_api_periodically_deletes_expired_terminal_jobs_and_checkpoints_wa
             terminal_finished_at = datetime.fromisoformat(
                 cast(str, terminal_payload["finished_at"])
             )
-            with sqlite3.connect(migrated_database_path) as connection:
-                terminal_internal_id = _internal_job_id_for_public_id(
-                    connection,
-                    terminal_submission["id"],
-                )
-                assert _job_storage_counts(connection, terminal_internal_id) == (
-                    1,
-                    1,
-                    1,
-                    1,
-                )
+            terminal_internal_id = await _internal_job_id_for_public_id(
+                migrated_postgresql_database_url,
+                terminal_submission["id"],
+            )
+            assert await _job_storage_counts(
+                migrated_postgresql_database_url,
+                terminal_internal_id,
+            ) == (1, 1, 1, 1)
 
             state.block_metadata = True
             state.metadata_entered.clear()
@@ -3408,30 +3611,33 @@ async def test_api_periodically_deletes_expired_terminal_jobs_and_checkpoints_wa
                 )
                 queued_location = queued_submission["links"]["self"]
 
-                retention_lock = sqlite3.connect(migrated_database_path)
+                retention_lock_engine = create_application_engine(
+                    migrated_postgresql_database_url
+                )
+                retention_lock = await retention_lock_engine.connect()
+                retention_lock_transaction = await retention_lock.begin()
                 try:
-                    retention_lock.execute("BEGIN IMMEDIATE")
+                    await retention_lock.execute(
+                        text("LOCK TABLE transcription_job IN SHARE ROW EXCLUSIVE MODE")
+                    )
                     now[0] = terminal_finished_at + timedelta(seconds=86_400)
                     _assert_safe_error(
                         await client.get(terminal_location),
                         404,
                         "job_not_found",
                     )
-                    with sqlite3.connect(migrated_database_path) as connection:
-                        assert _job_storage_counts(
-                            connection,
-                            terminal_internal_id,
-                        ) == (1, 1, 1, 1)
-                finally:
-                    retention_lock.rollback()
-                    retention_lock.close()
-
-                await _wait_until(
-                    lambda: _terminal_job_rows_are_deleted(
-                        migrated_database_path,
+                    assert await _job_storage_counts(
+                        migrated_postgresql_database_url,
                         terminal_internal_id,
-                    ),
-                    "Periodic terminal retention cleanup did not delete the job.",
+                    ) == (1, 1, 1, 1)
+                finally:
+                    await retention_lock_transaction.rollback()
+                    await retention_lock.close()
+                    await retention_lock_engine.dispose()
+
+                await _wait_for_terminal_job_deletion(
+                    migrated_postgresql_database_url,
+                    terminal_internal_id,
                 )
 
                 _assert_processing(
@@ -3439,17 +3645,10 @@ async def test_api_periodically_deletes_expired_terminal_jobs_and_checkpoints_wa
                     processing_location,
                 )
                 assert (await client.get(queued_location)).json() == queued_submission
-                with sqlite3.connect(migrated_database_path) as connection:
-                    assert _job_storage_counts(connection, terminal_internal_id) == (
-                        0,
-                        0,
-                        0,
-                        0,
-                    )
-                await _wait_until(
-                    lambda: _wal_is_checkpointed(migrated_database_path),
-                    "Periodic terminal retention cleanup did not checkpoint the WAL.",
-                )
+                assert await _job_storage_counts(
+                    migrated_postgresql_database_url,
+                    terminal_internal_id,
+                ) == (0, 0, 0, 0)
             finally:
                 state.metadata_release.set()
 
@@ -3467,18 +3666,18 @@ async def test_api_periodically_deletes_expired_terminal_jobs_and_checkpoints_wa
 
 
 async def test_api_marks_unready_when_periodic_retention_cannot_commit(
-    migrated_database_path: Path,
+    migrated_postgresql_database_url: str,
     tmp_path: Path,
 ) -> None:
     """Fail closed when periodic terminal retention cannot delete durable rows."""
     now = [datetime(2026, 8, 24, tzinfo=UTC)]
     state = ControlledAdapterState()
     application = _application(
-        migrated_database_path,
+        migrated_postgresql_database_url,
         tmp_path / "media",
         ControlledAdaptersFactory(state),
         job_config=_job_config(
-            migrated_database_path,
+            migrated_postgresql_database_url,
             job_retention_seconds=1,
         ),
         clock=lambda: now[0],
@@ -3499,20 +3698,34 @@ async def test_api_marks_unready_when_periodic_retention_cannot_commit(
                 await _poll_until_finished(client, terminal_location),
                 terminal_location,
             )
+            await _execute_storage_statement(
+                migrated_postgresql_database_url,
+                """
+                CREATE FUNCTION abort_periodic_retention_cleanup_delete()
+                RETURNS trigger
+                LANGUAGE plpgsql
+                AS $$
+                BEGIN
+                    IF OLD.status = 'finished' THEN
+                        RAISE EXCEPTION 'blocked retention cleanup';
+                    END IF;
+                    RETURN OLD;
+                END;
+                $$;
+                """,
+            )
+            await _execute_storage_statement(
+                migrated_postgresql_database_url,
+                """
+                CREATE TRIGGER terminal_retention_abort
+                BEFORE DELETE ON transcription_job
+                FOR EACH ROW
+                EXECUTE FUNCTION abort_periodic_retention_cleanup_delete()
+                """,
+            )
             now[0] = datetime.fromisoformat(
                 cast(str, terminal_payload["finished_at"])
             ) + timedelta(seconds=1)
-            with sqlite3.connect(migrated_database_path) as connection:
-                connection.executescript(
-                    """
-                    CREATE TRIGGER terminal_retention_abort
-                    BEFORE DELETE ON transcription_job
-                    WHEN OLD.status = 'finished'
-                    BEGIN
-                        SELECT RAISE(ABORT, 'blocked retention cleanup');
-                    END;
-                    """
-                )
 
             await _wait_until(
                 lambda: application.state.ready is False,
@@ -3530,19 +3743,13 @@ async def test_api_marks_unready_when_periodic_retention_cannot_commit(
             )
 
 
-def _terminal_job_rows_are_deleted(
-    database_path: Path,
+async def _wait_for_terminal_job_deletion(
+    database_url: str,
     internal_job_id: int,
-) -> bool:
-    """Return whether a terminal job and all cascade-owned rows are absent."""
-    with sqlite3.connect(database_path) as connection:
-        return _job_storage_counts(connection, internal_job_id) == (0, 0, 0, 0)
-
-
-def _wal_is_checkpointed(database_path: Path) -> bool:
-    """Return whether every current WAL page has already been checkpointed."""
-    with sqlite3.connect(database_path) as connection:
-        checkpoint = connection.execute("PRAGMA wal_checkpoint(NOOP)").fetchone()
-    return (
-        checkpoint is not None and checkpoint[0] == 0 and checkpoint[1] == checkpoint[2]
-    )
+) -> None:
+    """Wait until a terminal job and all cascade-owned rows are absent."""
+    for _ in range(200):
+        if await _job_storage_counts(database_url, internal_job_id) == (0, 0, 0, 0):
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("Periodic terminal retention cleanup did not delete the job.")

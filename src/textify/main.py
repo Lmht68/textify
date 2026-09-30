@@ -32,7 +32,7 @@ from textify.jobs.database import (
 )
 from textify.jobs.exceptions import JobStoreUnavailableError
 from textify.jobs.http import TranscriptionJobHeadersMiddleware
-from textify.jobs.repository import SqliteTranscriptionJobRepository
+from textify.jobs.repository import PostgresTranscriptionJobRepository
 from textify.jobs.router import router as transcription_job_router
 from textify.jobs.runner import (
     InProcessTranscriptionJobRunner,
@@ -235,10 +235,10 @@ def create_app(
             resolved_job_config.job_worker_count,
             available_bytes=available_temporary_media_bytes,
         )
-        engine = create_application_engine(resolved_job_config.database_path)
+        engine = create_application_engine(str(resolved_job_config.database_url))
         try:
             await verify_application_database(engine)
-            repository = SqliteTranscriptionJobRepository(
+            repository = PostgresTranscriptionJobRepository(
                 engine=engine,
                 maximum_outstanding_jobs=resolved_job_config.max_outstanding_jobs,
                 queue_timeout=timedelta(

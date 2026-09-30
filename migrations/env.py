@@ -1,8 +1,6 @@
 """Alembic environment for Textify's durable Transcription Job schema."""
 
 import asyncio
-from pathlib import Path
-from urllib.parse import quote
 
 from alembic import context
 from sqlalchemy import pool
@@ -15,18 +13,9 @@ config = context.config
 target_metadata = metadata
 
 
-def _database_url(database_path: Path) -> str:
-    """Build an async SQLite URL that can create a migration target file."""
-    raw_path = str(database_path)
-    if raw_path == ":memory:" or raw_path.startswith(("file:", "sqlite:")):
-        raise RuntimeError("TEXTIFY_DATABASE_PATH must be a filesystem path.")
-    resolved_path = database_path.expanduser().resolve(strict=False)
-    return f"sqlite+aiosqlite:///{quote(str(resolved_path), safe='/')}"
-
-
 def _configured_database_url() -> str:
-    """Load the migration target from application settings."""
-    return _database_url(JobConfig().database_path)
+    """Load the PostgreSQL migration target from application settings."""
+    return str(JobConfig().database_url)
 
 
 def run_migrations_offline() -> None:
@@ -49,7 +38,7 @@ def _run_migrations(connection: AsyncConnection) -> None:
 
 
 async def run_migrations_online() -> None:
-    """Run migrations against the configured asynchronous SQLite database."""
+    """Run migrations against the configured asynchronous PostgreSQL database."""
     engine = create_async_engine(_configured_database_url(), poolclass=pool.NullPool)
     try:
         async with engine.connect() as connection:

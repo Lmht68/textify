@@ -1,38 +1,53 @@
-"""Tests for durable Transcription Job environment configuration."""
-
-from pathlib import Path
+"""Tests for durable PostgreSQL Transcription Job environment configuration."""
 
 import pytest
 from pydantic import ValidationError
 
 from textify.jobs.config import JobConfig
 
+_DATABASE_URL = "postgresql+asyncpg://textify:change-me@127.0.0.1:5432/textify"
 
-def test_database_path_is_required(
+
+def test_database_url_is_required(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Reject configuration that omits durable SQLite storage."""
-    monkeypatch.delenv("TEXTIFY_DATABASE_PATH", raising=False)
+    """Reject configuration that omits durable PostgreSQL storage."""
+    monkeypatch.delenv("TEXTIFY_DATABASE_URL", raising=False)
 
     with pytest.raises(ValidationError):
         JobConfig(_env_file=None)  # type: ignore[call-arg]
 
 
-def test_database_path_loads_explicit_filesystem_value(
+def test_database_url_loads_explicit_async_postgresql_value(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Read the configured durable SQLite filesystem path from the environment."""
-    monkeypatch.setenv("TEXTIFY_DATABASE_PATH", "./textify.sqlite3")
+    """Read the configured async PostgreSQL URL from the environment."""
+    monkeypatch.setenv("TEXTIFY_DATABASE_URL", _DATABASE_URL)
 
     settings = JobConfig(_env_file=None)  # type: ignore[call-arg]
 
-    assert settings.database_path == Path("textify.sqlite3")
+    assert str(settings.database_url) == _DATABASE_URL
+
+
+@pytest.mark.parametrize(
+    "database_url",
+    (
+        "sqlite+aiosqlite:///textify.sqlite3",
+        "postgresql://textify:change-me@127.0.0.1:5432/textify",
+    ),
+)
+def test_database_url_rejects_non_async_postgresql_values(
+    database_url: str,
+) -> None:
+    """Reject SQLite and synchronous PostgreSQL durable-store URLs."""
+    with pytest.raises(ValidationError):
+        JobConfig(database_url=database_url, _env_file=None)  # type: ignore[call-arg]
 
 
 def test_durable_job_settings_use_bounded_defaults() -> None:
     """Default durable admission, polling, worker ownership, and retention."""
     settings = JobConfig(
-        database_path=Path("textify.sqlite3"),
+        database_url=_DATABASE_URL,
         _env_file=None,  # type: ignore[call-arg]
     )
 
@@ -63,6 +78,7 @@ def test_nonpositive_job_settings_are_rejected(
     setting_value: str,
 ) -> None:
     """Reject nonpositive durable admission, deadline, and retention configuration."""
+    monkeypatch.setenv("TEXTIFY_DATABASE_URL", _DATABASE_URL)
     monkeypatch.setenv(setting_name, setting_value)
 
     with pytest.raises(ValidationError):
