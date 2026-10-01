@@ -42,6 +42,9 @@ _CHECK_CONSTRAINT_NAMES = {
     "transcription_job_error_pair_check",
     "transcription_job_lifecycle_check",
     "transcription_job_execution_attempt_token_uuid4_check",
+    "transcription_job_attempt_publication_lease_pair_check",
+    "transcription_job_attempt_lease_owner_uuid4_check",
+    "transcription_job_attempt_dispatch_history_check",
     "transcription_job_exclusion_field_path_check",
     "transcription_job_result_platform_check",
     "transcription_job_result_method_check",
@@ -173,6 +176,196 @@ async def test_execution_attempt_migration_backfills_and_round_trips_populated_j
         await engine.dispose()
 
 
+async def test_dispatch_recovery_migration_backfills_and_downgrades_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+    postgresql_database_url: str,
+) -> None:
+    """Backfill due attempts, reject invalid recovery state, and retain tokens."""
+    monkeypatch.setenv("TEXTIFY_DATABASE_URL", postgresql_database_url)
+    alembic_config = Config(str(PROJECT_ROOT / "alembic.ini"))
+    engine = create_application_engine(postgresql_database_url)
+    now = datetime.now(UTC)
+    try:
+        await asyncio.to_thread(
+            command.upgrade,
+            alembic_config,
+            "0002_execution_attempts",
+        )
+        async with engine.begin() as connection:
+            queued_job_id = await _insert_job(
+                connection,
+                _queued_values(now),
+                with_execution_attempt=False,
+            )
+            processing_job_id = await _insert_job(
+                connection,
+                _queued_values(now)
+                | {
+                    "status": "processing",
+                    "started_at": now,
+                },
+                with_execution_attempt=False,
+            )
+            terminal_job_id = await _insert_job(
+                connection,
+                _queued_values(now)
+                | {
+                    "status": "finished",
+                    "outcome": "failed",
+                    "finished_at": now,
+                    "error_code": "queue_timeout",
+                    "error_message": "The job exceeded its queue timeout.",
+                },
+                with_execution_attempt=False,
+            )
+            for job_id in (queued_job_id, processing_job_id, terminal_job_id):
+                await _insert_pre_dispatch_recovery_attempt(
+                    connection,
+                    job_id,
+                    uuid4(),
+                )
+            original_attempt_tokens = dict(
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT job_id, execution_attempt_token "
+                            "FROM transcription_job_execution_attempt "
+                            "ORDER BY job_id"
+                        )
+                    )
+                ).all()
+            )
+
+        await asyncio.to_thread(command.upgrade, alembic_config, "head")
+        async with engine.connect() as connection:
+            recovery_rows = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT job.id, job.status, job.submitted_at, "
+                            "attempt.execution_attempt_token, "
+                            "attempt.next_dispatch_at, "
+                            "attempt.publication_lease_owner, "
+                            "attempt.publication_lease_expires_at, "
+                            "attempt.last_dispatched_at, attempt.dispatch_count "
+                            "FROM transcription_job AS job "
+                            "JOIN transcription_job_execution_attempt AS attempt "
+                            "ON attempt.job_id = job.id ORDER BY job.id"
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+
+        assert [row["id"] for row in recovery_rows] == [
+            queued_job_id,
+            processing_job_id,
+            terminal_job_id,
+        ]
+        assert [row["status"] for row in recovery_rows] == [
+            "queued",
+            "processing",
+            "finished",
+        ]
+        assert {
+            row["id"]: row["execution_attempt_token"] for row in recovery_rows
+        } == original_attempt_tokens
+        assert all(
+            row["next_dispatch_at"] == row["submitted_at"] for row in recovery_rows
+        )
+        assert all(row["publication_lease_owner"] is None for row in recovery_rows)
+        assert all(row["publication_lease_expires_at"] is None for row in recovery_rows)
+        assert all(row["last_dispatched_at"] is None for row in recovery_rows)
+        assert all(row["dispatch_count"] == 0 for row in recovery_rows)
+
+        with pytest.raises(IntegrityError):
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE transcription_job_execution_attempt "
+                        "SET publication_lease_owner = :lease_owner "
+                        "WHERE job_id = :job_id"
+                    ),
+                    {
+                        "lease_owner": uuid4(),
+                        "job_id": queued_job_id,
+                    },
+                )
+        with pytest.raises(IntegrityError):
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE transcription_job_execution_attempt "
+                        "SET publication_lease_expires_at = :lease_expires_at "
+                        "WHERE job_id = :job_id"
+                    ),
+                    {
+                        "lease_expires_at": now + timedelta(seconds=5),
+                        "job_id": queued_job_id,
+                    },
+                )
+        with pytest.raises(IntegrityError):
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE transcription_job_execution_attempt "
+                        "SET publication_lease_owner = :lease_owner, "
+                        "publication_lease_expires_at = :lease_expires_at "
+                        "WHERE job_id = :job_id"
+                    ),
+                    {
+                        "lease_owner": uuid1(),
+                        "lease_expires_at": now + timedelta(seconds=5),
+                        "job_id": queued_job_id,
+                    },
+                )
+        with pytest.raises(IntegrityError):
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE transcription_job_execution_attempt "
+                        "SET dispatch_count = 1 WHERE job_id = :job_id"
+                    ),
+                    {"job_id": queued_job_id},
+                )
+        with pytest.raises(IntegrityError):
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE transcription_job_execution_attempt "
+                        "SET last_dispatched_at = :last_dispatched_at "
+                        "WHERE job_id = :job_id"
+                    ),
+                    {
+                        "last_dispatched_at": now,
+                        "job_id": queued_job_id,
+                    },
+                )
+
+        await asyncio.to_thread(
+            command.downgrade,
+            alembic_config,
+            "0002_execution_attempts",
+        )
+        async with engine.connect() as connection:
+            downgraded_attempt_tokens = dict(
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT job_id, execution_attempt_token "
+                            "FROM transcription_job_execution_attempt "
+                            "ORDER BY job_id"
+                        )
+                    )
+                ).all()
+            )
+        assert await _revision_rows(engine) == ["0002_execution_attempts"]
+        assert downgraded_attempt_tokens == original_attempt_tokens
+    finally:
+        await engine.dispose()
+
+
 async def test_postgresql_baseline_uses_required_native_schema(
     migrated_engine: AsyncEngine,
 ) -> None:
@@ -202,8 +395,8 @@ async def test_postgresql_baseline_uses_required_native_schema(
                 (
                     await connection.execute(
                         text(
-                            "SELECT column_name, data_type, udt_name "
-                            "FROM information_schema.columns "
+                            "SELECT column_name, data_type, udt_name, is_nullable, "
+                            "column_default FROM information_schema.columns "
                             "WHERE table_schema = 'public' "
                             "AND table_name = "
                             "'transcription_job_execution_attempt'"
@@ -221,6 +414,17 @@ async def test_postgresql_baseline_uses_required_native_schema(
                         "SELECT indexname FROM pg_indexes "
                         "WHERE schemaname = 'public' "
                         "AND tablename = 'transcription_job'"
+                    )
+                )
+            ).all()
+        )
+        execution_attempt_index_names = set(
+            (
+                await connection.scalars(
+                    text(
+                        "SELECT indexname FROM pg_indexes "
+                        "WHERE schemaname = 'public' "
+                        "AND tablename = 'transcription_job_execution_attempt'"
                     )
                 )
             ).all()
@@ -301,6 +505,20 @@ async def test_postgresql_baseline_uses_required_native_schema(
     assert columns["cancellation_requested"]["udt_name"] == "bool"
     assert execution_attempt_columns["job_id"]["udt_name"] == "int8"
     assert execution_attempt_columns["execution_attempt_token"]["udt_name"] == "uuid"
+    assert execution_attempt_columns["next_dispatch_at"]["data_type"] == (
+        "timestamp with time zone"
+    )
+    assert execution_attempt_columns["next_dispatch_at"]["is_nullable"] == "NO"
+    assert execution_attempt_columns["publication_lease_owner"]["udt_name"] == "uuid"
+    assert execution_attempt_columns["publication_lease_expires_at"]["data_type"] == (
+        "timestamp with time zone"
+    )
+    assert execution_attempt_columns["last_dispatched_at"]["data_type"] == (
+        "timestamp with time zone"
+    )
+    assert execution_attempt_columns["dispatch_count"]["udt_name"] == "int8"
+    assert execution_attempt_columns["dispatch_count"]["is_nullable"] == "NO"
+    assert execution_attempt_columns["dispatch_count"]["column_default"] == "0"
     for timestamp_column in (
         "submitted_at",
         "queue_deadline_at",
@@ -313,6 +531,10 @@ async def test_postgresql_baseline_uses_required_native_schema(
         "transcription_job_status_queue_deadline_at_idx",
         "transcription_job_status_finished_at_idx",
     }
+    assert (
+        "transcription_job_attempt_next_dispatch_at_job_id_idx"
+        in execution_attempt_index_names
+    )
     assert check_constraint_names == _CHECK_CONSTRAINT_NAMES
     assert foreign_keys == {
         ("transcription_job_execution_attempt", "transcription_job", "c"),
@@ -733,6 +955,26 @@ async def _insert_execution_attempt(
     execution_attempt_token: UUID,
 ) -> None:
     """Insert one private Execution Attempt for an existing Transcription Job."""
+    await connection.execute(
+        text(
+            "INSERT INTO transcription_job_execution_attempt ("
+            "job_id, execution_attempt_token, next_dispatch_at) "
+            "SELECT :job_id, :execution_attempt_token, submitted_at "
+            "FROM transcription_job WHERE id = :job_id"
+        ),
+        {
+            "job_id": job_id,
+            "execution_attempt_token": execution_attempt_token,
+        },
+    )
+
+
+async def _insert_pre_dispatch_recovery_attempt(
+    connection: AsyncConnection,
+    job_id: int,
+    execution_attempt_token: UUID,
+) -> None:
+    """Insert one Execution Attempt before dispatch recovery columns exist."""
     await connection.execute(
         text(
             "INSERT INTO transcription_job_execution_attempt "

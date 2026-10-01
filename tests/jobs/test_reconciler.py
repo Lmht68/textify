@@ -1,25 +1,78 @@
 """Tests for PostgreSQL-driven Job Dispatch reconciliation."""
 
-from uuid import uuid4
+from collections import deque
+from datetime import timedelta
+from uuid import UUID, uuid4
 
 import pytest
 
+from textify.jobs.contracts import TranscriptionJobStoreUnavailableError
+from textify.jobs.dispatch import JobDispatchUnavailableError
+from textify.jobs.reconciler import ReconcilerPolicy, TranscriptionJobReconciler
 from textify.jobs.types import JobDispatch
 
 
 class RecordingDispatchRepository:
-    """Expose queued dispatches and record reconciler-owned cleanup."""
+    """Record the reconciler's durable dispatch state machine operations."""
 
-    def __init__(self, dispatches: tuple[JobDispatch, ...]) -> None:
-        """Initialize a stable private queued dispatch listing."""
-        self.dispatches = dispatches
-        self.list_calls = 0
+    def __init__(
+        self,
+        lease_batches: tuple[tuple[JobDispatch, ...], ...],
+        expire_results: tuple[int, ...] = (),
+    ) -> None:
+        """Initialize deterministic expiry and lease results.
+
+        Args:
+            lease_batches: Consecutive batches returned by due-lease operations.
+            expire_results: Consecutive counts returned by expiry operations.
+        """
+        self._lease_batches = deque(lease_batches)
+        self._expire_results = deque(expire_results)
+        self.calls: list[str] = []
+        self.lease_requests: list[tuple[UUID, timedelta, int]] = []
+        self.recorded_dispatches: list[tuple[JobDispatch, UUID, timedelta]] = []
+        self.released_dispatches: list[tuple[tuple[JobDispatch, ...], UUID]] = []
         self.cleanup_calls = 0
+        self.record_error: TranscriptionJobStoreUnavailableError | None = None
 
-    async def list_queued_dispatches(self) -> tuple[JobDispatch, ...]:
-        """Return the configured delivery candidates."""
-        self.list_calls += 1
-        return self.dispatches
+    async def expire_queued_jobs(self, limit: int) -> int:
+        """Return one configured bounded expiry result."""
+        self.calls.append("expire")
+        assert limit > 0
+        return self._expire_results.popleft() if self._expire_results else 0
+
+    async def lease_due_dispatches(
+        self,
+        lease_owner: UUID,
+        lease_duration: timedelta,
+        limit: int,
+    ) -> tuple[JobDispatch, ...]:
+        """Return one configured due-dispatch batch."""
+        self.calls.append("lease")
+        self.lease_requests.append((lease_owner, lease_duration, limit))
+        return self._lease_batches.popleft() if self._lease_batches else ()
+
+    async def record_dispatch_published(
+        self,
+        dispatch: JobDispatch,
+        lease_owner: UUID,
+        redispatch_after: timedelta,
+    ) -> bool:
+        """Record one successful broker publication or raise a configured failure."""
+        self.calls.append("record")
+        self.recorded_dispatches.append((dispatch, lease_owner, redispatch_after))
+        if self.record_error is not None:
+            raise self.record_error
+        return True
+
+    async def release_dispatch_leases(
+        self,
+        dispatches: tuple[JobDispatch, ...],
+        lease_owner: UUID,
+    ) -> None:
+        """Record one mapped broker-failure lease release."""
+        self.calls.append("release")
+        self.released_dispatches.append((dispatches, lease_owner))
 
     async def delete_expired_terminal_jobs(self) -> None:
         """Record one reconciler-owned retention pass."""
@@ -27,18 +80,23 @@ class RecordingDispatchRepository:
 
 
 class RecordingPublisher:
-    """Record dispatch publication and optionally reject a broker write."""
+    """Record dispatch publication and optionally reject one broker write."""
 
-    def __init__(self) -> None:
-        """Initialize publication records and no broker failure."""
+    def __init__(self, unavailable_after: int | None = None) -> None:
+        """Initialize publication records and an optional broker failure position.
+
+        Args:
+            unavailable_after: Number of accepted publications before failure.
+        """
         self.dispatches: list[JobDispatch] = []
-        self.fail_after: int | None = None
+        self._unavailable_after = unavailable_after
 
     async def publish(self, dispatch: JobDispatch) -> None:
-        """Record a publish or signal that the delivery broker is unavailable."""
-        from textify.jobs.dispatch import JobDispatchUnavailableError
-
-        if self.fail_after is not None and len(self.dispatches) >= self.fail_after:
+        """Record a publication or signal an unavailable broker."""
+        if (
+            self._unavailable_after is not None
+            and len(self.dispatches) >= self._unavailable_after
+        ):
             raise JobDispatchUnavailableError()
         self.dispatches.append(dispatch)
 
@@ -50,50 +108,142 @@ def _dispatch(internal_job_id: int) -> JobDispatch:
         internal_job_id: Positive PostgreSQL job identity.
 
     Returns:
-        A private notification for one Execution Attempt.
+        Private notification for one Execution Attempt.
     """
     return JobDispatch(internal_job_id, uuid4())
 
 
-@pytest.mark.asyncio
-async def test_reconciler_republishes_every_queued_dispatch_in_order() -> None:
-    """Publish the stable PostgreSQL dispatch list without loading job inputs."""
-    from textify.jobs.reconciler import TranscriptionJobReconciler
-
-    dispatches = (_dispatch(3), _dispatch(8))
-    repository = RecordingDispatchRepository(dispatches)
-    publisher = RecordingPublisher()
-
-    await TranscriptionJobReconciler(repository, publisher).reconcile_once()
-
-    assert repository.list_calls == 1
-    assert publisher.dispatches == list(dispatches)
-    assert repository.cleanup_calls == 0
+def _policy(dispatch_batch_size: int = 100) -> ReconcilerPolicy:
+    """Build the recovery policy used by isolated reconciliation tests."""
+    return ReconcilerPolicy(
+        interval=timedelta(seconds=1),
+        publication_lease_duration=timedelta(seconds=5),
+        dispatch_batch_size=dispatch_batch_size,
+        retention_cleanup_interval=timedelta(hours=1),
+    )
 
 
 @pytest.mark.asyncio
-async def test_reconciler_stops_current_pass_when_broker_is_unavailable() -> None:
-    """Leave remaining deliveries for a later idempotent reconciliation pass."""
-    from textify.jobs.reconciler import TranscriptionJobReconciler
-
-    first_dispatch, second_dispatch = _dispatch(3), _dispatch(8)
-    repository = RecordingDispatchRepository((first_dispatch, second_dispatch))
+async def test_reconciler_expires_before_leasing_and_recording_dispatches() -> None:
+    """Expire queued deadlines before publishing a newly due batch."""
+    dispatch = _dispatch(3)
+    repository = RecordingDispatchRepository(((dispatch,), ()), (1, 0))
     publisher = RecordingPublisher()
-    publisher.fail_after = 1
 
-    await TranscriptionJobReconciler(repository, publisher).reconcile_once()
+    await TranscriptionJobReconciler(
+        repository,
+        publisher,
+        policy=_policy(),
+    ).reconcile_once()
+
+    assert repository.calls == ["expire", "expire", "lease", "record", "lease"]
+    assert publisher.dispatches == [dispatch]
+    assert [record[0] for record in repository.recorded_dispatches] == [dispatch]
+
+
+@pytest.mark.asyncio
+async def test_reconciler_drains_due_dispatch_batches() -> None:
+    """Lease and record every batch until no due Job Dispatch remains."""
+    first_dispatch, second_dispatch, third_dispatch = (
+        _dispatch(3),
+        _dispatch(8),
+        _dispatch(13),
+    )
+    repository = RecordingDispatchRepository(
+        ((first_dispatch, second_dispatch), (third_dispatch,), ()),
+    )
+    publisher = RecordingPublisher()
+
+    await TranscriptionJobReconciler(
+        repository,
+        publisher,
+        policy=_policy(dispatch_batch_size=2),
+    ).reconcile_once()
+
+    assert publisher.dispatches == [
+        first_dispatch,
+        second_dispatch,
+        third_dispatch,
+    ]
+    assert [record[0] for record in repository.recorded_dispatches] == (
+        publisher.dispatches
+    )
+    assert all(request[2] == 2 for request in repository.lease_requests)
+
+
+@pytest.mark.asyncio
+async def test_reconciler_releases_unpublished_suffix_when_broker_is_unavailable() -> (
+    None
+):
+    """Release the failed and unattempted lease suffix after a broker failure."""
+    first_dispatch, second_dispatch, third_dispatch = (
+        _dispatch(3),
+        _dispatch(8),
+        _dispatch(13),
+    )
+    repository = RecordingDispatchRepository(
+        ((first_dispatch, second_dispatch, third_dispatch),),
+    )
+    publisher = RecordingPublisher(unavailable_after=1)
+
+    await TranscriptionJobReconciler(
+        repository,
+        publisher,
+        policy=_policy(),
+    ).reconcile_once()
 
     assert publisher.dispatches == [first_dispatch]
+    assert [record[0] for record in repository.recorded_dispatches] == [first_dispatch]
+    assert repository.released_dispatches == [
+        ((second_dispatch, third_dispatch), repository.lease_requests[0][0])
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reconciler_leaves_lease_after_post_publication_store_failure() -> None:
+    """Leave the lease to expire when recording fails after broker acceptance."""
+    dispatch = _dispatch(3)
+    repository = RecordingDispatchRepository(((dispatch,),))
+    repository.record_error = TranscriptionJobStoreUnavailableError()
+    publisher = RecordingPublisher()
+
+    with pytest.raises(TranscriptionJobStoreUnavailableError):
+        await TranscriptionJobReconciler(
+            repository,
+            publisher,
+            policy=_policy(),
+        ).reconcile_once()
+
+    assert publisher.dispatches == [dispatch]
+    assert repository.released_dispatches == []
 
 
 @pytest.mark.asyncio
 async def test_reconciler_owns_expired_terminal_job_cleanup() -> None:
-    """Run terminal retention independently of queued Job Dispatch publication."""
-    from textify.jobs.reconciler import TranscriptionJobReconciler
-
+    """Run terminal retention independently of Job Dispatch publication."""
     repository = RecordingDispatchRepository(())
 
-    await TranscriptionJobReconciler(repository, RecordingPublisher()).cleanup_once()
+    await TranscriptionJobReconciler(
+        repository,
+        RecordingPublisher(),
+        policy=_policy(),
+    ).cleanup_once()
 
-    assert repository.list_calls == 0
     assert repository.cleanup_calls == 1
+
+
+@pytest.mark.parametrize(
+    "policy_kwargs",
+    (
+        {"interval": timedelta()},
+        {"publication_lease_duration": timedelta()},
+        {"dispatch_batch_size": 0},
+        {"retention_cleanup_interval": timedelta()},
+    ),
+)
+def test_reconciler_policy_rejects_nonpositive_values(
+    policy_kwargs: dict[str, object],
+) -> None:
+    """Reject scheduling policies that could strand due dispatches."""
+    with pytest.raises(ValueError):
+        ReconcilerPolicy(**policy_kwargs)

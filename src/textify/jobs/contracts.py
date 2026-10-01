@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Protocol
 from uuid import UUID
 
@@ -87,14 +88,79 @@ class TranscriptionJobApiRepository(Protocol):
 class TranscriptionJobDispatchRepository(Protocol):
     """Provide committed dispatch and retention operations to the reconciler."""
 
-    async def list_queued_dispatches(self) -> tuple[JobDispatch, ...]:
-        """List eligible queued Execution Attempts without private job inputs.
+    async def expire_queued_jobs(self, limit: int) -> int:
+        """Fail up to ``limit`` queued jobs that reached their absolute deadline.
+
+        Args:
+            limit: Maximum queued rows to transition in one transaction.
 
         Returns:
-            Dispatches ordered by immutable submission time and private job identifier.
+            Number of jobs transitioned to the ``queue_timeout`` outcome.
 
         Raises:
             TranscriptionJobStoreUnavailableError: If durable storage is unavailable.
+            ValueError: If ``limit`` is not positive.
+        """
+        ...
+
+    async def lease_due_dispatches(
+        self,
+        lease_owner: UUID,
+        lease_duration: timedelta,
+        limit: int,
+    ) -> tuple[JobDispatch, ...]:
+        """Lease a bounded FIFO batch of due private Job Dispatches.
+
+        Args:
+            lease_owner: Private UUIDv4 identity of this reconciler instance.
+            lease_duration: Positive interval before an unrecorded lease expires.
+            limit: Maximum dispatches to lease.
+
+        Returns:
+            Leased Job Dispatch values after their transaction commits.
+
+        Raises:
+            TranscriptionJobStoreUnavailableError: If durable storage is unavailable.
+            ValueError: If any lease argument is invalid.
+        """
+        ...
+
+    async def record_dispatch_published(
+        self,
+        dispatch: JobDispatch,
+        lease_owner: UUID,
+        redispatch_after: timedelta,
+    ) -> bool:
+        """Record one broker publication while releasing its publication lease.
+
+        Args:
+            dispatch: Private attempt identity published to the broker.
+            lease_owner: UUIDv4 reconciler identity holding the lease.
+            redispatch_after: Positive delay before another dispatch becomes due.
+
+        Returns:
+            ``True`` when the matching lease was recorded, otherwise ``False``.
+
+        Raises:
+            TranscriptionJobStoreUnavailableError: If durable storage is unavailable.
+            ValueError: If the lease owner or redispatch delay is invalid.
+        """
+        ...
+
+    async def release_dispatch_leases(
+        self,
+        dispatches: tuple[JobDispatch, ...],
+        lease_owner: UUID,
+    ) -> None:
+        """Release publication leases after a mapped broker failure.
+
+        Args:
+            dispatches: Leased private attempts to release.
+            lease_owner: UUIDv4 reconciler identity holding the leases.
+
+        Raises:
+            TranscriptionJobStoreUnavailableError: If durable storage is unavailable.
+            ValueError: If the lease owner is invalid.
         """
         ...
 

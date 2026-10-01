@@ -54,6 +54,17 @@ def _repository(
     )
 
 
+async def _lease_due_dispatches(
+    repository: PostgresTranscriptionJobRepository,
+) -> tuple[JobDispatch, ...]:
+    """Lease a valid short-lived dispatch batch for lifecycle test setup."""
+    return await repository.lease_due_dispatches(
+        uuid4(),
+        timedelta(seconds=5),
+        limit=100,
+    )
+
+
 async def _dispose_engines(*engines: AsyncEngine) -> None:
     """Close independent PostgreSQL application engines owned by this test."""
     await asyncio.gather(*(engine.dispose() for engine in engines))
@@ -148,10 +159,10 @@ async def test_postgres_repositories_enforce_capacity_across_sessions(
     assert attempt_count == 1
 
 
-async def test_postgres_repositories_list_dispatches_in_submission_order(
+async def test_postgres_repositories_enforce_fifo_claims_after_reversed_delivery(
     migrated_postgresql_database_url: str,
 ) -> None:
-    """List committed attempts deterministically and claim each dispatch once."""
+    """Reject a newer delivery until the oldest eligible attempt claims."""
     clock = [_INITIAL]
     submitting_repository, submitting_engine = _repository(
         migrated_postgresql_database_url,
@@ -171,11 +182,12 @@ async def test_postgres_repositories_list_dispatches_in_submission_order(
     try:
         first_queued = await submitting_repository.create_queued(_queued_job("first"))
         second_queued = await submitting_repository.create_queued(_queued_job("second"))
-        dispatches = await submitting_repository.list_queued_dispatches()
+        dispatches = await _lease_due_dispatches(submitting_repository)
 
-        first_claim = await first_consumer_repository.claim_dispatch(dispatches[0])
-        second_claim = await second_consumer_repository.claim_dispatch(dispatches[1])
-        repeated_claim = await first_consumer_repository.claim_dispatch(dispatches[0])
+        newer_claim = await first_consumer_repository.claim_dispatch(dispatches[1])
+        first_claim = await second_consumer_repository.claim_dispatch(dispatches[0])
+        second_claim = await first_consumer_repository.claim_dispatch(dispatches[1])
+        repeated_claim = await second_consumer_repository.claim_dispatch(dispatches[0])
     finally:
         await _dispose_engines(
             submitting_engine,
@@ -187,11 +199,42 @@ async def test_postgres_repositories_list_dispatches_in_submission_order(
         first_queued.internal_id,
         second_queued.internal_id,
     ]
+    assert newer_claim is None
     assert first_claim is not None
     assert second_claim is not None
     assert first_claim.dispatch == dispatches[0]
     assert second_claim.dispatch == dispatches[1]
     assert repeated_claim is None
+
+
+async def test_postgres_fifo_uses_job_id_when_submission_times_match(
+    migrated_postgresql_database_url: str,
+) -> None:
+    """Break equal-submission-time FIFO ties with the internal job identifier."""
+    clock = [_INITIAL]
+    repository, engine = _repository(
+        migrated_postgresql_database_url,
+        maximum_outstanding_jobs=2,
+        clock=clock,
+    )
+    try:
+        first_queued = await repository.create_queued(_queued_job("first-tie"))
+        second_queued = await repository.create_queued(_queued_job("second-tie"))
+        dispatches = await _lease_due_dispatches(repository)
+
+        newer_claim = await repository.claim_dispatch(dispatches[1])
+        first_claim = await repository.claim_dispatch(dispatches[0])
+        second_claim = await repository.claim_dispatch(dispatches[1])
+    finally:
+        await engine.dispose()
+
+    assert [dispatch.internal_job_id for dispatch in dispatches] == [
+        first_queued.internal_id,
+        second_queued.internal_id,
+    ]
+    assert newer_claim is None
+    assert first_claim is not None
+    assert second_claim is not None
 
 
 async def test_postgres_admission_rolls_back_job_exclusions_and_attempt(
@@ -246,10 +289,10 @@ async def test_postgres_admission_rolls_back_job_exclusions_and_attempt(
     assert relation_counts == (0, 0, 0)
 
 
-async def test_postgres_dispatch_listing_is_stable_and_private(
+async def test_postgres_dispatch_leases_are_private(
     migrated_postgresql_database_url: str,
 ) -> None:
-    """Expose only stable internal Job Dispatch values to the reconciler."""
+    """Expose only leased internal Job Dispatch values to the reconciler."""
     clock = [_INITIAL]
     repository, engine = _repository(
         migrated_postgresql_database_url,
@@ -260,18 +303,213 @@ async def test_postgres_dispatch_listing_is_stable_and_private(
         await repository.create_queued(_queued_job("first"))
         await repository.create_queued(_queued_job("second"))
 
-        first_listing = await repository.list_queued_dispatches()
-        second_listing = await repository.list_queued_dispatches()
+        dispatches = await _lease_due_dispatches(repository)
     finally:
         await engine.dispose()
 
-    assert first_listing == second_listing
-    assert len({dispatch.execution_attempt_token for dispatch in first_listing}) == 2
+    assert len({dispatch.execution_attempt_token for dispatch in dispatches}) == 2
     assert all(
         not hasattr(dispatch, private_attribute)
-        for dispatch in first_listing
+        for dispatch in dispatches
         for private_attribute in ("submitted_url", "exclusions", "public_id")
     )
+
+
+async def test_postgres_cancellation_and_timeout_unblock_the_next_fifo_dispatch(
+    migrated_postgresql_database_url: str,
+) -> None:
+    """Allow the next dispatch after the older queued job terminalizes."""
+    clock = [_INITIAL]
+    repository, engine = _repository(
+        migrated_postgresql_database_url,
+        maximum_outstanding_jobs=4,
+        clock=clock,
+    )
+    try:
+        cancelled_job = await repository.create_queued(_queued_job("cancelled"))
+        cancellation_successor = await repository.create_queued(
+            _queued_job("cancellation-successor")
+        )
+        cancellation_dispatches = await _lease_due_dispatches(repository)
+        cancelled = await repository.request_cancellation(cancelled_job.public_id)
+        cancellation_successor_claim = await repository.claim_dispatch(
+            cancellation_dispatches[1]
+        )
+
+        timeout_job = await repository.create_queued(_queued_job("timeout"))
+        timeout_dispatch = (await _lease_due_dispatches(repository))[0]
+        clock[0] += _QUEUE_TIMEOUT + timedelta(seconds=1)
+        timeout_successor = await repository.create_queued(
+            _queued_job("timeout-successor")
+        )
+        timeout_successor_dispatch = (await _lease_due_dispatches(repository))[0]
+        timeout_claim = await repository.claim_dispatch(timeout_dispatch)
+        timeout_successor_claim = await repository.claim_dispatch(
+            timeout_successor_dispatch
+        )
+    finally:
+        await engine.dispose()
+
+    assert isinstance(cancelled, CancelledTranscriptionJob)
+    assert cancellation_successor_claim is not None
+    assert cancellation_dispatches[1].internal_job_id == (
+        cancellation_successor.internal_id
+    )
+    assert timeout_dispatch.internal_job_id == timeout_job.internal_id
+    assert timeout_successor_dispatch.internal_job_id == timeout_successor.internal_id
+    assert timeout_claim is None
+    assert timeout_successor_claim is not None
+
+
+async def test_postgres_leases_due_dispatches_and_recovers_after_redispatch(
+    migrated_postgresql_database_url: str,
+) -> None:
+    """Lease due attempts, record publication, and release failed publications."""
+    clock = [_INITIAL]
+    repository, engine = _repository(
+        migrated_postgresql_database_url,
+        maximum_outstanding_jobs=1,
+        clock=clock,
+    )
+    first_lease_owner = uuid4()
+    second_lease_owner = uuid4()
+    try:
+        queued_job = await repository.create_queued(_queued_job("lease-recovery"))
+        first_dispatches = await repository.lease_due_dispatches(
+            first_lease_owner,
+            timedelta(seconds=5),
+            limit=1,
+        )
+        blocked_dispatches = await repository.lease_due_dispatches(
+            second_lease_owner,
+            timedelta(seconds=5),
+            limit=1,
+        )
+        recorded = await repository.record_dispatch_published(
+            first_dispatches[0],
+            first_lease_owner,
+            timedelta(seconds=1),
+        )
+        not_yet_due_dispatches = await repository.lease_due_dispatches(
+            second_lease_owner,
+            timedelta(seconds=5),
+            limit=1,
+        )
+        clock[0] += timedelta(seconds=1)
+        recovered_dispatches = await repository.lease_due_dispatches(
+            second_lease_owner,
+            timedelta(seconds=5),
+            limit=1,
+        )
+        async with engine.connect() as connection:
+            dispatch_history = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT dispatch_count, last_dispatched_at, "
+                            "next_dispatch_at, publication_lease_owner "
+                            "FROM transcription_job_execution_attempt "
+                            "WHERE job_id = :job_id"
+                        ),
+                        {"job_id": queued_job.internal_id},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+        await repository.release_dispatch_leases(
+            recovered_dispatches,
+            second_lease_owner,
+        )
+        released_dispatches = await repository.lease_due_dispatches(
+            uuid4(),
+            timedelta(seconds=5),
+            limit=1,
+        )
+    finally:
+        await engine.dispose()
+
+    assert first_dispatches[0].internal_job_id == queued_job.internal_id
+    assert blocked_dispatches == ()
+    assert recorded is True
+    assert not_yet_due_dispatches == ()
+    assert recovered_dispatches == first_dispatches
+    assert released_dispatches == first_dispatches
+    assert dispatch_history["dispatch_count"] == 1
+    assert dispatch_history["last_dispatched_at"] == _INITIAL
+    assert dispatch_history["next_dispatch_at"] == _INITIAL + timedelta(seconds=1)
+    assert dispatch_history["publication_lease_owner"] == second_lease_owner
+
+
+async def test_postgres_lifecycle_transitions_prevent_future_dispatch_leases(
+    migrated_postgresql_database_url: str,
+) -> None:
+    """Exclude processing, cancelled, and queue-timeout jobs from future leasing."""
+    clock = [_INITIAL]
+    repository, engine = _repository(
+        migrated_postgresql_database_url,
+        maximum_outstanding_jobs=3,
+        clock=clock,
+    )
+    try:
+        processing_job = await repository.create_queued(_queued_job("processing"))
+        processing_dispatch = (await _lease_due_dispatches(repository))[0]
+        assert processing_dispatch.internal_job_id == processing_job.internal_id
+        assert await repository.claim_dispatch(processing_dispatch) is not None
+        processing_leases = await _lease_due_dispatches(repository)
+
+        cancelled_job = await repository.create_queued(_queued_job("cancelled"))
+        cancelled_dispatch = (await _lease_due_dispatches(repository))[0]
+        assert cancelled_dispatch.internal_job_id == cancelled_job.internal_id
+        assert isinstance(
+            await repository.request_cancellation(cancelled_job.public_id),
+            CancelledTranscriptionJob,
+        )
+        cancelled_leases = await _lease_due_dispatches(repository)
+
+        timeout_job = await repository.create_queued(_queued_job("timeout"))
+        timeout_dispatch = (await _lease_due_dispatches(repository))[0]
+        assert timeout_dispatch.internal_job_id == timeout_job.internal_id
+        clock[0] += _QUEUE_TIMEOUT
+        assert await repository.expire_queued_jobs(limit=1) == 1
+        timeout_leases = await _lease_due_dispatches(repository)
+    finally:
+        await engine.dispose()
+
+    assert processing_leases == ()
+    assert cancelled_leases == ()
+    assert timeout_leases == ()
+
+
+async def test_postgres_expires_queued_jobs_before_their_attempts_are_claimed(
+    migrated_postgresql_database_url: str,
+) -> None:
+    """Finish due queued jobs without relying on a broker delivery."""
+    clock = [_INITIAL]
+    repository, engine = _repository(
+        migrated_postgresql_database_url,
+        maximum_outstanding_jobs=2,
+        clock=clock,
+    )
+    try:
+        first_job = await repository.create_queued(_queued_job("first-expiry"))
+        second_job = await repository.create_queued(_queued_job("second-expiry"))
+        clock[0] += _QUEUE_TIMEOUT
+        first_expired_count = await repository.expire_queued_jobs(limit=1)
+        first_snapshot = await repository.get_job(first_job.public_id)
+        second_snapshot = await repository.get_job(second_job.public_id)
+        second_expired_count = await repository.expire_queued_jobs(limit=1)
+        terminal_snapshot = await repository.get_job(second_job.public_id)
+    finally:
+        await engine.dispose()
+
+    assert first_expired_count == 1
+    assert isinstance(first_snapshot, FailedTranscriptionJob)
+    assert first_snapshot.error_code == "queue_timeout"
+    assert isinstance(second_snapshot, QueuedTranscriptionJob)
+    assert second_expired_count == 1
+    assert isinstance(terminal_snapshot, FailedTranscriptionJob)
+    assert terminal_snapshot.error_code == "queue_timeout"
 
 
 async def test_postgres_claims_before_loading_private_inputs(
@@ -298,7 +536,7 @@ async def test_postgres_claims_before_loading_private_inputs(
 
     try:
         queued_job = await repository.create_queued(_queued_job("claim-order"))
-        dispatch = (await repository.list_queued_dispatches())[0]
+        dispatch = (await _lease_due_dispatches(repository))[0]
         stale_dispatch = JobDispatch(
             internal_job_id=queued_job.internal_id,
             execution_attempt_token=uuid4(),
@@ -344,18 +582,18 @@ async def test_postgres_stale_dispatches_do_not_load_private_inputs(
             [
                 await repository.create_queued(_queued_job(source_suffix))
                 for source_suffix in (
-                    "wrong-token",
                     "processing",
                     "cancelled",
                     "terminal",
+                    "wrong-token",
                 )
             ]
         )
-        dispatches = await repository.list_queued_dispatches()
-        processing_claim = await repository.claim_dispatch(dispatches[1])
+        dispatches = await _lease_due_dispatches(repository)
+        processing_claim = await repository.claim_dispatch(dispatches[0])
         assert processing_claim is not None
-        await repository.request_cancellation(queued_jobs[2].public_id)
-        terminal_claim = await repository.claim_dispatch(dispatches[3])
+        await repository.request_cancellation(queued_jobs[1].public_id)
+        terminal_claim = await repository.claim_dispatch(dispatches[2])
         assert terminal_claim is not None
         assert await repository.publish_failure(
             terminal_claim.dispatch,
@@ -364,12 +602,12 @@ async def test_postgres_stale_dispatches_do_not_load_private_inputs(
         )
         invalid_dispatches = (
             JobDispatch(
-                internal_job_id=dispatches[0].internal_job_id,
+                internal_job_id=dispatches[3].internal_job_id,
                 execution_attempt_token=uuid4(),
             ),
+            dispatches[0],
             dispatches[1],
             dispatches[2],
-            dispatches[3],
         )
         event.listen(
             engine.sync_engine,
@@ -418,7 +656,7 @@ async def test_postgres_allows_only_one_successful_claim_per_dispatch(
     )
     try:
         await submitting_repository.create_queued(_queued_job("concurrent-claim"))
-        dispatch = (await submitting_repository.list_queued_dispatches())[0]
+        dispatch = (await _lease_due_dispatches(submitting_repository))[0]
         claims = await asyncio.gather(
             first_consumer.claim_dispatch(dispatch),
             second_consumer.claim_dispatch(dispatch),
@@ -441,7 +679,7 @@ async def test_postgres_terminal_publication_requires_claim_token(
     )
     try:
         success_job = await repository.create_queued(_queued_job("token-success"))
-        success_dispatch = (await repository.list_queued_dispatches())[0]
+        success_dispatch = (await _lease_due_dispatches(repository))[0]
         success_claim = await repository.claim_dispatch(success_dispatch)
         assert success_claim is not None
         wrong_success_dispatch = JobDispatch(
@@ -457,7 +695,7 @@ async def test_postgres_terminal_publication_requires_claim_token(
         )
 
         failure_job = await repository.create_queued(_queued_job("token-failure"))
-        failure_dispatch = (await repository.list_queued_dispatches())[0]
+        failure_dispatch = (await _lease_due_dispatches(repository))[0]
         failure_claim = await repository.claim_dispatch(failure_dispatch)
         assert failure_claim is not None
         wrong_failure_dispatch = JobDispatch(
@@ -478,7 +716,7 @@ async def test_postgres_terminal_publication_requires_claim_token(
         cancellation_job = await repository.create_queued(
             _queued_job("token-cancelled")
         )
-        cancellation_dispatch = (await repository.list_queued_dispatches())[0]
+        cancellation_dispatch = (await _lease_due_dispatches(repository))[0]
         cancellation_claim = await repository.claim_dispatch(cancellation_dispatch)
         assert cancellation_claim is not None
         cancellation = await repository.request_cancellation(cancellation_job.public_id)
@@ -518,7 +756,7 @@ async def test_postgres_cancellation_blocks_competing_success_publication(
     )
     try:
         queued_job = await execution_repository.create_queued(_queued_job("race"))
-        dispatch = (await execution_repository.list_queued_dispatches())[0]
+        dispatch = (await _lease_due_dispatches(execution_repository))[0]
         claimed_job = await execution_repository.claim_dispatch(dispatch)
         assert claimed_job is not None
 
@@ -564,7 +802,7 @@ async def test_postgres_cancellation_blocks_competing_failure_publication(
         queued_job = await execution_repository.create_queued(
             _queued_job("failure-race")
         )
-        dispatch = (await execution_repository.list_queued_dispatches())[0]
+        dispatch = (await _lease_due_dispatches(execution_repository))[0]
         claimed_job = await execution_repository.claim_dispatch(dispatch)
         assert claimed_job is not None
         cancellation = await cancellation_repository.request_cancellation(
@@ -609,7 +847,7 @@ async def test_postgres_repeatable_read_snapshot_survives_concurrent_retention(
     pause_listener: Callable[..., object] | None = None
     try:
         queued_job = await reader_repository.create_queued(_queued_job("snapshot"))
-        dispatch = (await reader_repository.list_queued_dispatches())[0]
+        dispatch = (await _lease_due_dispatches(reader_repository))[0]
         claimed_job = await reader_repository.claim_dispatch(dispatch)
         assert claimed_job is not None
         assert await reader_repository.publish_success(

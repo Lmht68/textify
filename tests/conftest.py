@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
+import socket
+import subprocess
 from collections.abc import AsyncIterator
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -22,6 +25,102 @@ from sqlalchemy.pool import NullPool
 
 PROJECT_ROOT = Path(__file__).parent.parent
 _TEST_DATABASE_PREFIX = "textify_test_"
+
+
+class RestartableRedisBroker:
+    """Own an isolated non-persistent Redis child for restart fault tests."""
+
+    def __init__(
+        self,
+        redis_server_path: str,
+        port: int,
+        data_directory: Path,
+    ) -> None:
+        """Initialize one stopped Redis child process controller.
+
+        Args:
+            redis_server_path: Absolute path to the required Redis server binary.
+            port: Reserved loopback port for this child only.
+            data_directory: Per-test directory for Redis data and logs.
+        """
+        self._redis_server_path = redis_server_path
+        self._port = port
+        self._data_directory = data_directory
+        self._process: subprocess.Popen[bytes] | None = None
+
+    @property
+    def url(self) -> str:
+        """Return the private broker URL for this isolated Redis child."""
+        return f"redis://127.0.0.1:{self._port}/0"
+
+    async def start(self) -> None:
+        """Start Redis and wait until it accepts PING requests.
+
+        Raises:
+            AssertionError: If the required Redis child cannot start.
+        """
+        if self._process is not None and self._process.poll() is None:
+            return
+        self._data_directory.mkdir(exist_ok=True)
+        log_path = self._data_directory / "redis.log"
+        self._process = await asyncio.to_thread(
+            subprocess.Popen,
+            [
+                self._redis_server_path,
+                "--port",
+                str(self._port),
+                "--bind",
+                "127.0.0.1",
+                "--save",
+                "",
+                "--appendonly",
+                "no",
+                "--dir",
+                str(self._data_directory),
+                "--logfile",
+                str(log_path),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        redis_client = Redis.from_url(self.url)
+        try:
+            for _ in range(100):
+                if self._process.poll() is not None:
+                    break
+                try:
+                    await redis_client.ping()
+                except RedisError:
+                    await asyncio.sleep(0.05)
+                else:
+                    return
+            log_output = log_path.read_text() if log_path.exists() else ""
+            await self.stop()
+            pytest.fail(
+                "redis-server could not start for restart fault tests. "
+                f"Review {log_path}: {log_output}"
+            )
+        finally:
+            await redis_client.aclose()
+
+    async def stop(self) -> None:
+        """Terminate only this fixture's Redis child process."""
+        process = self._process
+        self._process = None
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            await asyncio.to_thread(process.wait, 5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            await asyncio.to_thread(process.wait, 5)
+
+    async def restart(self) -> None:
+        """Discard this non-persistent broker state and start the same child again."""
+        await self.stop()
+        await self.start()
 
 
 def _test_admin_database_url() -> URL:
@@ -192,3 +291,37 @@ async def redis_broker_url() -> AsyncIterator[str]:
         yield raw_url
     finally:
         await redis_client.aclose()
+
+
+@pytest.fixture
+async def restartable_redis_broker(
+    tmp_path: Path,
+) -> AsyncIterator[RestartableRedisBroker]:
+    """Start an isolated redis-server child that tests may stop and restart.
+
+    Args:
+        tmp_path: Per-test directory for ephemeral Redis logs and disabled persistence.
+
+    Yields:
+        Started Redis child controller with a stable isolated broker URL.
+    """
+    redis_server_path = shutil.which("redis-server")
+    if redis_server_path is None:
+        pytest.fail(
+            "redis-server is required for restart fault tests. "
+            "Install the Redis server binary and rerun the test suite."
+        )
+        raise AssertionError("pytest.fail must stop fixture setup.")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reserved_socket:
+        reserved_socket.bind(("127.0.0.1", 0))
+        reserved_port = reserved_socket.getsockname()[1]
+    broker = RestartableRedisBroker(
+        redis_server_path,
+        reserved_port,
+        tmp_path / "restartable-redis",
+    )
+    try:
+        await broker.start()
+        yield broker
+    finally:
+        await broker.stop()

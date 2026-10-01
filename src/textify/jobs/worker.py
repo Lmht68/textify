@@ -181,6 +181,21 @@ class TranscriptionWorkerRuntime:
                 extra={"code": InternalError.code},
             )
 
+    def dispose_engine(self, engine: AsyncEngine) -> None:
+        """Dispose database connections on the runtime loop that owns them.
+
+        Args:
+            engine: PostgreSQL engine whose asyncpg connections belong to this loop.
+
+        Raises:
+            RuntimeError: If the worker runtime is not started.
+        """
+        with self._state_lock:
+            loop = self._loop if self._started else None
+        if loop is None:
+            raise RuntimeError("Transcription worker runtime is unavailable.")
+        asyncio.run_coroutine_threadsafe(engine.dispose(), loop).result()
+
     def shutdown(self) -> None:
         """Drain the executor, stop the loop, and release its thread exactly once."""
         with self._state_lock:
@@ -214,6 +229,7 @@ def register_transcription_task(
         Registered unbound private Celery task bound to ``runtime``.
 
     """
+    celery_app.tasks.pop(TRANSCRIPTION_TASK, None)
 
     @celery_app.task(  # type: ignore[untyped-decorator]
         name=TRANSCRIPTION_TASK,
@@ -328,6 +344,7 @@ async def _create_worker_runtime(
         RuntimeError: If PostgreSQL is unavailable or schema is not current.
     """
     await verify_application_database(engine)
+    await engine.dispose()
     repository = PostgresTranscriptionJobRepository(
         engine=engine,
         maximum_outstanding_jobs=job_config.max_outstanding_jobs,
@@ -349,6 +366,7 @@ def main() -> None:
     transcription_config = TranscriptionConfig()
     engine = create_application_engine(str(job_config.database_url))
     runtime: TranscriptionWorkerRuntime | None = None
+    runtime_started = False
     try:
         runtime = asyncio.run(
             _create_worker_runtime(
@@ -359,6 +377,7 @@ def main() -> None:
             )
         )
         runtime.start()
+        runtime_started = True
         celery_app = create_celery_app(dispatch_config)
         register_transcription_task(celery_app, runtime)
         celery_app.worker_main(
@@ -371,6 +390,13 @@ def main() -> None:
             ]
         )
     finally:
-        if runtime is not None:
+        if runtime is None:
+            asyncio.run(engine.dispose())
+        elif not runtime_started:
             runtime.shutdown()
-        asyncio.run(engine.dispose())
+            asyncio.run(engine.dispose())
+        else:
+            try:
+                runtime.dispose_engine(engine)
+            finally:
+                runtime.shutdown()

@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 from datetime import timedelta
+from uuid import uuid4
 
 from textify.jobs.celery_app import create_celery_app
 from textify.jobs.config import JobConfig, JobDispatchConfig
@@ -25,6 +27,34 @@ from textify.jobs.service import utc_now
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True, slots=True)
+class ReconcilerPolicy:
+    """Define bounded timing and lease behavior for one reconciler process."""
+
+    interval: timedelta = timedelta(seconds=1)
+    publication_lease_duration: timedelta = timedelta(seconds=5)
+    dispatch_batch_size: int = 100
+    retention_cleanup_interval: timedelta = timedelta(hours=1)
+
+    def __post_init__(self) -> None:
+        """Reject timing policies that can strand or spin dispatch recovery."""
+        _require_positive_duration(self.interval, "interval")
+        _require_positive_duration(
+            self.publication_lease_duration,
+            "publication_lease_duration",
+        )
+        if (
+            isinstance(self.dispatch_batch_size, bool)
+            or not isinstance(self.dispatch_batch_size, int)
+            or self.dispatch_batch_size <= 0
+        ):
+            raise ValueError("dispatch_batch_size must be a positive integer.")
+        _require_positive_duration(
+            self.retention_cleanup_interval,
+            "retention_cleanup_interval",
+        )
+
+
 class TranscriptionJobReconciler:
     """Publish committed queued Execution Attempts and own terminal retention."""
 
@@ -32,48 +62,58 @@ class TranscriptionJobReconciler:
         self,
         repository: TranscriptionJobDispatchRepository,
         publisher: JobDispatchPublisher,
-        interval_seconds: float = 1.0,
-        retention_cleanup_interval: timedelta = timedelta(hours=1),
+        policy: ReconcilerPolicy | None = None,
     ) -> None:
-        """Initialize PostgreSQL scanning and private delivery dependencies.
+        """Initialize PostgreSQL recovery and private delivery dependencies.
 
         Args:
-            repository: PostgreSQL queued-dispatch and terminal-retention boundary.
-            publisher: Private Celery delivery boundary.
-            interval_seconds: Delay between reconciliation scans.
-            retention_cleanup_interval: Delay between terminal retention passes.
-
-        Raises:
-            ValueError: If either interval is nonpositive.
+            repository: PostgreSQL dispatch-recovery and terminal-retention seam.
+            publisher: Private Celery delivery seam.
+            policy: Optional bounded reconciliation timing and lease policy.
         """
-        if interval_seconds <= 0:
-            raise ValueError("interval_seconds must be positive.")
-        if retention_cleanup_interval <= timedelta():
-            raise ValueError("retention_cleanup_interval must be positive.")
         self._repository = repository
         self._publisher = publisher
-        self._interval_seconds = interval_seconds
-        self._retention_cleanup_interval_seconds = (
-            retention_cleanup_interval.total_seconds()
-        )
+        self._policy = policy or ReconcilerPolicy()
+        self._lease_owner = uuid4()
 
     async def reconcile_once(self) -> None:
-        """Publish every currently queued dispatch until broker delivery fails.
-
-        Repeated delivery is intentional. PostgreSQL claim semantics ensure that only
-        one delivery can own an Execution Attempt.
+        """Expire queued work, then lease, publish, and record due dispatches.
 
         Raises:
-            TranscriptionJobStoreUnavailableError: If PostgreSQL cannot list queued
-                dispatches safely.
+            TranscriptionJobStoreUnavailableError: If PostgreSQL recovery cannot
+                complete an operation.
         """
-        dispatches = await self._repository.list_queued_dispatches()
-        for dispatch in dispatches:
-            try:
-                await self._publisher.publish(dispatch)
-            except JobDispatchUnavailableError:
-                logger.error("transcription job dispatch broker is unavailable")
+        await self._expire_queued_jobs()
+        while True:
+            dispatches = await self._repository.lease_due_dispatches(
+                self._lease_owner,
+                self._policy.publication_lease_duration,
+                self._policy.dispatch_batch_size,
+            )
+            if not dispatches:
                 return
+            for index, dispatch in enumerate(dispatches):
+                try:
+                    await self._publisher.publish(dispatch)
+                except JobDispatchUnavailableError:
+                    logger.error("transcription job dispatch broker is unavailable")
+                    await self._repository.release_dispatch_leases(
+                        dispatches[index:],
+                        self._lease_owner,
+                    )
+                    return
+                await self._repository.record_dispatch_published(
+                    dispatch,
+                    self._lease_owner,
+                    self._policy.interval,
+                )
+
+    async def _expire_queued_jobs(self) -> None:
+        """Drain bounded queue-timeout transitions before dispatch publication."""
+        while await self._repository.expire_queued_jobs(
+            self._policy.dispatch_batch_size
+        ):
+            continue
 
     async def cleanup_once(self) -> None:
         """Delete terminal jobs that reached PostgreSQL retention cutoff.
@@ -96,12 +136,13 @@ class TranscriptionJobReconciler:
                 if time.monotonic() >= next_cleanup_at:
                     await self.cleanup_once()
                     next_cleanup_at = (
-                        time.monotonic() + self._retention_cleanup_interval_seconds
+                        time.monotonic()
+                        + self._policy.retention_cleanup_interval.total_seconds()
                     )
             except TranscriptionJobStoreUnavailableError:
                 logger.error("transcription job storage is unavailable to reconciler")
             try:
-                async with asyncio.timeout(self._interval_seconds):
+                async with asyncio.timeout(self._policy.interval.total_seconds()):
                     await stop_event.wait()
             except TimeoutError:
                 continue
@@ -129,11 +170,19 @@ async def run_reconciler() -> None:
         reconciler = TranscriptionJobReconciler(
             repository,
             publisher,
-            interval_seconds=dispatch_config.reconciler_interval_seconds,
+            policy=ReconcilerPolicy(
+                interval=timedelta(seconds=dispatch_config.reconciler_interval_seconds)
+            ),
         )
         await reconciler.run(asyncio.Event())
     finally:
         await engine.dispose()
+
+
+def _require_positive_duration(value: timedelta, name: str) -> None:
+    """Reject invalid reconciler policy durations."""
+    if not isinstance(value, timedelta) or value <= timedelta():
+        raise ValueError(f"{name} must be a positive timedelta.")
 
 
 def main() -> None:

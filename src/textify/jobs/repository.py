@@ -30,8 +30,10 @@ from sqlalchemy import (
     exists,
     func,
     insert,
+    or_,
     select,
     text,
+    tuple_,
     update,
 )
 from sqlalchemy.dialects.postgresql import UUID as PostgreSQLUUID
@@ -177,6 +179,16 @@ transcription_job_execution_attempt = Table(
         PostgreSQLUUID(as_uuid=True),
         nullable=False,
     ),
+    Column("next_dispatch_at", DateTime(timezone=True), nullable=False),
+    Column("publication_lease_owner", PostgreSQLUUID(as_uuid=True)),
+    Column("publication_lease_expires_at", DateTime(timezone=True)),
+    Column("last_dispatched_at", DateTime(timezone=True)),
+    Column(
+        "dispatch_count",
+        BigInteger,
+        nullable=False,
+        server_default=text("0"),
+    ),
     UniqueConstraint(
         "execution_attempt_token",
         name="transcription_job_execution_attempt_token_key",
@@ -186,6 +198,28 @@ transcription_job_execution_attempt = Table(
         "AND (get_byte(uuid_send(execution_attempt_token), 8) & 192) = 128",
         name="transcription_job_execution_attempt_token_uuid4_check",
     ),
+    CheckConstraint(
+        "(publication_lease_owner IS NULL) = (publication_lease_expires_at IS NULL)",
+        name="transcription_job_attempt_publication_lease_pair_check",
+    ),
+    CheckConstraint(
+        "publication_lease_owner IS NULL OR "
+        "((get_byte(uuid_send(publication_lease_owner), 6) & 240) = 64 "
+        "AND (get_byte(uuid_send(publication_lease_owner), 8) & 192) = 128)",
+        name="transcription_job_attempt_lease_owner_uuid4_check",
+    ),
+    CheckConstraint(
+        "dispatch_count >= 0 AND "
+        "((dispatch_count = 0 AND last_dispatched_at IS NULL) OR "
+        "(dispatch_count > 0 AND last_dispatched_at IS NOT NULL))",
+        name="transcription_job_attempt_dispatch_history_check",
+    ),
+)
+
+Index(
+    "transcription_job_attempt_next_dispatch_at_job_id_idx",
+    transcription_job_execution_attempt.c.next_dispatch_at,
+    transcription_job_execution_attempt.c.job_id,
 )
 
 transcription_job_exclusion = Table(
@@ -427,6 +461,8 @@ class PostgresTranscriptionJobRepository:
                     insert(transcription_job_execution_attempt).values(
                         job_id=internal_id,
                         execution_attempt_token=execution_attempt_token,
+                        next_dispatch_at=submitted_at,
+                        dispatch_count=0,
                     )
                 )
         except TranscriptionJobCapacityError:
@@ -443,18 +479,104 @@ class PostgresTranscriptionJobRepository:
             queue_deadline_at=queue_deadline_at,
         )
 
-    async def list_queued_dispatches(self) -> tuple[JobDispatch, ...]:
-        """List queued Job Dispatches without selecting provider inputs.
+    async def expire_queued_jobs(self, limit: int) -> int:
+        """Fail a bounded batch of queued jobs that reached their deadline.
+
+        Args:
+            limit: Maximum queued jobs to transition in one transaction.
 
         Returns:
-            Private dispatches ordered deterministically by submission time and ID.
+            Number of jobs transitioned to the queue-timeout outcome.
 
         Raises:
-            TranscriptionJobStoreUnavailableError: If PostgreSQL cannot list safely.
+            TranscriptionJobStoreUnavailableError: If PostgreSQL cannot expire jobs.
+            ValueError: If ``limit`` is not positive.
         """
+        _require_positive_limit(limit)
         try:
-            async with self._engine.connect() as connection:
-                rows = (
+            async with self._engine.begin() as connection:
+                now = _as_utc(self._clock())
+                expired_rows = (
+                    (
+                        await connection.execute(
+                            select(transcription_job.c.id)
+                            .where(
+                                transcription_job.c.status == "queued",
+                                transcription_job.c.cancellation_requested.is_(False),
+                                transcription_job.c.queue_deadline_at <= now,
+                            )
+                            .order_by(
+                                transcription_job.c.queue_deadline_at,
+                                transcription_job.c.id,
+                            )
+                            .limit(limit)
+                            .with_for_update(skip_locked=True)
+                        )
+                    )
+                    .mappings()
+                    .all()
+                )
+                expired_job_ids = tuple(
+                    _internal_id_from_row(row) for row in expired_rows
+                )
+                if not expired_job_ids:
+                    return 0
+                transition = await connection.execute(
+                    update(transcription_job)
+                    .where(
+                        transcription_job.c.id.in_(expired_job_ids),
+                        transcription_job.c.status == "queued",
+                        transcription_job.c.cancellation_requested.is_(False),
+                        transcription_job.c.queue_deadline_at <= now,
+                    )
+                    .values(
+                        status="finished",
+                        outcome="failed",
+                        finished_at=now,
+                        error_code=QueueTimeoutError.code,
+                        error_message=QueueTimeoutError.message,
+                    )
+                )
+                if (
+                    transition.rowcount is None
+                    or transition.rowcount < 0
+                    or transition.rowcount > len(expired_job_ids)
+                ):
+                    raise TranscriptionJobStoreUnavailableError()
+                return transition.rowcount
+        except TranscriptionJobStoreUnavailableError:
+            raise
+        except (OSError, SQLAlchemyError) as exc:
+            raise TranscriptionJobStoreUnavailableError() from exc
+
+    async def lease_due_dispatches(
+        self,
+        lease_owner: UUID,
+        lease_duration: timedelta,
+        limit: int,
+    ) -> tuple[JobDispatch, ...]:
+        """Lease a bounded FIFO batch of due queued Job Dispatches.
+
+        Args:
+            lease_owner: Private UUIDv4 identity for this reconciler instance.
+            lease_duration: Positive lease duration for unrecorded publication.
+            limit: Maximum Execution Attempts to lease.
+
+        Returns:
+            Leased private dispatches after their transaction commits.
+
+        Raises:
+            TranscriptionJobStoreUnavailableError: If PostgreSQL cannot lease safely.
+            ValueError: If lease arguments are invalid.
+        """
+        _require_uuid4(lease_owner, "lease_owner")
+        _require_positive_duration(lease_duration, "lease_duration")
+        _require_positive_limit(limit)
+        try:
+            async with self._engine.begin() as connection:
+                now = _as_utc(self._clock())
+                lease_expires_at = now + lease_duration
+                due_rows = (
                     (
                         await connection.execute(
                             select(
@@ -466,19 +588,180 @@ class PostgresTranscriptionJobRepository:
                                 transcription_job.c.id
                                 == transcription_job_execution_attempt.c.job_id,
                             )
-                            .where(transcription_job.c.status == "queued")
+                            .where(
+                                transcription_job.c.status == "queued",
+                                transcription_job.c.cancellation_requested.is_(False),
+                                transcription_job.c.queue_deadline_at > now,
+                                transcription_job_execution_attempt.c.next_dispatch_at
+                                <= now,
+                                or_(
+                                    transcription_job_execution_attempt.c.publication_lease_owner.is_(
+                                        None
+                                    ),
+                                    transcription_job_execution_attempt.c.publication_lease_expires_at
+                                    <= now,
+                                ),
+                            )
                             .order_by(
                                 transcription_job.c.submitted_at,
                                 transcription_job.c.id,
+                            )
+                            .limit(limit)
+                            .with_for_update(
+                                of=transcription_job_execution_attempt,
+                                skip_locked=True,
                             )
                         )
                     )
                     .mappings()
                     .all()
                 )
+                candidates = tuple(_dispatch_from_row(row) for row in due_rows)
+                if not candidates:
+                    return ()
+
+                queued_parent_exists = exists(
+                    select(transcription_job.c.id).where(
+                        transcription_job.c.id
+                        == transcription_job_execution_attempt.c.job_id,
+                        transcription_job.c.status == "queued",
+                        transcription_job.c.cancellation_requested.is_(False),
+                        transcription_job.c.queue_deadline_at > now,
+                    )
+                )
+                result = await connection.execute(
+                    update(transcription_job_execution_attempt)
+                    .where(
+                        transcription_job_execution_attempt.c.job_id.in_(
+                            tuple(dispatch.internal_job_id for dispatch in candidates)
+                        ),
+                        queued_parent_exists,
+                    )
+                    .values(
+                        publication_lease_owner=lease_owner,
+                        publication_lease_expires_at=lease_expires_at,
+                    )
+                    .returning(
+                        transcription_job_execution_attempt.c.job_id.label("id"),
+                        transcription_job_execution_attempt.c.execution_attempt_token,
+                    )
+                )
+                leased_dispatches = tuple(
+                    _dispatch_from_row(row) for row in result.mappings().all()
+                )
+        except TranscriptionJobStoreUnavailableError:
+            raise
         except (OSError, SQLAlchemyError) as exc:
             raise TranscriptionJobStoreUnavailableError() from exc
-        return tuple(_dispatch_from_row(row) for row in rows)
+
+        leased_dispatch_keys = {
+            (dispatch.internal_job_id, dispatch.execution_attempt_token)
+            for dispatch in leased_dispatches
+        }
+        if len(leased_dispatch_keys) != len(leased_dispatches):
+            raise TranscriptionJobStoreUnavailableError()
+        return tuple(
+            dispatch
+            for dispatch in candidates
+            if (dispatch.internal_job_id, dispatch.execution_attempt_token)
+            in leased_dispatch_keys
+        )
+
+    async def record_dispatch_published(
+        self,
+        dispatch: JobDispatch,
+        lease_owner: UUID,
+        redispatch_after: timedelta,
+    ) -> bool:
+        """Record a broker publication and release the matching lease.
+
+        Args:
+            dispatch: Private attempt identity published to the broker.
+            lease_owner: UUIDv4 reconciler identity that owns the lease.
+            redispatch_after: Positive delay before another publication is due.
+
+        Returns:
+            ``True`` when the matching lease was recorded, otherwise ``False``.
+
+        Raises:
+            TranscriptionJobStoreUnavailableError: If PostgreSQL cannot record safely.
+            ValueError: If the lease owner or redispatch interval is invalid.
+        """
+        _require_uuid4(lease_owner, "lease_owner")
+        _require_positive_duration(redispatch_after, "redispatch_after")
+        try:
+            async with self._engine.begin() as connection:
+                dispatched_at = _as_utc(self._clock())
+                result = await connection.execute(
+                    update(transcription_job_execution_attempt)
+                    .where(
+                        transcription_job_execution_attempt.c.job_id
+                        == dispatch.internal_job_id,
+                        transcription_job_execution_attempt.c.execution_attempt_token
+                        == dispatch.execution_attempt_token,
+                        transcription_job_execution_attempt.c.publication_lease_owner
+                        == lease_owner,
+                    )
+                    .values(
+                        next_dispatch_at=dispatched_at + redispatch_after,
+                        publication_lease_owner=None,
+                        publication_lease_expires_at=None,
+                        last_dispatched_at=dispatched_at,
+                        dispatch_count=(
+                            transcription_job_execution_attempt.c.dispatch_count + 1
+                        ),
+                    )
+                    .returning(transcription_job_execution_attempt.c.job_id.label("id"))
+                )
+                row = result.mappings().one_or_none()
+        except (OSError, SQLAlchemyError) as exc:
+            raise TranscriptionJobStoreUnavailableError() from exc
+
+        if row is None:
+            return False
+        return _internal_id_from_row(row) == dispatch.internal_job_id
+
+    async def release_dispatch_leases(
+        self,
+        dispatches: tuple[JobDispatch, ...],
+        lease_owner: UUID,
+    ) -> None:
+        """Release this reconciler's bounded batch of publication leases.
+
+        Args:
+            dispatches: Private attempts leased by this reconciler.
+            lease_owner: UUIDv4 identity required to release each lease.
+
+        Raises:
+            TranscriptionJobStoreUnavailableError: If PostgreSQL cannot release safely.
+            ValueError: If the lease owner is invalid.
+        """
+        _require_uuid4(lease_owner, "lease_owner")
+        if not dispatches:
+            return
+        dispatch_keys = tuple(
+            (dispatch.internal_job_id, dispatch.execution_attempt_token)
+            for dispatch in dispatches
+        )
+        try:
+            async with self._engine.begin() as connection:
+                await connection.execute(
+                    update(transcription_job_execution_attempt)
+                    .where(
+                        transcription_job_execution_attempt.c.publication_lease_owner
+                        == lease_owner,
+                        tuple_(
+                            transcription_job_execution_attempt.c.job_id,
+                            transcription_job_execution_attempt.c.execution_attempt_token,
+                        ).in_(dispatch_keys),
+                    )
+                    .values(
+                        publication_lease_owner=None,
+                        publication_lease_expires_at=None,
+                    )
+                )
+        except (OSError, SQLAlchemyError) as exc:
+            raise TranscriptionJobStoreUnavailableError() from exc
 
     async def claim_dispatch(
         self,
@@ -506,6 +789,50 @@ class PostgresTranscriptionJobRepository:
         try:
             async with self._serialized_lifecycle_transaction() as connection:
                 now = _as_utc(self._clock())
+                timeout_transition = await connection.execute(
+                    update(transcription_job)
+                    .where(
+                        transcription_job.c.id == dispatch.internal_job_id,
+                        transcription_job.c.status == "queued",
+                        transcription_job.c.cancellation_requested.is_(False),
+                        transcription_job.c.queue_deadline_at <= now,
+                        attempt_matches_dispatch,
+                    )
+                    .values(
+                        status="finished",
+                        outcome="failed",
+                        finished_at=now,
+                        error_code=QueueTimeoutError.code,
+                        error_message=QueueTimeoutError.message,
+                    )
+                )
+                if timeout_transition.rowcount not in {0, 1}:
+                    raise TranscriptionJobStoreUnavailableError()
+                if timeout_transition.rowcount == 1:
+                    return None
+
+                oldest_eligible_job_id = await connection.scalar(
+                    select(transcription_job.c.id)
+                    .where(
+                        transcription_job.c.status == "queued",
+                        transcription_job.c.cancellation_requested.is_(False),
+                        transcription_job.c.queue_deadline_at > now,
+                    )
+                    .order_by(
+                        transcription_job.c.submitted_at,
+                        transcription_job.c.id,
+                    )
+                    .limit(1)
+                )
+                if oldest_eligible_job_id is None:
+                    return None
+                if isinstance(oldest_eligible_job_id, bool) or not isinstance(
+                    oldest_eligible_job_id, int
+                ):
+                    raise TranscriptionJobStoreUnavailableError()
+                if oldest_eligible_job_id != dispatch.internal_job_id:
+                    return None
+
                 claim_transition = await connection.execute(
                     update(transcription_job)
                     .where(
@@ -517,34 +844,10 @@ class PostgresTranscriptionJobRepository:
                     )
                     .values(status="processing", started_at=now)
                 )
-                if claim_transition.rowcount == 1:
-                    claimed = True
-                elif claim_transition.rowcount == 0:
-                    claimed = False
-                else:
-                    raise TranscriptionJobStoreUnavailableError()
-
-                if not claimed:
-                    timeout_transition = await connection.execute(
-                        update(transcription_job)
-                        .where(
-                            transcription_job.c.id == dispatch.internal_job_id,
-                            transcription_job.c.status == "queued",
-                            transcription_job.c.cancellation_requested.is_(False),
-                            transcription_job.c.queue_deadline_at <= now,
-                            attempt_matches_dispatch,
-                        )
-                        .values(
-                            status="finished",
-                            outcome="failed",
-                            finished_at=now,
-                            error_code=QueueTimeoutError.code,
-                            error_message=QueueTimeoutError.message,
-                        )
-                    )
-                    if timeout_transition.rowcount not in {0, 1}:
-                        raise TranscriptionJobStoreUnavailableError()
+                if claim_transition.rowcount == 0:
                     return None
+                if claim_transition.rowcount != 1:
+                    raise TranscriptionJobStoreUnavailableError()
 
             async with self._engine.connect() as connection:
                 claimed_row = (
@@ -1339,6 +1642,24 @@ def _public_id_from_row(row: RowMapping) -> UUID:
     if not isinstance(public_id, UUID) or public_id.version != 4:
         raise TranscriptionJobStoreUnavailableError()
     return public_id
+
+
+def _require_uuid4(value: UUID, name: str) -> None:
+    """Reject non-UUIDv4 values at a repository method boundary."""
+    if not isinstance(value, UUID) or value.version != 4:
+        raise ValueError(f"{name} must be a UUIDv4.")
+
+
+def _require_positive_duration(value: timedelta, name: str) -> None:
+    """Reject invalid repository scheduling durations."""
+    if not isinstance(value, timedelta) or value <= timedelta():
+        raise ValueError(f"{name} must be a positive timedelta.")
+
+
+def _require_positive_limit(limit: int) -> None:
+    """Reject invalid repository batch limits."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError("limit must be a positive integer.")
 
 
 def _datetime_from_row(row: RowMapping, column: str) -> datetime:

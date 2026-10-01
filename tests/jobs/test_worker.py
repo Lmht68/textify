@@ -1,5 +1,7 @@
 """Tests for the private Celery threads worker runtime."""
 
+import asyncio
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -8,7 +10,7 @@ from uuid import uuid4
 import pytest
 
 from textify.jobs.celery_app import create_celery_app
-from textify.jobs.config import JobDispatchConfig
+from textify.jobs.config import JobConfig, JobDispatchConfig
 from textify.jobs.contracts import TranscriptionJobExecutionRepository
 from textify.jobs.types import JobDispatch
 from textify.transcription.config import TranscriptionConfig
@@ -141,3 +143,90 @@ def test_worker_runtime_checks_media_capacity_before_adapter_construction(
 
     assert (tmp_path / "media").is_dir()
     assert adapter_factory_calls == 0
+
+
+class DatabaseProbeProcessor:
+    """Run one real repository query and record whether it completed."""
+
+    def __init__(self) -> None:
+        """Initialize the deferred repository and completion signal."""
+        self.repository: object | None = None
+        self.completed = threading.Event()
+
+    async def process(self, dispatch: JobDispatch) -> None:
+        """Read an absent public job through the runtime-owned database loop.
+
+        Args:
+            dispatch: Valid private task payload, unused by this database probe.
+        """
+        from textify.jobs.repository import PostgresTranscriptionJobRepository
+
+        del dispatch
+        repository = self.repository
+        assert isinstance(repository, PostgresTranscriptionJobRepository)
+        await repository.get_job(uuid4())
+        self.completed.set()
+
+
+@pytest.mark.asyncio
+async def test_worker_runtime_uses_its_own_loop_for_database_connections(
+    migrated_postgresql_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Keep pooled asyncpg connections off the closed startup event loop."""
+    from textify.jobs import worker
+    from textify.jobs.database import create_application_engine
+
+    probe = DatabaseProbeProcessor()
+    executor = ShutdownExecutor()
+    engine = create_application_engine(migrated_postgresql_database_url)
+    runtime: worker.TranscriptionWorkerRuntime | None = None
+
+    def build_runtime(
+        cls: type[worker.TranscriptionWorkerRuntime],
+        repository: TranscriptionJobExecutionRepository,
+        configuration: TranscriptionConfig,
+        worker_concurrency: int,
+    ) -> worker.TranscriptionWorkerRuntime:
+        """Build a deterministic runtime after production startup verification."""
+        del cls, configuration, worker_concurrency
+        probe.repository = repository
+        return worker.TranscriptionWorkerRuntime(probe, executor)
+
+    monkeypatch.setattr(
+        worker.TranscriptionWorkerRuntime,
+        "from_repository",
+        classmethod(build_runtime),
+    )
+    try:
+        runtime = await asyncio.to_thread(
+            lambda: asyncio.run(
+                worker._create_worker_runtime(
+                    engine,
+                    JobConfig(database_url=migrated_postgresql_database_url),
+                    JobDispatchConfig(
+                        broker_url="redis://127.0.0.1:6379/0",
+                        worker_concurrency=1,
+                        _env_file=None,  # type: ignore[call-arg]
+                    ),
+                    TranscriptionConfig(
+                        temporary_media_root=tmp_path,
+                        transcription_concurrency=1,
+                        max_media_bytes=1024,
+                    ),
+                )
+            )
+        )
+        runtime.start()
+        runtime.process_payload(JobDispatch(1, uuid4()).to_payload())
+    finally:
+        if runtime is None:
+            await engine.dispose()
+        else:
+            try:
+                runtime.dispose_engine(engine)
+            finally:
+                runtime.shutdown()
+
+    assert probe.completed.is_set()

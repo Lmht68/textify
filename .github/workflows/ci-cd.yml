@@ -57,6 +57,10 @@ jobs:
           version: "0.12.1"
           enable-cache: true
           cache-dependency-glob: uv.lock
+      - name: Install redis-server for restart recovery tests
+        run: |
+          apt-get update
+          apt-get install --yes redis-server
       - name: Install locked dependencies
         run: uv sync --frozen --all-groups
       - name: Check formatting and lint
