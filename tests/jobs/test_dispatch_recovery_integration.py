@@ -24,6 +24,7 @@ from sqlalchemy.pool import NullPool
 
 from textify.config import AppConfig, Environment
 from textify.jobs.celery_app import TRANSCRIPTION_QUEUE, create_celery_app
+from textify.jobs.claim_manager import ExecutionClaimManager
 from textify.jobs.config import JobConfig, JobDispatchConfig
 from textify.jobs.contracts import TranscriptionJobStoreUnavailableError
 from textify.jobs.dispatch import CeleryJobDispatchPublisher, JobDispatchPublisher
@@ -267,6 +268,7 @@ def _policy() -> ReconcilerPolicy:
 
 def _runtime(
     repository: PostgresTranscriptionJobRepository,
+    engine: AsyncEngine,
     temporary_media_root: Path,
     provider: _CaptionProvider,
     metadata_extractor: _MetadataExtractor,
@@ -285,9 +287,17 @@ def _runtime(
             max_media_bytes=1024,
         ),
     )
+    claim_manager = ExecutionClaimManager(
+        repository,
+        max_active_claims=1,
+        heartbeat_interval=timedelta(seconds=5),
+        claim_lease_duration=timedelta(seconds=30),
+    )
     return TranscriptionWorkerRuntime(
-        TranscriptionJobProcessor(repository, executor),
+        TranscriptionJobProcessor(repository, executor, claim_manager),
         executor,
+        claim_manager,
+        engine,
     )
 
 
@@ -353,6 +363,7 @@ async def _public_client(database_url: str) -> AsyncGenerator[AsyncClient]:
 async def _real_worker(
     broker_url: str,
     repository: PostgresTranscriptionJobRepository,
+    engine: AsyncEngine,
     temporary_media_root: Path,
     provider: _CaptionProvider,
     metadata_extractor: _MetadataExtractor,
@@ -361,6 +372,7 @@ async def _real_worker(
     worker_celery_app = _celery_app(broker_url)
     runtime = _runtime(
         repository,
+        engine,
         temporary_media_root,
         provider,
         metadata_extractor,
@@ -469,6 +481,7 @@ async def test_broker_restart_recovers_lost_delivery(
         async with _real_worker(
             restartable_redis_broker.url,
             worker_repository,
+            worker_engine,
             tmp_path,
             provider,
             _MetadataExtractor(),
@@ -530,6 +543,7 @@ async def test_pre_publication_crash_recovers_expired_lease(
         async with _real_worker(
             restartable_redis_broker.url,
             worker_repository,
+            worker_engine,
             tmp_path,
             provider,
             _MetadataExtractor(),
@@ -601,6 +615,7 @@ async def test_post_publication_crash_recovers_lost_delivery(
         async with _real_worker(
             restartable_redis_broker.url,
             worker_repository,
+            worker_engine,
             tmp_path,
             provider,
             _MetadataExtractor(),
@@ -735,7 +750,14 @@ async def test_real_redis_payload_and_sql_interruptions_preserve_recovery(
             "execution_attempt_token",
         }
         assert payload_dispatch.internal_job_id == queued_job.internal_id
-        assert await repository.claim_dispatch(payload_dispatch) is not None
+        assert (
+            await repository.claim_dispatch(
+                payload_dispatch,
+                uuid4(),
+                timedelta(seconds=30),
+            )
+            is not None
+        )
 
         interrupted_job = await repository.create_queued(
             NewQueuedTranscriptionJob(f"{_YOUTUBE_URL}&job=sql-interruption", ())
@@ -816,6 +838,7 @@ async def test_real_worker_rejects_reverse_fifo_delivery_before_private_executio
             _real_worker(
                 restartable_redis_broker.url,
                 worker_repository,
+                worker_engine,
                 tmp_path,
                 provider,
                 metadata_extractor,
@@ -835,6 +858,7 @@ async def test_real_worker_rejects_reverse_fifo_delivery_before_private_executio
         async with _real_worker(
             restartable_redis_broker.url,
             worker_repository,
+            worker_engine,
             tmp_path,
             provider,
             metadata_extractor,
@@ -887,6 +911,7 @@ async def test_duplicate_deliveries_start_attempts_once_across_terminal_outcomes
         async with _real_worker(
             restartable_redis_broker.url,
             worker_repository,
+            worker_engine,
             tmp_path,
             provider,
             metadata_extractor,
@@ -901,6 +926,7 @@ async def test_duplicate_deliveries_start_attempts_once_across_terminal_outcomes
         async with _real_worker(
             restartable_redis_broker.url,
             worker_repository,
+            worker_engine,
             tmp_path,
             provider,
             metadata_extractor,
@@ -919,6 +945,7 @@ async def test_duplicate_deliveries_start_attempts_once_across_terminal_outcomes
         async with _real_worker(
             restartable_redis_broker.url,
             worker_repository,
+            worker_engine,
             tmp_path,
             provider,
             metadata_extractor,
@@ -939,6 +966,7 @@ async def test_duplicate_deliveries_start_attempts_once_across_terminal_outcomes
         async with _real_worker(
             restartable_redis_broker.url,
             worker_repository,
+            worker_engine,
             tmp_path,
             provider,
             metadata_extractor,
@@ -957,6 +985,7 @@ async def test_duplicate_deliveries_start_attempts_once_across_terminal_outcomes
         async with _real_worker(
             restartable_redis_broker.url,
             worker_repository,
+            worker_engine,
             tmp_path,
             provider,
             metadata_extractor,
@@ -974,6 +1003,7 @@ async def test_duplicate_deliveries_start_attempts_once_across_terminal_outcomes
         async with _real_worker(
             restartable_redis_broker.url,
             worker_repository,
+            worker_engine,
             tmp_path,
             provider,
             metadata_extractor,

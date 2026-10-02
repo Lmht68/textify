@@ -45,6 +45,9 @@ _CHECK_CONSTRAINT_NAMES = {
     "transcription_job_attempt_publication_lease_pair_check",
     "transcription_job_attempt_lease_owner_uuid4_check",
     "transcription_job_attempt_dispatch_history_check",
+    "transcription_job_attempt_claim_state_check",
+    "transcription_job_attempt_worker_owner_uuid4_check",
+    "transcription_job_attempt_claim_lease_order_check",
     "transcription_job_exclusion_field_path_check",
     "transcription_job_result_platform_check",
     "transcription_job_result_method_check",
@@ -366,6 +369,170 @@ async def test_dispatch_recovery_migration_backfills_and_downgrades_attempts(
         await engine.dispose()
 
 
+async def test_execution_claim_migration_backfills_processing_jobs_and_round_trips(
+    monkeypatch: pytest.MonkeyPatch,
+    postgresql_database_url: str,
+) -> None:
+    """Backfill only processing attempts with immediately expired valid claims."""
+    monkeypatch.setenv("TEXTIFY_DATABASE_URL", postgresql_database_url)
+    alembic_config = Config(str(PROJECT_ROOT / "alembic.ini"))
+    engine = create_application_engine(postgresql_database_url)
+    now = datetime.now(UTC)
+    try:
+        await asyncio.to_thread(
+            command.upgrade,
+            alembic_config,
+            "0003_dispatch_recovery",
+        )
+        async with engine.begin() as connection:
+            queued_job_id = await _insert_job(
+                connection,
+                _queued_values(now),
+                with_execution_attempt=False,
+            )
+            processing_job_id = await _insert_job(
+                connection,
+                _queued_values(now)
+                | {
+                    "status": "processing",
+                    "started_at": now,
+                },
+                with_execution_attempt=False,
+            )
+            cancelling_job_id = await _insert_job(
+                connection,
+                _queued_values(now)
+                | {
+                    "status": "processing",
+                    "started_at": now,
+                    "cancellation_requested": True,
+                },
+                with_execution_attempt=False,
+            )
+            terminal_job_id = await _insert_job(
+                connection,
+                _queued_values(now)
+                | {
+                    "status": "finished",
+                    "outcome": "failed",
+                    "started_at": now,
+                    "finished_at": now,
+                    "error_code": "worker_interrupted",
+                    "error_message": "The worker stopped before completion.",
+                },
+                with_execution_attempt=False,
+            )
+            for job_id in (
+                queued_job_id,
+                processing_job_id,
+                cancelling_job_id,
+                terminal_job_id,
+            ):
+                await _insert_execution_attempt(connection, job_id, uuid4())
+
+        await asyncio.to_thread(command.upgrade, alembic_config, "head")
+        async with engine.connect() as connection:
+            claim_rows = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT job.id, job.status, job.cancellation_requested, "
+                            "job.started_at, attempt.worker_owner, "
+                            "attempt.last_heartbeat_at, "
+                            "attempt.claim_lease_expires_at "
+                            "FROM transcription_job AS job "
+                            "JOIN transcription_job_execution_attempt AS attempt "
+                            "ON attempt.job_id = job.id ORDER BY job.id"
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+
+        by_job_id = {row["id"]: row for row in claim_rows}
+        for job_id in (processing_job_id, cancelling_job_id):
+            row = by_job_id[job_id]
+            worker_owner = row["worker_owner"]
+            assert isinstance(worker_owner, UUID)
+            assert worker_owner.version == 4
+            assert row["last_heartbeat_at"] == row["started_at"]
+            assert row["claim_lease_expires_at"] == row["started_at"]
+        assert by_job_id[cancelling_job_id]["cancellation_requested"] is True
+        for job_id in (queued_job_id, terminal_job_id):
+            row = by_job_id[job_id]
+            assert row["worker_owner"] is None
+            assert row["last_heartbeat_at"] is None
+            assert row["claim_lease_expires_at"] is None
+
+        with pytest.raises(IntegrityError):
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE transcription_job_execution_attempt "
+                        "SET worker_owner = :worker_owner WHERE job_id = :job_id"
+                    ),
+                    {
+                        "worker_owner": uuid4(),
+                        "job_id": queued_job_id,
+                    },
+                )
+        with pytest.raises(IntegrityError):
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE transcription_job_execution_attempt "
+                        "SET worker_owner = :worker_owner, "
+                        "last_heartbeat_at = :last_heartbeat_at, "
+                        "claim_lease_expires_at = :claim_lease_expires_at "
+                        "WHERE job_id = :job_id"
+                    ),
+                    {
+                        "worker_owner": uuid1(),
+                        "last_heartbeat_at": now,
+                        "claim_lease_expires_at": now,
+                        "job_id": queued_job_id,
+                    },
+                )
+        with pytest.raises(IntegrityError):
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE transcription_job_execution_attempt "
+                        "SET worker_owner = :worker_owner, "
+                        "last_heartbeat_at = :last_heartbeat_at, "
+                        "claim_lease_expires_at = :claim_lease_expires_at "
+                        "WHERE job_id = :job_id"
+                    ),
+                    {
+                        "worker_owner": uuid4(),
+                        "last_heartbeat_at": now + timedelta(seconds=1),
+                        "claim_lease_expires_at": now,
+                        "job_id": queued_job_id,
+                    },
+                )
+
+        await asyncio.to_thread(
+            command.downgrade,
+            alembic_config,
+            "0003_dispatch_recovery",
+        )
+        async with engine.connect() as connection:
+            remaining_claim_columns = await connection.scalars(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = 'public' "
+                    "AND table_name = 'transcription_job_execution_attempt' "
+                    "AND column_name IN ("
+                    "'worker_owner', 'last_heartbeat_at', "
+                    "'claim_lease_expires_at')"
+                )
+            )
+        assert list(remaining_claim_columns) == []
+    finally:
+        await engine.dispose()
+
+
 async def test_postgresql_baseline_uses_required_native_schema(
     migrated_engine: AsyncEngine,
 ) -> None:
@@ -519,6 +686,13 @@ async def test_postgresql_baseline_uses_required_native_schema(
     assert execution_attempt_columns["dispatch_count"]["udt_name"] == "int8"
     assert execution_attempt_columns["dispatch_count"]["is_nullable"] == "NO"
     assert execution_attempt_columns["dispatch_count"]["column_default"] == "0"
+    assert execution_attempt_columns["worker_owner"]["udt_name"] == "uuid"
+    assert execution_attempt_columns["last_heartbeat_at"]["data_type"] == (
+        "timestamp with time zone"
+    )
+    assert execution_attempt_columns["claim_lease_expires_at"]["data_type"] == (
+        "timestamp with time zone"
+    )
     for timestamp_column in (
         "submitted_at",
         "queue_deadline_at",
@@ -531,10 +705,10 @@ async def test_postgresql_baseline_uses_required_native_schema(
         "transcription_job_status_queue_deadline_at_idx",
         "transcription_job_status_finished_at_idx",
     }
-    assert (
-        "transcription_job_attempt_next_dispatch_at_job_id_idx"
-        in execution_attempt_index_names
-    )
+    assert execution_attempt_index_names >= {
+        "transcription_job_attempt_next_dispatch_at_job_id_idx",
+        "transcription_job_attempt_claim_lease_expires_at_job_id_idx",
+    }
     assert check_constraint_names == _CHECK_CONSTRAINT_NAMES
     assert foreign_keys == {
         ("transcription_job_execution_attempt", "transcription_job", "c"),

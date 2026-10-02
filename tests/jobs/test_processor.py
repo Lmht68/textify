@@ -4,8 +4,9 @@ from uuid import uuid4
 
 import pytest
 
-from textify.jobs.types import ClaimedTranscriptionJob, JobDispatch
+from textify.jobs.types import ClaimedTranscriptionJob, ExecutionClaim, JobDispatch
 from textify.transcription.exceptions import TranscriptionFailedError
+from textify.transcription.service import TranscriptionExecutionControl
 from textify.transcription.types import (
     Platform,
     Segment,
@@ -17,50 +18,66 @@ from textify.transcription.types import (
 
 
 class RecordingExecutionRepository:
-    """Expose one claimed job and record terminal publication attempts."""
+    """Record terminal publication attempts for one claimed execution."""
 
-    def __init__(self, claimed_job: ClaimedTranscriptionJob | None) -> None:
-        """Initialize the private claim and empty terminal publication records."""
-        self._claimed_job = claimed_job
-        self.claimed_dispatches: list[JobDispatch] = []
-        self.successes: list[tuple[JobDispatch, dict[str, object]]] = []
-        self.failures: list[tuple[JobDispatch, str, str]] = []
-        self.cancelled_dispatches: list[JobDispatch] = []
+    def __init__(self) -> None:
+        """Initialize empty terminal publication records."""
+        self.successes: list[tuple[ExecutionClaim, dict[str, object]]] = []
+        self.failures: list[tuple[ExecutionClaim, str, str]] = []
+        self.cancelled_claims: list[ExecutionClaim] = []
         self.success_published = True
         self.failure_published = True
 
-    async def claim_dispatch(
-        self, dispatch: JobDispatch
-    ) -> ClaimedTranscriptionJob | None:
-        """Return the configured claim only for its exact dispatch."""
-        self.claimed_dispatches.append(dispatch)
-        if self._claimed_job is None or dispatch != self._claimed_job.dispatch:
-            return None
-        return self._claimed_job
-
     async def publish_success(
         self,
-        dispatch: JobDispatch,
+        claim: ExecutionClaim,
         projected_result: dict[str, object],
     ) -> bool:
         """Record the requested success publication outcome."""
-        self.successes.append((dispatch, projected_result))
+        self.successes.append((claim, projected_result))
         return self.success_published
 
     async def publish_failure(
         self,
-        dispatch: JobDispatch,
+        claim: ExecutionClaim,
         error_code: str,
         error_message: str,
     ) -> bool:
         """Record the requested failure publication outcome."""
-        self.failures.append((dispatch, error_code, error_message))
+        self.failures.append((claim, error_code, error_message))
         return self.failure_published
 
-    async def publish_cancelled(self, dispatch: JobDispatch) -> bool:
+    async def publish_cancelled(self, claim: ExecutionClaim) -> bool:
         """Record cancellation publication after provider cleanup."""
-        self.cancelled_dispatches.append(dispatch)
+        self.cancelled_claims.append(claim)
         return True
+
+
+class RecordingClaimManager:
+    """Expose one configured claim and record its eventual release."""
+
+    def __init__(self, claimed_job: ClaimedTranscriptionJob | None) -> None:
+        """Initialize a single configurable durable claim."""
+        self._claimed_job = claimed_job
+        self.claimed_dispatches: list[JobDispatch] = []
+        self.controls: list[TranscriptionExecutionControl] = []
+        self.released_claims: list[ExecutionClaim] = []
+
+    async def claim(
+        self,
+        dispatch: JobDispatch,
+        control: TranscriptionExecutionControl,
+    ) -> ClaimedTranscriptionJob | None:
+        """Return the configured claim only for its exact dispatch."""
+        self.claimed_dispatches.append(dispatch)
+        self.controls.append(control)
+        if self._claimed_job is None or dispatch != self._claimed_job.claim.dispatch:
+            return None
+        return self._claimed_job
+
+    def release(self, claim: ExecutionClaim) -> None:
+        """Record completion of one manager-owned Execution Claim."""
+        self.released_claims.append(claim)
 
 
 class ResultExecutor:
@@ -114,7 +131,7 @@ def _claimed_job(dispatch: JobDispatch) -> ClaimedTranscriptionJob:
         Private inputs for one execution.
     """
     return ClaimedTranscriptionJob(
-        dispatch=dispatch,
+        claim=ExecutionClaim(dispatch, uuid4()),
         submitted_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
         exclusions=(),
     )
@@ -151,16 +168,20 @@ async def test_processor_ignores_stale_dispatch_before_provider_execution() -> N
     from textify.jobs.processor import TranscriptionJobProcessor
 
     dispatch = _dispatch()
-    repository = RecordingExecutionRepository(claimed_job=None)
+    repository = RecordingExecutionRepository()
+    claim_manager = RecordingClaimManager(claimed_job=None)
     executor = ResultExecutor()
 
-    await TranscriptionJobProcessor(repository, executor).process(dispatch)
+    await TranscriptionJobProcessor(repository, executor, claim_manager).process(
+        dispatch
+    )
 
-    assert repository.claimed_dispatches == [dispatch]
+    assert claim_manager.claimed_dispatches == [dispatch]
+    assert claim_manager.released_claims == []
     assert executor.calls == 0
     assert repository.successes == []
     assert repository.failures == []
-    assert repository.cancelled_dispatches == []
+    assert repository.cancelled_claims == []
 
 
 @pytest.mark.asyncio
@@ -169,15 +190,19 @@ async def test_processor_publishes_projected_success_for_its_claim() -> None:
     from textify.jobs.processor import TranscriptionJobProcessor
 
     dispatch = _dispatch()
-    repository = RecordingExecutionRepository(_claimed_job(dispatch))
+    claimed_job = _claimed_job(dispatch)
+    repository = RecordingExecutionRepository()
+    claim_manager = RecordingClaimManager(claimed_job)
     executor = ResultExecutor()
 
-    await TranscriptionJobProcessor(repository, executor).process(dispatch)
+    await TranscriptionJobProcessor(repository, executor, claim_manager).process(
+        dispatch
+    )
 
     assert executor.calls == 1
     assert repository.successes == [
         (
-            dispatch,
+            claimed_job.claim,
             {
                 "source": {
                     "platform": Platform.YOUTUBE,
@@ -198,7 +223,8 @@ async def test_processor_publishes_projected_success_for_its_claim() -> None:
         )
     ]
     assert repository.failures == []
-    assert repository.cancelled_dispatches == []
+    assert repository.cancelled_claims == []
+    assert claim_manager.released_claims == [claimed_job.claim]
 
 
 @pytest.mark.asyncio
@@ -207,21 +233,26 @@ async def test_processor_publishes_safe_failure_for_provider_error() -> None:
     from textify.jobs.processor import TranscriptionJobProcessor
 
     dispatch = _dispatch()
-    repository = RecordingExecutionRepository(_claimed_job(dispatch))
+    claimed_job = _claimed_job(dispatch)
+    repository = RecordingExecutionRepository()
+    claim_manager = RecordingClaimManager(claimed_job)
     executor = FailingExecutor()
 
-    await TranscriptionJobProcessor(repository, executor).process(dispatch)
+    await TranscriptionJobProcessor(repository, executor, claim_manager).process(
+        dispatch
+    )
 
     assert executor.calls == 1
     assert repository.successes == []
     assert repository.failures == [
         (
-            dispatch,
+            claimed_job.claim,
             "transcription_failed",
             "The source could not be transcribed.",
         )
     ]
-    assert repository.cancelled_dispatches == []
+    assert repository.cancelled_claims == []
+    assert claim_manager.released_claims == [claimed_job.claim]
 
 
 @pytest.mark.asyncio
@@ -232,11 +263,16 @@ async def test_processor_publishes_cancellation_when_terminal_write_loses_race()
     from textify.jobs.processor import TranscriptionJobProcessor
 
     dispatch = _dispatch()
-    repository = RecordingExecutionRepository(_claimed_job(dispatch))
+    claimed_job = _claimed_job(dispatch)
+    repository = RecordingExecutionRepository()
+    claim_manager = RecordingClaimManager(claimed_job)
     repository.success_published = False
     executor = ResultExecutor()
 
-    await TranscriptionJobProcessor(repository, executor).process(dispatch)
+    await TranscriptionJobProcessor(repository, executor, claim_manager).process(
+        dispatch
+    )
 
-    assert repository.successes[0][0] == dispatch
-    assert repository.cancelled_dispatches == [dispatch]
+    assert repository.successes[0][0] == claimed_job.claim
+    assert repository.cancelled_claims == [claimed_job.claim]
+    assert claim_manager.released_claims == [claimed_job.claim]

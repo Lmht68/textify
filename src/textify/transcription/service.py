@@ -222,6 +222,7 @@ class TranscriptionExecutor:
                     caption_transcript = await self._acquire_youtube_caption(
                         video_id,
                         normalized_metadata.declared_language,
+                        control.provider_cancellation,
                         include_segments=include_segments,
                     )
                     _raise_if_cancellation_requested(control)
@@ -277,16 +278,32 @@ class TranscriptionExecutor:
         self,
         video_id: str,
         declared_language: str | None,
+        cancellation_event: threading.Event,
         *,
         include_segments: bool = True,
     ) -> Transcript | None:
-        """Acquire optional YouTube captions without blocking the event loop."""
+        """Acquire optional YouTube captions without blocking the event loop.
+
+        Args:
+            video_id: Stable external YouTube source identifier.
+            declared_language: Canonical provider-declared source language.
+            cancellation_event: Cooperative worker cancellation signal.
+            include_segments: Whether to retain normalized timed segments.
+
+        Returns:
+            A usable caption transcript, or ``None`` when captions are unavailable.
+
+        Raises:
+            TranscriptionCancellationRequestedError: If Cancellation wins during
+                caption acquisition.
+        """
         try:
             return await asyncio.to_thread(
                 acquisition.acquire_transcript,
                 self._caption_provider,
                 video_id,
                 declared_language,
+                cancellation_event,
                 include_segments=include_segments,
             )
         except acquisition._CaptionProviderTimeout:

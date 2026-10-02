@@ -47,10 +47,12 @@ from textify.jobs.contracts import (
     TranscriptionJobCapacityError,
     TranscriptionJobStoreUnavailableError,
 )
-from textify.jobs.exceptions import QueueTimeoutError
+from textify.jobs.exceptions import QueueTimeoutError, WorkerInterruptedError
 from textify.jobs.types import (
     CancelledTranscriptionJob,
     ClaimedTranscriptionJob,
+    ClaimHeartbeat,
+    ExecutionClaim,
     FailedTranscriptionJob,
     JobDispatch,
     JobOutcome,
@@ -189,6 +191,9 @@ transcription_job_execution_attempt = Table(
         nullable=False,
         server_default=text("0"),
     ),
+    Column("worker_owner", PostgreSQLUUID(as_uuid=True)),
+    Column("last_heartbeat_at", DateTime(timezone=True)),
+    Column("claim_lease_expires_at", DateTime(timezone=True)),
     UniqueConstraint(
         "execution_attempt_token",
         name="transcription_job_execution_attempt_token_key",
@@ -214,12 +219,38 @@ transcription_job_execution_attempt = Table(
         "(dispatch_count > 0 AND last_dispatched_at IS NOT NULL))",
         name="transcription_job_attempt_dispatch_history_check",
     ),
+    CheckConstraint(
+        "((worker_owner IS NULL AND last_heartbeat_at IS NULL "
+        "AND claim_lease_expires_at IS NULL) OR "
+        "(worker_owner IS NOT NULL AND last_heartbeat_at IS NOT NULL "
+        "AND claim_lease_expires_at IS NOT NULL))",
+        name="transcription_job_attempt_claim_state_check",
+    ),
+    CheckConstraint(
+        "worker_owner IS NULL OR "
+        "((get_byte(uuid_send(worker_owner), 6) & 240) = 64 "
+        "AND (get_byte(uuid_send(worker_owner), 8) & 192) = 128)",
+        name="transcription_job_attempt_worker_owner_uuid4_check",
+    ),
+    CheckConstraint(
+        "last_heartbeat_at <= claim_lease_expires_at",
+        name="transcription_job_attempt_claim_lease_order_check",
+    ),
 )
 
 Index(
     "transcription_job_attempt_next_dispatch_at_job_id_idx",
     transcription_job_execution_attempt.c.next_dispatch_at,
     transcription_job_execution_attempt.c.job_id,
+)
+
+Index(
+    "transcription_job_attempt_claim_lease_expires_at_job_id_idx",
+    transcription_job_execution_attempt.c.claim_lease_expires_at,
+    transcription_job_execution_attempt.c.job_id,
+    postgresql_where=transcription_job_execution_attempt.c.claim_lease_expires_at.is_not(
+        None
+    ),
 )
 
 transcription_job_exclusion = Table(
@@ -766,18 +797,27 @@ class PostgresTranscriptionJobRepository:
     async def claim_dispatch(
         self,
         dispatch: JobDispatch,
+        worker_owner: UUID,
+        lease_duration: timedelta,
     ) -> ClaimedTranscriptionJob | None:
         """Claim one delivered Job Dispatch before loading private execution inputs.
 
         Args:
             dispatch: Private identifier and token supplied by the broker.
+            worker_owner: UUIDv4 identity for the worker process claiming the attempt.
+            lease_duration: Positive duration before an unrenewed claim expires.
 
         Returns:
             Private execution inputs for one committed claim, or ``None`` when stale.
 
         Raises:
             TranscriptionJobStoreUnavailableError: If PostgreSQL cannot claim safely.
+            ValueError: If the worker owner or lease duration is invalid.
         """
+        _require_uuid4(dispatch.execution_attempt_token, "execution_attempt_token")
+        _require_uuid4(worker_owner, "worker_owner")
+        _require_positive_duration(lease_duration, "lease_duration")
+        claim = ExecutionClaim(dispatch=dispatch, worker_owner=worker_owner)
         attempt_matches_dispatch = exists(
             select(transcription_job_execution_attempt.c.job_id).where(
                 transcription_job_execution_attempt.c.job_id
@@ -789,6 +829,7 @@ class PostgresTranscriptionJobRepository:
         try:
             async with self._serialized_lifecycle_transaction() as connection:
                 now = _as_utc(self._clock())
+                claim_lease_expires_at = now + lease_duration
                 timeout_transition = await connection.execute(
                     update(transcription_job)
                     .where(
@@ -849,7 +890,24 @@ class PostgresTranscriptionJobRepository:
                 if claim_transition.rowcount != 1:
                     raise TranscriptionJobStoreUnavailableError()
 
-            async with self._engine.connect() as connection:
+                ownership_transition = await connection.execute(
+                    update(transcription_job_execution_attempt)
+                    .where(
+                        transcription_job_execution_attempt.c.job_id
+                        == dispatch.internal_job_id,
+                        transcription_job_execution_attempt.c.execution_attempt_token
+                        == dispatch.execution_attempt_token,
+                        transcription_job_execution_attempt.c.worker_owner.is_(None),
+                    )
+                    .values(
+                        worker_owner=worker_owner,
+                        last_heartbeat_at=now,
+                        claim_lease_expires_at=claim_lease_expires_at,
+                    )
+                )
+                if ownership_transition.rowcount != 1:
+                    raise TranscriptionJobStoreUnavailableError()
+
                 claimed_row = (
                     (
                         await connection.execute(
@@ -866,8 +924,9 @@ class PostgresTranscriptionJobRepository:
                                 transcription_job.c.id == dispatch.internal_job_id,
                                 transcription_job_execution_attempt.c.execution_attempt_token
                                 == dispatch.execution_attempt_token,
+                                transcription_job_execution_attempt.c.worker_owner
+                                == worker_owner,
                                 transcription_job.c.status == "processing",
-                                transcription_job.c.cancellation_requested.is_(False),
                             )
                         )
                     )
@@ -875,7 +934,7 @@ class PostgresTranscriptionJobRepository:
                     .one_or_none()
                 )
                 if claimed_row is None:
-                    return None
+                    raise TranscriptionJobStoreUnavailableError()
                 internal_id, submitted_url = _claimed_input_from_row(claimed_row)
                 if internal_id != dispatch.internal_job_id:
                     raise TranscriptionJobStoreUnavailableError()
@@ -884,7 +943,237 @@ class PostgresTranscriptionJobRepository:
             raise
         except (OSError, SQLAlchemyError) as exc:
             raise TranscriptionJobStoreUnavailableError() from exc
-        return _claimed_job(dispatch, submitted_url, exclusions)
+        return _claimed_job(claim, submitted_url, exclusions)
+
+    async def heartbeat_claims(
+        self,
+        claims: tuple[ExecutionClaim, ...],
+        lease_duration: timedelta,
+    ) -> tuple[ClaimHeartbeat, ...]:
+        """Renew matching claims and return their authoritative Cancellation state.
+
+        Args:
+            claims: Bounded active worker claims to renew.
+            lease_duration: Positive duration before an unrenewed claim expires.
+
+        Returns:
+            Renewed claims only, each with durable Cancellation state.
+
+        Raises:
+            TranscriptionJobStoreUnavailableError: If PostgreSQL cannot renew safely.
+            ValueError: If a claim owner, token, or lease duration is invalid.
+        """
+        _require_positive_duration(lease_duration, "lease_duration")
+        if not claims:
+            return ()
+        for claim in claims:
+            _require_uuid4(
+                claim.dispatch.execution_attempt_token,
+                "execution_attempt_token",
+            )
+            _require_uuid4(claim.worker_owner, "worker_owner")
+
+        claim_keys = tuple(
+            (
+                claim.dispatch.internal_job_id,
+                claim.dispatch.execution_attempt_token,
+                claim.worker_owner,
+            )
+            for claim in claims
+        )
+        claims_by_key = {
+            (
+                claim.dispatch.internal_job_id,
+                claim.dispatch.execution_attempt_token,
+                claim.worker_owner,
+            ): claim
+            for claim in claims
+        }
+        try:
+            async with self._engine.begin() as connection:
+                now = _as_utc(self._clock())
+                result = await connection.execute(
+                    update(transcription_job_execution_attempt)
+                    .where(
+                        transcription_job.c.id
+                        == transcription_job_execution_attempt.c.job_id,
+                        transcription_job.c.status == "processing",
+                        transcription_job_execution_attempt.c.claim_lease_expires_at
+                        > now,
+                        tuple_(
+                            transcription_job_execution_attempt.c.job_id,
+                            transcription_job_execution_attempt.c.execution_attempt_token,
+                            transcription_job_execution_attempt.c.worker_owner,
+                        ).in_(claim_keys),
+                    )
+                    .values(
+                        last_heartbeat_at=now,
+                        claim_lease_expires_at=now + lease_duration,
+                    )
+                    .returning(
+                        transcription_job_execution_attempt.c.job_id.label("id"),
+                        transcription_job_execution_attempt.c.execution_attempt_token,
+                        transcription_job_execution_attempt.c.worker_owner,
+                        transcription_job.c.cancellation_requested,
+                    )
+                )
+                heartbeat_rows = result.mappings().all()
+        except (OSError, SQLAlchemyError) as exc:
+            raise TranscriptionJobStoreUnavailableError() from exc
+
+        renewed_cancellations: dict[ExecutionClaim, bool] = {}
+        for row in heartbeat_rows:
+            dispatch = _dispatch_from_row(row)
+            worker_owner = row["worker_owner"]
+            cancellation_requested = row["cancellation_requested"]
+            if (
+                not isinstance(worker_owner, UUID)
+                or worker_owner.version != 4
+                or not isinstance(cancellation_requested, bool)
+            ):
+                raise TranscriptionJobStoreUnavailableError()
+            claim_key = (
+                dispatch.internal_job_id,
+                dispatch.execution_attempt_token,
+                worker_owner,
+            )
+            matched_claim = claims_by_key.get(claim_key)
+            if matched_claim is None:
+                raise TranscriptionJobStoreUnavailableError()
+            renewed_cancellations[matched_claim] = cancellation_requested
+        return tuple(
+            ClaimHeartbeat(
+                claim=claim,
+                cancellation_requested=renewed_cancellations[claim],
+            )
+            for claim in claims
+            if claim in renewed_cancellations
+        )
+
+    async def recover_expired_claims(self, limit: int) -> int:
+        """Finish a bounded ordered batch of expired processing claims.
+
+        Args:
+            limit: Maximum expired Execution Attempts to terminalize.
+
+        Returns:
+            Number of claims finished as cancelled or worker-interrupted.
+
+        Raises:
+            TranscriptionJobStoreUnavailableError: If PostgreSQL cannot recover safely.
+            ValueError: If ``limit`` is not positive.
+        """
+        _require_positive_limit(limit)
+        try:
+            async with self._serialized_lifecycle_transaction() as connection:
+                now = _as_utc(self._clock())
+                expired_rows = (
+                    (
+                        await connection.execute(
+                            select(
+                                transcription_job.c.id,
+                                transcription_job.c.cancellation_requested,
+                            )
+                            .join(
+                                transcription_job_execution_attempt,
+                                transcription_job.c.id
+                                == transcription_job_execution_attempt.c.job_id,
+                            )
+                            .where(
+                                transcription_job.c.status == "processing",
+                                transcription_job_execution_attempt.c.claim_lease_expires_at
+                                <= now,
+                            )
+                            .order_by(
+                                transcription_job_execution_attempt.c.claim_lease_expires_at,
+                                transcription_job.c.id,
+                            )
+                            .limit(limit)
+                            .with_for_update(
+                                of=transcription_job_execution_attempt,
+                                skip_locked=True,
+                            )
+                        )
+                    )
+                    .mappings()
+                    .all()
+                )
+                if not expired_rows:
+                    return 0
+
+                cancelled_job_ids: list[int] = []
+                interrupted_job_ids: list[int] = []
+                for row in expired_rows:
+                    job_id = _internal_id_from_row(row)
+                    cancellation_requested = row["cancellation_requested"]
+                    if not isinstance(cancellation_requested, bool):
+                        raise TranscriptionJobStoreUnavailableError()
+                    if cancellation_requested:
+                        cancelled_job_ids.append(job_id)
+                    else:
+                        interrupted_job_ids.append(job_id)
+
+                transitioned_count = 0
+                if cancelled_job_ids:
+                    cancelled_transition = await connection.execute(
+                        update(transcription_job)
+                        .where(
+                            transcription_job.c.id.in_(cancelled_job_ids),
+                            transcription_job.c.status == "processing",
+                            transcription_job.c.cancellation_requested.is_(True),
+                        )
+                        .values(
+                            status="finished",
+                            outcome="cancelled",
+                            finished_at=now,
+                        )
+                    )
+                    if cancelled_transition.rowcount != len(cancelled_job_ids):
+                        raise TranscriptionJobStoreUnavailableError()
+                    transitioned_count += cancelled_transition.rowcount
+                if interrupted_job_ids:
+                    interrupted_transition = await connection.execute(
+                        update(transcription_job)
+                        .where(
+                            transcription_job.c.id.in_(interrupted_job_ids),
+                            transcription_job.c.status == "processing",
+                            transcription_job.c.cancellation_requested.is_(False),
+                        )
+                        .values(
+                            status="finished",
+                            outcome="failed",
+                            finished_at=now,
+                            error_code=WorkerInterruptedError.code,
+                            error_message=WorkerInterruptedError.message,
+                        )
+                    )
+                    if interrupted_transition.rowcount != len(interrupted_job_ids):
+                        raise TranscriptionJobStoreUnavailableError()
+                    transitioned_count += interrupted_transition.rowcount
+
+                expired_job_ids = tuple(cancelled_job_ids + interrupted_job_ids)
+                cleared_claims = await connection.execute(
+                    update(transcription_job_execution_attempt)
+                    .where(
+                        transcription_job_execution_attempt.c.job_id.in_(
+                            expired_job_ids
+                        ),
+                        transcription_job_execution_attempt.c.claim_lease_expires_at
+                        <= now,
+                    )
+                    .values(
+                        worker_owner=None,
+                        last_heartbeat_at=None,
+                        claim_lease_expires_at=None,
+                    )
+                )
+                if cleared_claims.rowcount != transitioned_count:
+                    raise TranscriptionJobStoreUnavailableError()
+        except TranscriptionJobStoreUnavailableError:
+            raise
+        except (OSError, SQLAlchemyError) as exc:
+            raise TranscriptionJobStoreUnavailableError() from exc
+        return transitioned_count
 
     async def delete_expired_terminal_jobs(self) -> None:
         """Delete terminal jobs whose finished time has reached retention cutoff.
@@ -1020,37 +1309,46 @@ class PostgresTranscriptionJobRepository:
         except (OSError, SQLAlchemyError) as exc:
             raise TranscriptionJobStoreUnavailableError() from exc
 
-    async def publish_cancelled(self, dispatch: JobDispatch) -> bool:
-        """Publish cancellation after active provider work has cleaned up.
+    async def publish_cancelled(self, claim: ExecutionClaim) -> bool:
+        """Publish Cancellation after active provider work has cleaned up.
 
         Args:
-            dispatch: Private identifier and token from the committed claim.
+            claim: Exact worker-owned claim that completed provider cleanup.
 
         Returns:
-            ``True`` when cancellation committed the terminal outcome, otherwise
-            ``False`` when another terminal transition owns the job.
+            ``True`` when Cancellation committed the terminal outcome, otherwise
+            ``False`` when the claim is stale or another transition owns the job.
 
         Raises:
             TranscriptionJobStoreUnavailableError: If PostgreSQL cannot publish safely.
+            ValueError: If the claim token or worker owner is invalid.
         """
-        attempt_matches_dispatch = exists(
-            select(transcription_job_execution_attempt.c.job_id).where(
-                transcription_job_execution_attempt.c.job_id
-                == dispatch.internal_job_id,
-                transcription_job_execution_attempt.c.execution_attempt_token
-                == dispatch.execution_attempt_token,
-            )
+        _require_uuid4(
+            claim.dispatch.execution_attempt_token, "execution_attempt_token"
         )
+        _require_uuid4(claim.worker_owner, "worker_owner")
         try:
             async with self._serialized_lifecycle_transaction() as connection:
                 finished_at = _as_utc(self._clock())
+                active_claim = exists(
+                    select(transcription_job_execution_attempt.c.job_id).where(
+                        transcription_job_execution_attempt.c.job_id
+                        == claim.dispatch.internal_job_id,
+                        transcription_job_execution_attempt.c.execution_attempt_token
+                        == claim.dispatch.execution_attempt_token,
+                        transcription_job_execution_attempt.c.worker_owner
+                        == claim.worker_owner,
+                        transcription_job_execution_attempt.c.claim_lease_expires_at
+                        > finished_at,
+                    )
+                )
                 transition = await connection.execute(
                     update(transcription_job)
                     .where(
-                        transcription_job.c.id == dispatch.internal_job_id,
+                        transcription_job.c.id == claim.dispatch.internal_job_id,
                         transcription_job.c.status == "processing",
                         transcription_job.c.cancellation_requested.is_(True),
-                        attempt_matches_dispatch,
+                        active_claim,
                     )
                     .values(
                         status="finished",
@@ -1060,6 +1358,7 @@ class PostgresTranscriptionJobRepository:
                 )
                 if transition.rowcount != 1:
                     return False
+                await self._clear_execution_claim(connection, claim)
         except TranscriptionJobStoreUnavailableError:
             raise
         except (OSError, SQLAlchemyError) as exc:
@@ -1068,43 +1367,58 @@ class PostgresTranscriptionJobRepository:
 
     async def publish_success(
         self,
-        dispatch: JobDispatch,
+        claim: ExecutionClaim,
         projected_result: TranscriptionResponse,
     ) -> bool:
         """Atomically persist one projected result and succeeded terminal transition.
 
         Args:
-            dispatch: Private identifier and token from the committed claim.
+            claim: Exact worker-owned claim that produced the result.
             projected_result: Fully projected and validated public result.
 
         Returns:
             ``True`` when this consumer committed the successful terminal outcome,
-            otherwise ``False`` when another terminal transition owns the job.
+            otherwise ``False`` when the claim is stale or Cancellation was accepted.
 
         Raises:
             TranscriptionJobStoreUnavailableError: If PostgreSQL cannot publish safely.
+            ValueError: If the claim token or worker owner is invalid.
         """
+        _require_uuid4(
+            claim.dispatch.execution_attempt_token, "execution_attempt_token"
+        )
+        _require_uuid4(claim.worker_owner, "worker_owner")
         validated_result = _validate_response(projected_result)
-        result_values = _result_values(dispatch.internal_job_id, validated_result)
-        segment_values = _segment_values(dispatch.internal_job_id, validated_result)
-        attempt_matches_dispatch = exists(
-            select(transcription_job_execution_attempt.c.job_id).where(
-                transcription_job_execution_attempt.c.job_id
-                == dispatch.internal_job_id,
-                transcription_job_execution_attempt.c.execution_attempt_token
-                == dispatch.execution_attempt_token,
-            )
+        result_values = _result_values(
+            claim.dispatch.internal_job_id,
+            validated_result,
+        )
+        segment_values = _segment_values(
+            claim.dispatch.internal_job_id,
+            validated_result,
         )
         try:
             async with self._serialized_lifecycle_transaction() as connection:
                 finished_at = _as_utc(self._clock())
+                active_claim = exists(
+                    select(transcription_job_execution_attempt.c.job_id).where(
+                        transcription_job_execution_attempt.c.job_id
+                        == claim.dispatch.internal_job_id,
+                        transcription_job_execution_attempt.c.execution_attempt_token
+                        == claim.dispatch.execution_attempt_token,
+                        transcription_job_execution_attempt.c.worker_owner
+                        == claim.worker_owner,
+                        transcription_job_execution_attempt.c.claim_lease_expires_at
+                        > finished_at,
+                    )
+                )
                 transition = await connection.execute(
                     update(transcription_job)
                     .where(
-                        transcription_job.c.id == dispatch.internal_job_id,
+                        transcription_job.c.id == claim.dispatch.internal_job_id,
                         transcription_job.c.status == "processing",
                         transcription_job.c.cancellation_requested.is_(False),
-                        attempt_matches_dispatch,
+                        active_claim,
                     )
                     .values(
                         status="finished",
@@ -1114,6 +1428,7 @@ class PostgresTranscriptionJobRepository:
                 )
                 if transition.rowcount != 1:
                     return False
+                await self._clear_execution_claim(connection, claim)
                 await connection.execute(
                     insert(transcription_job_result).values(result_values)
                 )
@@ -1130,44 +1445,53 @@ class PostgresTranscriptionJobRepository:
 
     async def publish_failure(
         self,
-        dispatch: JobDispatch,
+        claim: ExecutionClaim,
         error_code: str,
         error_message: str,
     ) -> bool:
         """Atomically persist one safe failed terminal transition.
 
         Args:
-            dispatch: Private identifier and token from the committed claim.
+            claim: Exact worker-owned claim that encountered the failure.
             error_code: Validated stable public error code.
             error_message: Validated safe nonempty public error message.
 
         Returns:
             ``True`` when this consumer committed the failed terminal outcome,
-            otherwise ``False`` when another terminal transition owns the job.
+            otherwise ``False`` when the claim is stale or Cancellation was accepted.
 
         Raises:
             TranscriptionJobStoreUnavailableError: If validation or PostgreSQL
                 publication cannot complete safely.
+            ValueError: If the claim token or worker owner is invalid.
         """
-        error = _validate_error_detail(error_code, error_message)
-        attempt_matches_dispatch = exists(
-            select(transcription_job_execution_attempt.c.job_id).where(
-                transcription_job_execution_attempt.c.job_id
-                == dispatch.internal_job_id,
-                transcription_job_execution_attempt.c.execution_attempt_token
-                == dispatch.execution_attempt_token,
-            )
+        _require_uuid4(
+            claim.dispatch.execution_attempt_token, "execution_attempt_token"
         )
+        _require_uuid4(claim.worker_owner, "worker_owner")
+        error = _validate_error_detail(error_code, error_message)
         try:
             async with self._serialized_lifecycle_transaction() as connection:
                 finished_at = _as_utc(self._clock())
+                active_claim = exists(
+                    select(transcription_job_execution_attempt.c.job_id).where(
+                        transcription_job_execution_attempt.c.job_id
+                        == claim.dispatch.internal_job_id,
+                        transcription_job_execution_attempt.c.execution_attempt_token
+                        == claim.dispatch.execution_attempt_token,
+                        transcription_job_execution_attempt.c.worker_owner
+                        == claim.worker_owner,
+                        transcription_job_execution_attempt.c.claim_lease_expires_at
+                        > finished_at,
+                    )
+                )
                 transition = await connection.execute(
                     update(transcription_job)
                     .where(
-                        transcription_job.c.id == dispatch.internal_job_id,
+                        transcription_job.c.id == claim.dispatch.internal_job_id,
                         transcription_job.c.status == "processing",
                         transcription_job.c.cancellation_requested.is_(False),
-                        attempt_matches_dispatch,
+                        active_claim,
                     )
                     .values(
                         status="finished",
@@ -1179,11 +1503,42 @@ class PostgresTranscriptionJobRepository:
                 )
                 if transition.rowcount != 1:
                     return False
+                await self._clear_execution_claim(connection, claim)
         except TranscriptionJobStoreUnavailableError:
             raise
         except (OSError, SQLAlchemyError) as exc:
             raise TranscriptionJobStoreUnavailableError() from exc
         return True
+
+    async def _clear_execution_claim(
+        self,
+        connection: AsyncConnection,
+        claim: ExecutionClaim,
+    ) -> None:
+        """Clear a terminalized claim within its winning lifecycle transaction."""
+        cleared = await connection.execute(
+            update(transcription_job_execution_attempt)
+            .where(
+                transcription_job_execution_attempt.c.job_id
+                == claim.dispatch.internal_job_id,
+                transcription_job_execution_attempt.c.execution_attempt_token
+                == claim.dispatch.execution_attempt_token,
+                transcription_job_execution_attempt.c.worker_owner
+                == claim.worker_owner,
+            )
+            .values(
+                worker_owner=None,
+                last_heartbeat_at=None,
+                claim_lease_expires_at=None,
+            )
+            .returning(transcription_job_execution_attempt.c.job_id.label("id"))
+        )
+        cleared_row = cleared.mappings().one_or_none()
+        if (
+            cleared_row is None
+            or _internal_id_from_row(cleared_row) != claim.dispatch.internal_job_id
+        ):
+            raise TranscriptionJobStoreUnavailableError()
 
     async def get_job(self, public_id: UUID) -> TranscriptionJob | None:
         """Read one safe Transcription Job snapshot by bearer capability.
@@ -1337,13 +1692,13 @@ def _claimed_input_from_row(row: RowMapping) -> tuple[int, str]:
 
 
 def _claimed_job(
-    dispatch: JobDispatch,
+    claim: ExecutionClaim,
     submitted_url: str,
     exclusions: tuple[ResponseFieldPath, ...],
 ) -> ClaimedTranscriptionJob:
     """Construct one private committed claim snapshot."""
     return ClaimedTranscriptionJob(
-        dispatch=dispatch,
+        claim=claim,
         submitted_url=submitted_url,
         exclusions=exclusions,
     )

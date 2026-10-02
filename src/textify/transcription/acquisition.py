@@ -806,6 +806,7 @@ def acquire_transcript(
     provider: CaptionProvider,
     video_id: str,
     declared_language: str | None,
+    cancellation_event: threading.Event,
     *,
     include_segments: bool = True,
 ) -> Transcript | None:
@@ -815,6 +816,7 @@ def acquire_transcript(
         provider: Caption provider boundary.
         video_id: Stable YouTube video identity.
         declared_language: Source's canonical provider-declared language.
+        cancellation_event: Cooperative signal that prevents more caption work.
         include_segments: Whether to retain normalized timed segments.
 
     Returns:
@@ -822,6 +824,7 @@ def acquire_transcript(
         declaration is absent or ambiguous or no original track is usable.
 
     Raises:
+        TranscriptionCancellationRequestedError: If cancellation is requested.
         _CaptionProviderFailure: If track listing or a candidate fetch fails.
         _CaptionProviderTimeout: If track listing or a candidate fetch times out.
     """
@@ -829,9 +832,13 @@ def acquire_transcript(
     if normalized_declaration is None:
         return None
 
+    _raise_if_caption_cancellation_requested(cancellation_event)
     try:
         tracks = provider.list_tracks(video_id)
+        _raise_if_caption_cancellation_requested(cancellation_event)
         ranked_tracks = _rank_caption_tracks(tracks, normalized_declaration)
+    except TranscriptionCancellationRequestedError:
+        raise
     except _CaptionProviderTimeout:
         raise
     except _CaptionProviderFailure:
@@ -852,13 +859,18 @@ def acquire_transcript(
         raise _CaptionProviderFailure from exc
 
     for track in ranked_tracks:
+        _raise_if_caption_cancellation_requested(cancellation_event)
         try:
+            _raise_if_caption_cancellation_requested(cancellation_event)
             transcript = normalize_transcript(
                 TranscriptMethod.YOUTUBE_CAPTIONS,
                 track.language_code,
                 track.fetch_segments(),
                 include_segments=include_segments,
             )
+            _raise_if_caption_cancellation_requested(cancellation_event)
+        except TranscriptionCancellationRequestedError:
+            raise
         except _CaptionProviderTimeout:
             raise
         except _CaptionProviderFailure:
@@ -899,6 +911,21 @@ def acquire_transcript(
         return transcript
 
     return None
+
+
+def _raise_if_caption_cancellation_requested(
+    cancellation_event: threading.Event,
+) -> None:
+    """Raise the shared Cancellation signal before another caption operation.
+
+    Args:
+        cancellation_event: Worker control event shared with external providers.
+
+    Raises:
+        TranscriptionCancellationRequestedError: If Cancellation has been accepted.
+    """
+    if cancellation_event.is_set():
+        raise TranscriptionCancellationRequestedError()
 
 
 class WhisperAcquirer:

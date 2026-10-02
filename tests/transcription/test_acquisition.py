@@ -2,7 +2,7 @@
 
 import threading
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar, Self
@@ -19,6 +19,7 @@ from textify.transcription.acquisition import (
     acquire_transcript,
 )
 from textify.transcription.config import TranscriptionConfig
+from textify.transcription.exceptions import TranscriptionCancellationRequestedError
 from textify.transcription.types import RawSegment, TimedTranscript, TranscriptMethod
 from textify.transcription.util import (
     MediaByteLimitExceeded,
@@ -113,6 +114,7 @@ class FakeCaptionTrack:
         is_generated: bool,
         segments: tuple[RawSegment, ...],
         failure: Exception | None = None,
+        on_fetch: Callable[[], None] | None = None,
     ) -> None:
         """Initialize one deterministic caption track.
 
@@ -122,12 +124,14 @@ class FakeCaptionTrack:
             is_generated: Whether the provider generated the track.
             segments: Timed segments to return when fetched.
             failure: Optional provider failure to raise when fetched.
+            on_fetch: Optional callback invoked after fetch begins.
         """
         self.name = name
         self._language_code = language_code
         self._is_generated = is_generated
         self._segments = segments
         self._failure = failure
+        self._on_fetch = on_fetch
         self.fetch_calls = 0
 
     @property
@@ -150,6 +154,8 @@ class FakeCaptionTrack:
             Exception: The configured provider failure.
         """
         self.fetch_calls += 1
+        if self._on_fetch is not None:
+            self._on_fetch()
         if self._failure is not None:
             raise self._failure
         return self._segments
@@ -162,15 +168,18 @@ class FakeCaptionProvider:
         self,
         tracks: tuple[FakeCaptionTrack, ...] = (),
         failure: Exception | None = None,
+        on_list: Callable[[], None] | None = None,
     ) -> None:
         """Initialize deterministic caption listing behavior.
 
         Args:
             tracks: Caption tracks returned in provider order.
             failure: Optional provider failure to raise during listing.
+            on_list: Optional callback invoked after listing begins.
         """
         self._tracks = tracks
         self._failure = failure
+        self._on_list = on_list
         self.list_calls: list[str] = []
 
     def list_tracks(self, video_id: str) -> Sequence[FakeCaptionTrack]:
@@ -186,6 +195,8 @@ class FakeCaptionProvider:
             Exception: The configured provider failure.
         """
         self.list_calls.append(video_id)
+        if self._on_list is not None:
+            self._on_list()
         if self._failure is not None:
             raise self._failure
         return self._tracks
@@ -432,7 +443,12 @@ def test_acquire_transcript_prefers_original_declared_language_tracks(
     )
     provider = FakeCaptionProvider(tracks)
 
-    transcript = acquire_transcript(provider, "dQw4w9WgXcQ", "en-US")
+    transcript = acquire_transcript(
+        provider,
+        "dQw4w9WgXcQ",
+        "en-US",
+        threading.Event(),
+    )
 
     assert transcript is not None
     assert transcript.text == expected_track_name
@@ -448,7 +464,12 @@ def test_acquire_transcript_preserves_provider_order_for_equal_rank_tracks() -> 
     second_track = FakeCaptionTrack("second", "en-US", True, ((0.0, 1.0, "two"),))
     provider = FakeCaptionProvider((first_track, second_track))
 
-    transcript = acquire_transcript(provider, "dQw4w9WgXcQ", "en-US")
+    transcript = acquire_transcript(
+        provider,
+        "dQw4w9WgXcQ",
+        "en-US",
+        threading.Event(),
+    )
 
     assert transcript is not None
     assert transcript.text == "two"
@@ -471,6 +492,7 @@ def test_acquire_transcript_returns_text_only_caption_when_segments_are_excluded
         provider,
         "dQw4w9WgXcQ",
         "en-US",
+        threading.Event(),
         include_segments=False,
     )
 
@@ -497,10 +519,67 @@ def test_acquire_transcript_skips_ambiguous_caption_declarations(
         provider,
         "dQw4w9WgXcQ",
         declared_language,
+        threading.Event(),
     )
 
     assert transcript is None
     assert provider.list_calls == []
+
+
+def test_acquire_transcript_rejects_cancellation_before_listing_tracks() -> None:
+    """Never start optional provider work after durable Cancellation is observed."""
+    cancellation_event = threading.Event()
+    cancellation_event.set()
+    provider = FakeCaptionProvider()
+
+    with pytest.raises(TranscriptionCancellationRequestedError):
+        acquire_transcript(
+            provider,
+            "dQw4w9WgXcQ",
+            "en-US",
+            cancellation_event,
+        )
+
+    assert provider.list_calls == []
+
+
+def test_acquire_transcript_rejects_cancellation_after_listing_before_fetch() -> None:
+    """Do not fetch a ranked track when Cancellation arrives during listing."""
+    cancellation_event = threading.Event()
+    track = FakeCaptionTrack("caption", "en-US", False, ((0.0, 1.0, "text"),))
+    provider = FakeCaptionProvider((track,), on_list=cancellation_event.set)
+
+    with pytest.raises(TranscriptionCancellationRequestedError):
+        acquire_transcript(
+            provider,
+            "dQw4w9WgXcQ",
+            "en-US",
+            cancellation_event,
+        )
+
+    assert track.fetch_calls == 0
+
+
+def test_acquire_transcript_rejects_cancellation_after_track_fetch() -> None:
+    """Discard a fetched caption when Cancellation wins before it is returned."""
+    cancellation_event = threading.Event()
+    track = FakeCaptionTrack(
+        "caption",
+        "en-US",
+        False,
+        ((0.0, 1.0, "text"),),
+        on_fetch=cancellation_event.set,
+    )
+
+    with pytest.raises(TranscriptionCancellationRequestedError):
+        acquire_transcript(
+            FakeCaptionProvider((track,)),
+            "dQw4w9WgXcQ",
+            "en-US",
+            cancellation_event,
+        )
+
+    assert track.fetch_calls == 1
 
 
 @pytest.mark.parametrize(
@@ -514,7 +593,7 @@ def test_acquire_transcript_preserves_listing_provider_failures(
     provider = FakeCaptionProvider(failure=failure_type())
 
     with pytest.raises(failure_type):
-        acquire_transcript(provider, "dQw4w9WgXcQ", "en-US")
+        acquire_transcript(provider, "dQw4w9WgXcQ", "en-US", threading.Event())
 
 
 def test_acquire_transcript_tries_next_track_after_ordinary_fetch_failure() -> None:
@@ -529,7 +608,12 @@ def test_acquire_transcript_tries_next_track_after_ordinary_fetch_failure() -> N
     usable_track = FakeCaptionTrack("usable", "en-US", True, ((0.0, 1.0, "text"),))
     provider = FakeCaptionProvider((failed_track, usable_track))
 
-    transcript = acquire_transcript(provider, "dQw4w9WgXcQ", "en-US")
+    transcript = acquire_transcript(
+        provider,
+        "dQw4w9WgXcQ",
+        "en-US",
+        threading.Event(),
+    )
 
     assert transcript is not None
     assert transcript.text == "text"
@@ -549,7 +633,7 @@ def test_acquire_transcript_stops_after_caption_fetch_timeout() -> None:
     provider = FakeCaptionProvider((timed_out_track, later_track))
 
     with pytest.raises(acquisition._CaptionProviderTimeout):
-        acquire_transcript(provider, "dQw4w9WgXcQ", "en-US")
+        acquire_transcript(provider, "dQw4w9WgXcQ", "en-US", threading.Event())
 
     assert (timed_out_track.fetch_calls, later_track.fetch_calls) == (1, 0)
 
@@ -577,6 +661,7 @@ def test_youtube_caption_adapter_fetches_original_timed_snippets(
         YouTubeCaptionProvider(),
         "dQw4w9WgXcQ",
         "en-US",
+        threading.Event(),
     )
 
     assert transcript is not None

@@ -80,6 +80,8 @@ def test_dispatch_settings_use_bounded_defaults(
     assert str(settings.broker_url) == "redis://127.0.0.1:6379/15"
     assert settings.worker_concurrency == 4
     assert settings.reconciler_interval_seconds == 1.0
+    assert settings.attempt_heartbeat_seconds == 5.0
+    assert settings.attempt_lease_seconds == 30.0
 
 
 @pytest.mark.parametrize(
@@ -113,6 +115,10 @@ def test_nonpositive_job_settings_are_rejected(
         ("TEXTIFY_WORKER_CONCURRENCY", "-1"),
         ("TEXTIFY_RECONCILER_INTERVAL_SECONDS", "0"),
         ("TEXTIFY_RECONCILER_INTERVAL_SECONDS", "-1"),
+        ("TEXTIFY_ATTEMPT_HEARTBEAT_SECONDS", "0"),
+        ("TEXTIFY_ATTEMPT_HEARTBEAT_SECONDS", "-1"),
+        ("TEXTIFY_ATTEMPT_LEASE_SECONDS", "0"),
+        ("TEXTIFY_ATTEMPT_LEASE_SECONDS", "-1"),
     ),
 )
 def test_nonpositive_dispatch_settings_are_rejected(
@@ -125,4 +131,22 @@ def test_nonpositive_dispatch_settings_are_rejected(
     monkeypatch.setenv(setting_name, setting_value)
 
     with pytest.raises(ValidationError):
+        JobDispatchConfig(_env_file=None)  # type: ignore[call-arg]
+
+
+def test_attempt_lease_requires_three_heartbeat_intervals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject a lease that cannot tolerate two missed heartbeat intervals."""
+    monkeypatch.setenv("TEXTIFY_BROKER_URL", "redis://127.0.0.1:6379/15")
+    monkeypatch.setenv("TEXTIFY_ATTEMPT_HEARTBEAT_SECONDS", "2")
+    monkeypatch.setenv("TEXTIFY_ATTEMPT_LEASE_SECONDS", "5")
+
+    with pytest.raises(
+        ValidationError,
+        match=(
+            "TEXTIFY_ATTEMPT_LEASE_SECONDS must be at least three times "
+            "TEXTIFY_ATTEMPT_HEARTBEAT_SECONDS\\."
+        ),
+    ):
         JobDispatchConfig(_env_file=None)  # type: ignore[call-arg]

@@ -8,6 +8,8 @@ from typing import cast
 from uuid import uuid4
 
 import pytest
+from celery.signals import worker_shutting_down
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from textify.jobs.celery_app import create_celery_app
 from textify.jobs.config import JobConfig, JobDispatchConfig
@@ -36,13 +38,72 @@ class RecordingProcessor:
 class ShutdownExecutor:
     """Record worker-owned executor shutdown."""
 
-    def __init__(self) -> None:
-        """Initialize the shutdown observation flag."""
+    def __init__(self, lifecycle_events: list[str] | None = None) -> None:
+        """Initialize shutdown observation state.
+
+        Args:
+            lifecycle_events: Optional ordered lifecycle event sink.
+        """
         self.shutdown_calls = 0
+        self._lifecycle_events = lifecycle_events
 
     async def shutdown(self) -> None:
         """Record one worker lifecycle shutdown."""
         self.shutdown_calls += 1
+        if self._lifecycle_events is not None:
+            self._lifecycle_events.append("executor_shutdown")
+
+
+class RecordingClaimManager:
+    """Record claim-manager lifecycle calls on the worker-owned event loop."""
+
+    def __init__(self, lifecycle_events: list[str] | None = None) -> None:
+        """Initialize lifecycle observations.
+
+        Args:
+            lifecycle_events: Optional ordered lifecycle event sink.
+        """
+        self.start_calls = 0
+        self.shutdown_calls = 0
+        self.admission_closed = threading.Event()
+        self._lifecycle_events = lifecycle_events
+
+    async def start(self) -> None:
+        """Record heartbeat monitor startup."""
+        self.start_calls += 1
+        if self._lifecycle_events is not None:
+            self._lifecycle_events.append("claim_manager_start")
+
+    def stop_accepting(self) -> None:
+        """Record admission closure."""
+        self.admission_closed.set()
+        if self._lifecycle_events is not None:
+            self._lifecycle_events.append("claim_manager_stop_accepting")
+
+    async def shutdown(self) -> None:
+        """Record claim-manager drain completion."""
+        self.shutdown_calls += 1
+        if self._lifecycle_events is not None:
+            self._lifecycle_events.append("claim_manager_shutdown")
+
+
+class RecordingEngine:
+    """Record disposal on the worker-owned event loop."""
+
+    def __init__(self, lifecycle_events: list[str] | None = None) -> None:
+        """Initialize disposal observations.
+
+        Args:
+            lifecycle_events: Optional ordered lifecycle event sink.
+        """
+        self.dispose_calls = 0
+        self._lifecycle_events = lifecycle_events
+
+    async def dispose(self) -> None:
+        """Record one connection-pool disposal."""
+        self.dispose_calls += 1
+        if self._lifecycle_events is not None:
+            self._lifecycle_events.append("engine_dispose")
 
 
 class CapturingRuntime:
@@ -67,7 +128,9 @@ def test_worker_runtime_processes_only_valid_payloads_on_one_loop() -> None:
 
     processor = RecordingProcessor()
     executor = ShutdownExecutor()
-    runtime = TranscriptionWorkerRuntime(processor, executor)
+    claim_manager = RecordingClaimManager()
+    engine = RecordingEngine()
+    runtime = TranscriptionWorkerRuntime(processor, executor, claim_manager, engine)
     first_dispatch = JobDispatch(1, uuid4())
     second_dispatch = JobDispatch(2, uuid4())
 
@@ -82,7 +145,67 @@ def test_worker_runtime_processes_only_valid_payloads_on_one_loop() -> None:
         runtime.shutdown()
 
     assert processor.dispatches == [first_dispatch, second_dispatch]
+    assert claim_manager.start_calls == 1
+    assert claim_manager.shutdown_calls == 1
     assert executor.shutdown_calls == 1
+    assert engine.dispose_calls == 1
+
+
+def test_worker_shutdown_signal_stops_claiming_without_interrupting_work() -> None:
+    """Close admission on Celery warm shutdown without cancelling the worker loop."""
+    from textify.jobs.worker import (
+        TranscriptionWorkerRuntime,
+        _connect_worker_shutdown_signal,
+        _disconnect_worker_shutdown_signal,
+    )
+
+    claim_manager = RecordingClaimManager()
+    runtime = TranscriptionWorkerRuntime(
+        RecordingProcessor(),
+        ShutdownExecutor(),
+        claim_manager,
+        RecordingEngine(),
+    )
+    runtime.start()
+    receiver = _connect_worker_shutdown_signal(runtime)
+    try:
+        worker_shutting_down.send(
+            sender="test-transcription-worker",
+            sig="SIGTERM",
+            how="Warm",
+            exitcode=0,
+        )
+
+        assert claim_manager.admission_closed.wait(timeout=1)
+    finally:
+        _disconnect_worker_shutdown_signal(receiver)
+        runtime.shutdown()
+
+    assert claim_manager.shutdown_calls == 1
+
+
+def test_worker_runtime_shutdown_drains_claims_before_owned_resources() -> None:
+    """Retain native work and database ownership until claim draining completes."""
+    from textify.jobs.worker import TranscriptionWorkerRuntime
+
+    lifecycle_events: list[str] = []
+    runtime = TranscriptionWorkerRuntime(
+        RecordingProcessor(),
+        ShutdownExecutor(lifecycle_events),
+        RecordingClaimManager(lifecycle_events),
+        RecordingEngine(lifecycle_events),
+    )
+    runtime.start()
+    lifecycle_events.clear()
+
+    runtime.shutdown()
+
+    assert lifecycle_events == [
+        "claim_manager_stop_accepting",
+        "claim_manager_shutdown",
+        "executor_shutdown",
+        "engine_dispose",
+    ]
 
 
 def test_registered_task_is_unbound_and_forwards_one_json_payload() -> None:
@@ -129,6 +252,11 @@ def test_worker_runtime_checks_media_capacity_before_adapter_construction(
         transcription_concurrency=3,
         max_media_bytes=100,
     )
+    dispatch_config = JobDispatchConfig(
+        broker_url="redis://127.0.0.1:6379/15",
+        worker_concurrency=2,
+        _env_file=None,  # type: ignore[call-arg]
+    )
 
     with pytest.raises(
         RuntimeError,
@@ -136,8 +264,9 @@ def test_worker_runtime_checks_media_capacity_before_adapter_construction(
     ):
         worker.TranscriptionWorkerRuntime.from_repository(
             cast(TranscriptionJobExecutionRepository, object()),
+            cast(AsyncEngine, object()),
             configuration,
-            worker_concurrency=2,
+            dispatch_config,
             adapters_factory=adapter_factory,
         )
 
@@ -183,16 +312,24 @@ async def test_worker_runtime_uses_its_own_loop_for_database_connections(
     engine = create_application_engine(migrated_postgresql_database_url)
     runtime: worker.TranscriptionWorkerRuntime | None = None
 
+    claim_manager = RecordingClaimManager()
+
     def build_runtime(
         cls: type[worker.TranscriptionWorkerRuntime],
         repository: TranscriptionJobExecutionRepository,
+        worker_engine: AsyncEngine,
         configuration: TranscriptionConfig,
-        worker_concurrency: int,
+        dispatch_config: JobDispatchConfig,
     ) -> worker.TranscriptionWorkerRuntime:
         """Build a deterministic runtime after production startup verification."""
-        del cls, configuration, worker_concurrency
+        del cls, configuration, dispatch_config
         probe.repository = repository
-        return worker.TranscriptionWorkerRuntime(probe, executor)
+        return worker.TranscriptionWorkerRuntime(
+            probe,
+            executor,
+            claim_manager,
+            worker_engine,
+        )
 
     monkeypatch.setattr(
         worker.TranscriptionWorkerRuntime,
@@ -224,9 +361,6 @@ async def test_worker_runtime_uses_its_own_loop_for_database_connections(
         if runtime is None:
             await engine.dispose()
         else:
-            try:
-                runtime.dispose_engine(engine)
-            finally:
-                runtime.shutdown()
+            runtime.shutdown()
 
     assert probe.completed.is_set()

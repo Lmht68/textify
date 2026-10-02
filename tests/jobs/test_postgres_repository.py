@@ -19,6 +19,8 @@ from textify.jobs.database import create_application_engine
 from textify.jobs.repository import PostgresTranscriptionJobRepository
 from textify.jobs.types import (
     CancelledTranscriptionJob,
+    ClaimedTranscriptionJob,
+    ExecutionClaim,
     FailedTranscriptionJob,
     JobDispatch,
     NewQueuedTranscriptionJob,
@@ -62,6 +64,18 @@ async def _lease_due_dispatches(
         uuid4(),
         timedelta(seconds=5),
         limit=100,
+    )
+
+
+async def _claim_dispatch(
+    repository: PostgresTranscriptionJobRepository,
+    dispatch: JobDispatch,
+) -> ClaimedTranscriptionJob | None:
+    """Claim one dispatch with one isolated worker identity for a test."""
+    return await repository.claim_dispatch(
+        dispatch,
+        uuid4(),
+        timedelta(seconds=30),
     )
 
 
@@ -184,10 +198,22 @@ async def test_postgres_repositories_enforce_fifo_claims_after_reversed_delivery
         second_queued = await submitting_repository.create_queued(_queued_job("second"))
         dispatches = await _lease_due_dispatches(submitting_repository)
 
-        newer_claim = await first_consumer_repository.claim_dispatch(dispatches[1])
-        first_claim = await second_consumer_repository.claim_dispatch(dispatches[0])
-        second_claim = await first_consumer_repository.claim_dispatch(dispatches[1])
-        repeated_claim = await second_consumer_repository.claim_dispatch(dispatches[0])
+        newer_claim = await _claim_dispatch(
+            first_consumer_repository,
+            dispatches[1],
+        )
+        first_claim = await _claim_dispatch(
+            second_consumer_repository,
+            dispatches[0],
+        )
+        second_claim = await _claim_dispatch(
+            first_consumer_repository,
+            dispatches[1],
+        )
+        repeated_claim = await _claim_dispatch(
+            second_consumer_repository,
+            dispatches[0],
+        )
     finally:
         await _dispose_engines(
             submitting_engine,
@@ -202,8 +228,8 @@ async def test_postgres_repositories_enforce_fifo_claims_after_reversed_delivery
     assert newer_claim is None
     assert first_claim is not None
     assert second_claim is not None
-    assert first_claim.dispatch == dispatches[0]
-    assert second_claim.dispatch == dispatches[1]
+    assert first_claim.claim.dispatch == dispatches[0]
+    assert second_claim.claim.dispatch == dispatches[1]
     assert repeated_claim is None
 
 
@@ -222,9 +248,9 @@ async def test_postgres_fifo_uses_job_id_when_submission_times_match(
         second_queued = await repository.create_queued(_queued_job("second-tie"))
         dispatches = await _lease_due_dispatches(repository)
 
-        newer_claim = await repository.claim_dispatch(dispatches[1])
-        first_claim = await repository.claim_dispatch(dispatches[0])
-        second_claim = await repository.claim_dispatch(dispatches[1])
+        newer_claim = await _claim_dispatch(repository, dispatches[1])
+        first_claim = await _claim_dispatch(repository, dispatches[0])
+        second_claim = await _claim_dispatch(repository, dispatches[1])
     finally:
         await engine.dispose()
 
@@ -332,8 +358,9 @@ async def test_postgres_cancellation_and_timeout_unblock_the_next_fifo_dispatch(
         )
         cancellation_dispatches = await _lease_due_dispatches(repository)
         cancelled = await repository.request_cancellation(cancelled_job.public_id)
-        cancellation_successor_claim = await repository.claim_dispatch(
-            cancellation_dispatches[1]
+        cancellation_successor_claim = await _claim_dispatch(
+            repository,
+            cancellation_dispatches[1],
         )
 
         timeout_job = await repository.create_queued(_queued_job("timeout"))
@@ -343,9 +370,10 @@ async def test_postgres_cancellation_and_timeout_unblock_the_next_fifo_dispatch(
             _queued_job("timeout-successor")
         )
         timeout_successor_dispatch = (await _lease_due_dispatches(repository))[0]
-        timeout_claim = await repository.claim_dispatch(timeout_dispatch)
-        timeout_successor_claim = await repository.claim_dispatch(
-            timeout_successor_dispatch
+        timeout_claim = await _claim_dispatch(repository, timeout_dispatch)
+        timeout_successor_claim = await _claim_dispatch(
+            repository,
+            timeout_successor_dispatch,
         )
     finally:
         await engine.dispose()
@@ -455,7 +483,7 @@ async def test_postgres_lifecycle_transitions_prevent_future_dispatch_leases(
         processing_job = await repository.create_queued(_queued_job("processing"))
         processing_dispatch = (await _lease_due_dispatches(repository))[0]
         assert processing_dispatch.internal_job_id == processing_job.internal_id
-        assert await repository.claim_dispatch(processing_dispatch) is not None
+        assert await _claim_dispatch(repository, processing_dispatch) is not None
         processing_leases = await _lease_due_dispatches(repository)
 
         cancelled_job = await repository.create_queued(_queued_job("cancelled"))
@@ -543,8 +571,8 @@ async def test_postgres_claims_before_loading_private_inputs(
         )
         event.listen(engine.sync_engine, "before_cursor_execute", record_claim_query)
         try:
-            stale_claim = await repository.claim_dispatch(stale_dispatch)
-            valid_claim = await repository.claim_dispatch(dispatch)
+            stale_claim = await _claim_dispatch(repository, stale_dispatch)
+            valid_claim = await _claim_dispatch(repository, dispatch)
         finally:
             event.remove(
                 engine.sync_engine,
@@ -590,13 +618,13 @@ async def test_postgres_stale_dispatches_do_not_load_private_inputs(
             ]
         )
         dispatches = await _lease_due_dispatches(repository)
-        processing_claim = await repository.claim_dispatch(dispatches[0])
+        processing_claim = await _claim_dispatch(repository, dispatches[0])
         assert processing_claim is not None
         await repository.request_cancellation(queued_jobs[1].public_id)
-        terminal_claim = await repository.claim_dispatch(dispatches[2])
+        terminal_claim = await _claim_dispatch(repository, dispatches[2])
         assert terminal_claim is not None
         assert await repository.publish_failure(
-            terminal_claim.dispatch,
+            terminal_claim.claim,
             "transcription_failed",
             "The transcription provider failed.",
         )
@@ -617,7 +645,7 @@ async def test_postgres_stale_dispatches_do_not_load_private_inputs(
         try:
             claims = await asyncio.gather(
                 *(
-                    repository.claim_dispatch(dispatch)
+                    _claim_dispatch(repository, dispatch)
                     for dispatch in invalid_dispatches
                 )
             )
@@ -658,8 +686,8 @@ async def test_postgres_allows_only_one_successful_claim_per_dispatch(
         await submitting_repository.create_queued(_queued_job("concurrent-claim"))
         dispatch = (await _lease_due_dispatches(submitting_repository))[0]
         claims = await asyncio.gather(
-            first_consumer.claim_dispatch(dispatch),
-            second_consumer.claim_dispatch(dispatch),
+            _claim_dispatch(first_consumer, dispatch),
+            _claim_dispatch(second_consumer, dispatch),
         )
     finally:
         await _dispose_engines(submitting_engine, first_engine, second_engine)
@@ -680,35 +708,42 @@ async def test_postgres_terminal_publication_requires_claim_token(
     try:
         success_job = await repository.create_queued(_queued_job("token-success"))
         success_dispatch = (await _lease_due_dispatches(repository))[0]
-        success_claim = await repository.claim_dispatch(success_dispatch)
+        success_claim = await _claim_dispatch(repository, success_dispatch)
         assert success_claim is not None
         wrong_success_dispatch = JobDispatch(
             internal_job_id=success_dispatch.internal_job_id,
             execution_attempt_token=uuid4(),
         )
         assert not await repository.publish_success(
-            wrong_success_dispatch,
+            ExecutionClaim(
+                dispatch=wrong_success_dispatch,
+                worker_owner=success_claim.claim.worker_owner,
+            ),
             _projected_result(),
         )
         assert await repository.publish_success(
-            success_claim.dispatch, _projected_result()
+            success_claim.claim,
+            _projected_result(),
         )
 
         failure_job = await repository.create_queued(_queued_job("token-failure"))
         failure_dispatch = (await _lease_due_dispatches(repository))[0]
-        failure_claim = await repository.claim_dispatch(failure_dispatch)
+        failure_claim = await _claim_dispatch(repository, failure_dispatch)
         assert failure_claim is not None
         wrong_failure_dispatch = JobDispatch(
             internal_job_id=failure_dispatch.internal_job_id,
             execution_attempt_token=uuid4(),
         )
         assert not await repository.publish_failure(
-            wrong_failure_dispatch,
+            ExecutionClaim(
+                dispatch=wrong_failure_dispatch,
+                worker_owner=failure_claim.claim.worker_owner,
+            ),
             "transcription_failed",
             "The transcription provider failed.",
         )
         assert await repository.publish_failure(
-            failure_claim.dispatch,
+            failure_claim.claim,
             "transcription_failed",
             "The transcription provider failed.",
         )
@@ -717,7 +752,10 @@ async def test_postgres_terminal_publication_requires_claim_token(
             _queued_job("token-cancelled")
         )
         cancellation_dispatch = (await _lease_due_dispatches(repository))[0]
-        cancellation_claim = await repository.claim_dispatch(cancellation_dispatch)
+        cancellation_claim = await _claim_dispatch(
+            repository,
+            cancellation_dispatch,
+        )
         assert cancellation_claim is not None
         cancellation = await repository.request_cancellation(cancellation_job.public_id)
         assert isinstance(cancellation, ProcessingTranscriptionJob)
@@ -725,8 +763,13 @@ async def test_postgres_terminal_publication_requires_claim_token(
             internal_job_id=cancellation_dispatch.internal_job_id,
             execution_attempt_token=uuid4(),
         )
-        assert not await repository.publish_cancelled(wrong_cancellation_dispatch)
-        assert await repository.publish_cancelled(cancellation_claim.dispatch)
+        assert not await repository.publish_cancelled(
+            ExecutionClaim(
+                dispatch=wrong_cancellation_dispatch,
+                worker_owner=cancellation_claim.claim.worker_owner,
+            )
+        )
+        assert await repository.publish_cancelled(cancellation_claim.claim)
 
         success_terminal = await repository.get_job(success_job.public_id)
         failure_terminal = await repository.get_job(failure_job.public_id)
@@ -737,6 +780,143 @@ async def test_postgres_terminal_publication_requires_claim_token(
     assert isinstance(success_terminal, SucceededTranscriptionJob)
     assert isinstance(failure_terminal, FailedTranscriptionJob)
     assert isinstance(cancellation_terminal, CancelledTranscriptionJob)
+
+
+async def test_postgres_heartbeats_exact_worker_claims_and_polls_cancellation(
+    migrated_postgresql_database_url: str,
+) -> None:
+    """Renew an owner's bounded claims while returning durable Cancellation state."""
+    clock = [_INITIAL]
+    repository, engine = _repository(
+        migrated_postgresql_database_url,
+        maximum_outstanding_jobs=2,
+        clock=clock,
+    )
+    worker_owner = uuid4()
+    lease_duration = timedelta(seconds=30)
+    try:
+        first_job = await repository.create_queued(_queued_job("heartbeat-first"))
+        second_job = await repository.create_queued(_queued_job("heartbeat-second"))
+        first_dispatch, second_dispatch = await _lease_due_dispatches(repository)
+        first_claim = await repository.claim_dispatch(
+            first_dispatch,
+            worker_owner,
+            lease_duration,
+        )
+        second_claim = await repository.claim_dispatch(
+            second_dispatch,
+            worker_owner,
+            lease_duration,
+        )
+        assert first_claim is not None
+        assert second_claim is not None
+        assert first_claim.claim.worker_owner == worker_owner
+        assert second_claim.claim.worker_owner == worker_owner
+        assert not await repository.publish_failure(
+            ExecutionClaim(first_claim.claim.dispatch, uuid4()),
+            "transcription_failed",
+            "The transcription provider failed.",
+        )
+
+        cancellation = await repository.request_cancellation(second_job.public_id)
+        assert isinstance(cancellation, ProcessingTranscriptionJob)
+        clock[0] += timedelta(seconds=1)
+        heartbeats = await repository.heartbeat_claims(
+            (first_claim.claim, second_claim.claim),
+            lease_duration,
+        )
+    finally:
+        await engine.dispose()
+
+    assert first_job.internal_id == first_claim.claim.dispatch.internal_job_id
+    assert tuple(heartbeat.claim for heartbeat in heartbeats) == (
+        first_claim.claim,
+        second_claim.claim,
+    )
+    assert tuple(heartbeat.cancellation_requested for heartbeat in heartbeats) == (
+        False,
+        True,
+    )
+
+
+async def test_postgres_expired_claims_reject_terminal_writes_and_recover_once(
+    migrated_postgresql_database_url: str,
+) -> None:
+    """Terminalize expired claims without allowing late workers to replace outcomes."""
+    clock = [_INITIAL]
+    repository, engine = _repository(
+        migrated_postgresql_database_url,
+        maximum_outstanding_jobs=2,
+        clock=clock,
+    )
+    lease_duration = timedelta(seconds=30)
+    try:
+        interrupted_job = await repository.create_queued(
+            _queued_job("expired-interrupted")
+        )
+        cancelled_job = await repository.create_queued(_queued_job("expired-cancelled"))
+        interrupted_dispatch, cancelled_dispatch = await _lease_due_dispatches(
+            repository
+        )
+        interrupted_claim = await _claim_dispatch(repository, interrupted_dispatch)
+        cancelled_claim = await _claim_dispatch(repository, cancelled_dispatch)
+        assert interrupted_claim is not None
+        assert cancelled_claim is not None
+        cancellation = await repository.request_cancellation(cancelled_job.public_id)
+        assert isinstance(cancellation, ProcessingTranscriptionJob)
+
+        clock[0] += lease_duration
+        assert (
+            await repository.heartbeat_claims(
+                (interrupted_claim.claim, cancelled_claim.claim),
+                lease_duration,
+            )
+            == ()
+        )
+        assert not await repository.publish_success(
+            interrupted_claim.claim,
+            _projected_result(),
+        )
+        assert not await repository.publish_failure(
+            interrupted_claim.claim,
+            "transcription_failed",
+            "The transcription provider failed.",
+        )
+        assert not await repository.publish_cancelled(cancelled_claim.claim)
+        recovered_count = await repository.recover_expired_claims(limit=2)
+        interrupted_terminal = await repository.get_job(interrupted_job.public_id)
+        cancelled_terminal = await repository.get_job(cancelled_job.public_id)
+        assert not await repository.publish_success(
+            interrupted_claim.claim,
+            _projected_result(),
+        )
+        async with engine.connect() as connection:
+            claim_rows = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT job_id, worker_owner, last_heartbeat_at, "
+                            "claim_lease_expires_at "
+                            "FROM transcription_job_execution_attempt ORDER BY job_id"
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+    finally:
+        await engine.dispose()
+
+    assert recovered_count == 2
+    assert isinstance(interrupted_terminal, FailedTranscriptionJob)
+    assert interrupted_terminal.error_code == "worker_interrupted"
+    assert isinstance(cancelled_terminal, CancelledTranscriptionJob)
+    assert all(
+        row["worker_owner"] is None
+        and row["last_heartbeat_at"] is None
+        and row["claim_lease_expires_at"] is None
+        for row in claim_rows
+    )
 
 
 async def test_postgres_cancellation_blocks_competing_success_publication(
@@ -757,7 +937,7 @@ async def test_postgres_cancellation_blocks_competing_success_publication(
     try:
         queued_job = await execution_repository.create_queued(_queued_job("race"))
         dispatch = (await _lease_due_dispatches(execution_repository))[0]
-        claimed_job = await execution_repository.claim_dispatch(dispatch)
+        claimed_job = await _claim_dispatch(execution_repository, dispatch)
         assert claimed_job is not None
 
         cancellation = await cancellation_repository.request_cancellation(
@@ -768,10 +948,10 @@ async def test_postgres_cancellation_blocks_competing_success_publication(
 
         success_published, cancellation_published = await asyncio.gather(
             execution_repository.publish_success(
-                claimed_job.dispatch,
+                claimed_job.claim,
                 _projected_result(),
             ),
-            cancellation_repository.publish_cancelled(claimed_job.dispatch),
+            cancellation_repository.publish_cancelled(claimed_job.claim),
         )
         terminal_job = await execution_repository.get_job(queued_job.public_id)
     finally:
@@ -803,7 +983,7 @@ async def test_postgres_cancellation_blocks_competing_failure_publication(
             _queued_job("failure-race")
         )
         dispatch = (await _lease_due_dispatches(execution_repository))[0]
-        claimed_job = await execution_repository.claim_dispatch(dispatch)
+        claimed_job = await _claim_dispatch(execution_repository, dispatch)
         assert claimed_job is not None
         cancellation = await cancellation_repository.request_cancellation(
             queued_job.public_id
@@ -812,11 +992,11 @@ async def test_postgres_cancellation_blocks_competing_failure_publication(
 
         failure_published, cancellation_published = await asyncio.gather(
             execution_repository.publish_failure(
-                claimed_job.dispatch,
+                claimed_job.claim,
                 "transcription_failed",
                 "The transcription provider failed.",
             ),
-            cancellation_repository.publish_cancelled(claimed_job.dispatch),
+            cancellation_repository.publish_cancelled(claimed_job.claim),
         )
         terminal_job = await execution_repository.get_job(queued_job.public_id)
     finally:
@@ -848,10 +1028,10 @@ async def test_postgres_repeatable_read_snapshot_survives_concurrent_retention(
     try:
         queued_job = await reader_repository.create_queued(_queued_job("snapshot"))
         dispatch = (await _lease_due_dispatches(reader_repository))[0]
-        claimed_job = await reader_repository.claim_dispatch(dispatch)
+        claimed_job = await _claim_dispatch(reader_repository, dispatch)
         assert claimed_job is not None
         assert await reader_repository.publish_success(
-            claimed_job.dispatch,
+            claimed_job.claim,
             _projected_result(),
         )
 

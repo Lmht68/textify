@@ -13,6 +13,7 @@ from httpx import ASGITransport, AsyncClient
 
 from textify.config import AppConfig, Environment
 from textify.jobs.celery_app import TRANSCRIPTION_QUEUE, create_celery_app
+from textify.jobs.claim_manager import ExecutionClaimManager
 from textify.jobs.config import JobConfig, JobDispatchConfig
 from textify.jobs.database import create_application_engine
 from textify.jobs.dispatch import CeleryJobDispatchPublisher
@@ -218,17 +219,24 @@ async def test_api_submission_reconciles_and_retrieves_celery_caption_result(
         whisper_transcriber=_UnexpectedNativePath(),
     )
     executor = TranscriptionExecutor(adapters, _transcription_config(tmp_path))
+    claim_manager = ExecutionClaimManager(
+        worker_repository,
+        max_active_claims=1,
+        heartbeat_interval=timedelta(seconds=5),
+        claim_lease_duration=timedelta(seconds=30),
+    )
     runtime = TranscriptionWorkerRuntime(
-        TranscriptionJobProcessor(worker_repository, executor),
+        TranscriptionJobProcessor(worker_repository, executor, claim_manager),
         executor,
+        claim_manager,
+        worker_engine,
     )
-    celery_app = create_celery_app(
-        JobDispatchConfig(
-            broker_url=redis_broker_url,
-            worker_concurrency=1,
-            _env_file=None,  # type: ignore[call-arg]
-        )
+    dispatch_config = JobDispatchConfig(
+        broker_url=redis_broker_url,
+        worker_concurrency=1,
+        _env_file=None,  # type: ignore[call-arg]
     )
+    celery_app = create_celery_app(dispatch_config)
     register_transcription_task(celery_app, runtime)
     runtime.start()
     try:
@@ -260,7 +268,6 @@ async def test_api_submission_reconciles_and_retrieves_celery_caption_result(
                     completed = await _wait_for_succeeded_status(client, location)
     finally:
         runtime.shutdown()
-        await worker_engine.dispose()
         await reconciler_engine.dispose()
 
     completed_id = completed["id"]

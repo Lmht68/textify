@@ -77,12 +77,13 @@ class TranscriptionJobReconciler:
         self._lease_owner = uuid4()
 
     async def reconcile_once(self) -> None:
-        """Expire queued work, then lease, publish, and record due dispatches.
+        """Recover expired claims, expire queued work, then publish due dispatches.
 
         Raises:
             TranscriptionJobStoreUnavailableError: If PostgreSQL recovery cannot
                 complete an operation.
         """
+        await self._recover_expired_claims()
         await self._expire_queued_jobs()
         while True:
             dispatches = await self._repository.lease_due_dispatches(
@@ -107,6 +108,13 @@ class TranscriptionJobReconciler:
                     self._lease_owner,
                     self._policy.interval,
                 )
+
+    async def _recover_expired_claims(self) -> None:
+        """Drain bounded lost-worker transitions before queued-job recovery."""
+        while await self._repository.recover_expired_claims(
+            self._policy.dispatch_batch_size
+        ):
+            continue
 
     async def _expire_queued_jobs(self) -> None:
         """Drain bounded queue-timeout transitions before dispatch publication."""

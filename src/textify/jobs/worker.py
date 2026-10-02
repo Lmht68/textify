@@ -7,11 +7,13 @@ import logging
 import shutil
 import tempfile
 import threading
+from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 from celery import Celery, Task
+from celery.signals import worker_shutting_down
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from textify.errors import InternalError
@@ -20,6 +22,7 @@ from textify.jobs.celery_app import (
     TRANSCRIPTION_TASK,
     create_celery_app,
 )
+from textify.jobs.claim_manager import ExecutionClaimManager
 from textify.jobs.config import JobConfig, JobDispatchConfig
 from textify.jobs.contracts import (
     TranscriptionJobExecutionRepository,
@@ -60,6 +63,30 @@ class _ShutdownExecutor(Protocol):
         ...
 
 
+class _ExecutionClaimLifecycle(Protocol):
+    """Coordinate manager startup, admission closure, and worker drain."""
+
+    async def start(self) -> None:
+        """Start heartbeat monitoring on the worker's event loop."""
+        ...
+
+    def stop_accepting(self) -> None:
+        """Close claim admission without cancelling registered executions."""
+        ...
+
+    async def shutdown(self) -> None:
+        """Drain claims before the heartbeat monitor stops."""
+        ...
+
+
+class _EngineOwner(Protocol):
+    """Dispose database connections on the worker's event loop."""
+
+    async def dispose(self) -> None:
+        """Close all worker-owned database connections."""
+        ...
+
+
 class _TaskPayloadProcessor(Protocol):
     """Accept one deserialized private Celery task payload."""
 
@@ -79,15 +106,25 @@ class TranscriptionWorkerRuntime:
         self,
         processor: _DispatchProcessor,
         executor: _ShutdownExecutor,
+        claim_manager: _ExecutionClaimLifecycle,
+        engine: _EngineOwner,
+        *,
+        verify_database: bool = False,
     ) -> None:
         """Initialize unstarted worker runtime dependencies.
 
         Args:
             processor: Claimed Execution Attempt processing boundary.
             executor: Process-lifetime provider owner to shut down exactly once.
+            claim_manager: Worker-local claim ownership lifecycle.
+            engine: PostgreSQL connection owner disposed on this runtime's loop.
+            verify_database: Whether startup validates the owned PostgreSQL engine.
         """
         self._processor = processor
         self._executor = executor
+        self._claim_manager = claim_manager
+        self._engine = engine
+        self._verify_database = verify_database
         self._state_lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
@@ -97,40 +134,55 @@ class TranscriptionWorkerRuntime:
     def from_repository(
         cls,
         repository: TranscriptionJobExecutionRepository,
+        engine: AsyncEngine,
         transcription_config: TranscriptionConfig,
-        worker_concurrency: int,
+        dispatch_config: JobDispatchConfig,
         adapters_factory: TranscriptionAdaptersFactory = build_transcription_adapters,
     ) -> TranscriptionWorkerRuntime:
-        """Validate worker resources and construct one executor and processor.
+        """Validate worker resources and construct one managed processing runtime.
 
         Args:
             repository: PostgreSQL claim and terminal-publication boundary.
+            engine: PostgreSQL connection pool owned by the returned runtime.
             transcription_config: Process-local provider and temporary-media settings.
-            worker_concurrency: Concurrent Celery threads accepted by this process.
+            dispatch_config: Celery delivery, heartbeat, and claim-lease configuration.
             adapters_factory: Process-lifetime adapter and model construction boundary.
 
         Returns:
-            Unstarted worker runtime with exactly one adapter bundle and executor.
+            Unstarted runtime with exactly one adapter bundle, executor, and manager.
 
         Raises:
             RuntimeError: If temporary media cannot be created or hold configured quota.
-            ValueError: If Celery thread concurrency is nonpositive.
         """
-        if worker_concurrency <= 0:
-            raise ValueError("worker_concurrency must be positive.")
         _ensure_writable_temporary_media_root(transcription_config.temporary_media_root)
         _validate_temporary_media_capacity(
             transcription_config,
-            worker_concurrency,
+            dispatch_config.worker_concurrency,
         )
         executor = TranscriptionExecutor(
             adapters_factory(transcription_config),
             transcription_config,
         )
-        return cls(TranscriptionJobProcessor(repository, executor), executor)
+        claim_manager = ExecutionClaimManager(
+            repository,
+            max_active_claims=dispatch_config.worker_concurrency,
+            heartbeat_interval=timedelta(
+                seconds=dispatch_config.attempt_heartbeat_seconds
+            ),
+            claim_lease_duration=timedelta(
+                seconds=dispatch_config.attempt_lease_seconds
+            ),
+        )
+        return cls(
+            TranscriptionJobProcessor(repository, executor, claim_manager),
+            executor,
+            claim_manager,
+            engine,
+            verify_database=True,
+        )
 
     def start(self) -> None:
-        """Start the single asyncio loop before Celery accepts task delivery.
+        """Start database verification and claim monitoring before Celery receives work.
 
         Raises:
             RuntimeError: If this runtime has already started.
@@ -151,6 +203,11 @@ class TranscriptionWorkerRuntime:
             self._started = True
             loop_thread.start()
         loop_ready.wait()
+        try:
+            asyncio.run_coroutine_threadsafe(self._start_resources(), loop).result()
+        except Exception:
+            self._close_after_start_failure(loop, loop_thread)
+            raise
 
     def process_payload(self, payload: object) -> None:
         """Parse and process one Celery JSON payload without exposing it in logs.
@@ -181,23 +238,15 @@ class TranscriptionWorkerRuntime:
                 extra={"code": InternalError.code},
             )
 
-    def dispose_engine(self, engine: AsyncEngine) -> None:
-        """Dispose database connections on the runtime loop that owns them.
-
-        Args:
-            engine: PostgreSQL engine whose asyncpg connections belong to this loop.
-
-        Raises:
-            RuntimeError: If the worker runtime is not started.
-        """
+    def stop_claiming(self) -> None:
+        """Close worker admission from any Celery or task thread."""
         with self._state_lock:
             loop = self._loop if self._started else None
-        if loop is None:
-            raise RuntimeError("Transcription worker runtime is unavailable.")
-        asyncio.run_coroutine_threadsafe(engine.dispose(), loop).result()
+        if loop is not None:
+            loop.call_soon_threadsafe(self._claim_manager.stop_accepting)
 
     def shutdown(self) -> None:
-        """Drain the executor, stop the loop, and release its thread exactly once."""
+        """Drain claims, native work, and database connections before loop teardown."""
         with self._state_lock:
             if not self._started:
                 return
@@ -207,13 +256,49 @@ class TranscriptionWorkerRuntime:
         assert loop is not None
         assert loop_thread is not None
         try:
-            asyncio.run_coroutine_threadsafe(self._executor.shutdown(), loop).result()
+            asyncio.run_coroutine_threadsafe(
+                self._shutdown_resources(),
+                loop,
+            ).result()
         finally:
             loop.call_soon_threadsafe(loop.stop)
             loop_thread.join()
             with self._state_lock:
                 self._loop = None
                 self._loop_thread = None
+
+    async def _start_resources(self) -> None:
+        """Verify PostgreSQL and start heartbeat monitoring on the worker loop."""
+        if self._verify_database:
+            await verify_application_database(cast(AsyncEngine, self._engine))
+        await self._claim_manager.start()
+
+    async def _shutdown_resources(self) -> None:
+        """Drain owned resources on the same loop that used them."""
+        self._claim_manager.stop_accepting()
+        try:
+            await self._claim_manager.shutdown()
+        finally:
+            try:
+                await self._executor.shutdown()
+            finally:
+                await self._engine.dispose()
+
+    def _close_after_start_failure(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        loop_thread: threading.Thread,
+    ) -> None:
+        """Dispose the engine and stop a loop whose claim monitor could not start."""
+        try:
+            asyncio.run_coroutine_threadsafe(self._engine.dispose(), loop).result()
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            loop_thread.join()
+            with self._state_lock:
+                self._loop = None
+                self._loop_thread = None
+                self._started = False
 
 
 def register_transcription_task(
@@ -329,7 +414,7 @@ async def _create_worker_runtime(
     dispatch_config: JobDispatchConfig,
     transcription_config: TranscriptionConfig,
 ) -> TranscriptionWorkerRuntime:
-    """Verify PostgreSQL and create the worker's one process-lifetime runtime.
+    """Create the worker's one process-lifetime runtime.
 
     Args:
         engine: Application PostgreSQL engine owned by the worker process.
@@ -338,13 +423,8 @@ async def _create_worker_runtime(
         transcription_config: Provider and temporary-media configuration.
 
     Returns:
-        Unstarted worker runtime.
-
-    Raises:
-        RuntimeError: If PostgreSQL is unavailable or schema is not current.
+        Unstarted worker runtime that verifies PostgreSQL during ``start``.
     """
-    await verify_application_database(engine)
-    await engine.dispose()
     repository = PostgresTranscriptionJobRepository(
         engine=engine,
         maximum_outstanding_jobs=job_config.max_outstanding_jobs,
@@ -354,9 +434,39 @@ async def _create_worker_runtime(
     )
     return TranscriptionWorkerRuntime.from_repository(
         repository,
+        engine,
         transcription_config,
-        dispatch_config.worker_concurrency,
+        dispatch_config,
     )
+
+
+def _connect_worker_shutdown_signal(
+    runtime: TranscriptionWorkerRuntime,
+) -> Callable[..., None]:
+    """Close claim admission synchronously when Celery begins shutdown.
+
+    Args:
+        runtime: Started runtime whose manager must reject new claims.
+
+    Returns:
+        Strongly registered Celery receiver to disconnect during teardown.
+    """
+
+    def stop_claiming_on_shutdown(**_signal_kwargs: object) -> None:
+        """Schedule admission closure without blocking Celery's signal handler."""
+        runtime.stop_claiming()
+
+    worker_shutting_down.connect(stop_claiming_on_shutdown, weak=False)
+    return stop_claiming_on_shutdown
+
+
+def _disconnect_worker_shutdown_signal(receiver: Callable[..., None]) -> None:
+    """Remove a previously registered Celery shutdown receiver.
+
+    Args:
+        receiver: Exact signal receiver returned by connection setup.
+    """
+    worker_shutting_down.disconnect(receiver)
 
 
 def main() -> None:
@@ -366,7 +476,7 @@ def main() -> None:
     transcription_config = TranscriptionConfig()
     engine = create_application_engine(str(job_config.database_url))
     runtime: TranscriptionWorkerRuntime | None = None
-    runtime_started = False
+    shutdown_receiver: Callable[..., None] | None = None
     try:
         runtime = asyncio.run(
             _create_worker_runtime(
@@ -377,7 +487,7 @@ def main() -> None:
             )
         )
         runtime.start()
-        runtime_started = True
+        shutdown_receiver = _connect_worker_shutdown_signal(runtime)
         celery_app = create_celery_app(dispatch_config)
         register_transcription_task(celery_app, runtime)
         celery_app.worker_main(
@@ -390,13 +500,9 @@ def main() -> None:
             ]
         )
     finally:
+        if shutdown_receiver is not None:
+            _disconnect_worker_shutdown_signal(shutdown_receiver)
         if runtime is None:
             asyncio.run(engine.dispose())
-        elif not runtime_started:
-            runtime.shutdown()
-            asyncio.run(engine.dispose())
         else:
-            try:
-                runtime.dispose_engine(engine)
-            finally:
-                runtime.shutdown()
+            runtime.shutdown()

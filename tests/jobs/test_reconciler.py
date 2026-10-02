@@ -19,21 +19,32 @@ class RecordingDispatchRepository:
         self,
         lease_batches: tuple[tuple[JobDispatch, ...], ...],
         expire_results: tuple[int, ...] = (),
+        recovery_results: tuple[int, ...] = (),
     ) -> None:
-        """Initialize deterministic expiry and lease results.
+        """Initialize deterministic recovery, expiry, and dispatch results.
 
         Args:
             lease_batches: Consecutive batches returned by due-lease operations.
-            expire_results: Consecutive counts returned by expiry operations.
+            expire_results: Consecutive counts returned by queue expiry operations.
+            recovery_results: Consecutive counts returned by expired claim recovery.
         """
         self._lease_batches = deque(lease_batches)
         self._expire_results = deque(expire_results)
+        self._recovery_results = deque(recovery_results)
         self.calls: list[str] = []
+        self.recovery_limits: list[int] = []
         self.lease_requests: list[tuple[UUID, timedelta, int]] = []
         self.recorded_dispatches: list[tuple[JobDispatch, UUID, timedelta]] = []
         self.released_dispatches: list[tuple[tuple[JobDispatch, ...], UUID]] = []
         self.cleanup_calls = 0
         self.record_error: TranscriptionJobStoreUnavailableError | None = None
+
+    async def recover_expired_claims(self, limit: int) -> int:
+        """Return one configured bounded expired-claim recovery result."""
+        self.calls.append("recover")
+        self.recovery_limits.append(limit)
+        assert limit > 0
+        return self._recovery_results.popleft() if self._recovery_results else 0
 
     async def expire_queued_jobs(self, limit: int) -> int:
         """Return one configured bounded expiry result."""
@@ -124,19 +135,33 @@ def _policy(dispatch_batch_size: int = 100) -> ReconcilerPolicy:
 
 
 @pytest.mark.asyncio
-async def test_reconciler_expires_before_leasing_and_recording_dispatches() -> None:
-    """Expire queued deadlines before publishing a newly due batch."""
+async def test_reconciler_recovers_claims_before_expiry_and_dispatch() -> None:
+    """Drain expired claims before queued deadlines and new broker publication."""
     dispatch = _dispatch(3)
-    repository = RecordingDispatchRepository(((dispatch,), ()), (1, 0))
+    repository = RecordingDispatchRepository(
+        ((dispatch,), ()),
+        expire_results=(1, 0),
+        recovery_results=(2, 1, 0),
+    )
     publisher = RecordingPublisher()
 
     await TranscriptionJobReconciler(
         repository,
         publisher,
-        policy=_policy(),
+        policy=_policy(dispatch_batch_size=2),
     ).reconcile_once()
 
-    assert repository.calls == ["expire", "expire", "lease", "record", "lease"]
+    assert repository.calls == [
+        "recover",
+        "recover",
+        "recover",
+        "expire",
+        "expire",
+        "lease",
+        "record",
+        "lease",
+    ]
+    assert repository.recovery_limits == [2, 2, 2]
     assert publisher.dispatches == [dispatch]
     assert [record[0] for record in repository.recorded_dispatches] == [dispatch]
 

@@ -88,6 +88,22 @@ class JobDispatch:
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutionClaim:
+    """Identify one worker-owned claimed Execution Attempt."""
+
+    dispatch: JobDispatch
+    worker_owner: UUID
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimHeartbeat:
+    """Report authoritative ownership and Cancellation for one Execution Claim."""
+
+    claim: ExecutionClaim
+    cancellation_requested: bool
+
+
+@dataclass(frozen=True, slots=True)
 class NewQueuedTranscriptionJob:
     """Hold private data required to persist one newly admitted job."""
 
@@ -97,9 +113,9 @@ class NewQueuedTranscriptionJob:
 
 @dataclass(frozen=True, slots=True)
 class ClaimedTranscriptionJob:
-    """Hold private execution inputs claimed for one Job Dispatch."""
+    """Hold private execution inputs claimed for one Execution Claim."""
 
-    dispatch: JobDispatch
+    claim: ExecutionClaim
     submitted_url: str
     exclusions: tuple[ResponseFieldPath, ...]
 

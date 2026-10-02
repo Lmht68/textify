@@ -9,6 +9,8 @@ from uuid import UUID
 from textify.jobs.types import (
     CancelledTranscriptionJob,
     ClaimedTranscriptionJob,
+    ClaimHeartbeat,
+    ExecutionClaim,
     JobDispatch,
     NewQueuedTranscriptionJob,
     ProcessingTranscriptionJob,
@@ -164,6 +166,21 @@ class TranscriptionJobDispatchRepository(Protocol):
         """
         ...
 
+    async def recover_expired_claims(self, limit: int) -> int:
+        """Finish bounded expired claims without returning work to the queue.
+
+        Args:
+            limit: Maximum expired Execution Attempts to terminalize.
+
+        Returns:
+            Number of claims finished as cancelled or worker-interrupted.
+
+        Raises:
+            TranscriptionJobStoreUnavailableError: If durable storage is unavailable.
+            ValueError: If ``limit`` is not positive.
+        """
+        ...
+
     async def delete_expired_terminal_jobs(self) -> None:
         """Delete expired terminal Transcription Jobs.
 
@@ -177,26 +194,52 @@ class TranscriptionJobExecutionRepository(Protocol):
     """Provide durable operations required by one claimed Execution Attempt."""
 
     async def claim_dispatch(
-        self, dispatch: JobDispatch
+        self,
+        dispatch: JobDispatch,
+        worker_owner: UUID,
+        lease_duration: timedelta,
     ) -> ClaimedTranscriptionJob | None:
         """Conditionally claim one delivered Job Dispatch before loading inputs.
 
         Args:
             dispatch: Private identifier and token received from the broker.
+            worker_owner: UUIDv4 identity for the worker process claiming the attempt.
+            lease_duration: Positive duration before an unrenewed claim expires.
 
         Returns:
             Private claimed execution inputs, or ``None`` when delivery is stale.
 
         Raises:
             TranscriptionJobStoreUnavailableError: If durable storage is unavailable.
+            ValueError: If the worker owner or lease duration is invalid.
         """
         ...
 
-    async def publish_cancelled(self, dispatch: JobDispatch) -> bool:
+    async def heartbeat_claims(
+        self,
+        claims: tuple[ExecutionClaim, ...],
+        lease_duration: timedelta,
+    ) -> tuple[ClaimHeartbeat, ...]:
+        """Renew matching claims and return their authoritative Cancellation state.
+
+        Args:
+            claims: Bounded active worker claims to renew.
+            lease_duration: Positive duration before an unrenewed claim expires.
+
+        Returns:
+            Renewed claims only, each with durable Cancellation state.
+
+        Raises:
+            TranscriptionJobStoreUnavailableError: If durable storage is unavailable.
+            ValueError: If the lease duration is invalid.
+        """
+        ...
+
+    async def publish_cancelled(self, claim: ExecutionClaim) -> bool:
         """Conditionally publish cancellation after execution cleanup completes.
 
         Args:
-            dispatch: Private identifier and token from the committed claim.
+            claim: Exact worker-owned claim that completed cleanup.
 
         Returns:
             ``True`` when this operation committed cancellation.
@@ -208,13 +251,13 @@ class TranscriptionJobExecutionRepository(Protocol):
 
     async def publish_success(
         self,
-        dispatch: JobDispatch,
+        claim: ExecutionClaim,
         projected_result: TranscriptionResponse,
     ) -> bool:
         """Conditionally publish one successful Transcription Job result.
 
         Args:
-            dispatch: Private identifier and token from the committed claim.
+            claim: Exact worker-owned claim that produced the result.
             projected_result: Validated result after immutable field projection.
 
         Returns:
@@ -227,14 +270,14 @@ class TranscriptionJobExecutionRepository(Protocol):
 
     async def publish_failure(
         self,
-        dispatch: JobDispatch,
+        claim: ExecutionClaim,
         error_code: str,
         error_message: str,
     ) -> bool:
         """Conditionally publish one safe failed Transcription Job outcome.
 
         Args:
-            dispatch: Private identifier and token from the committed claim.
+            claim: Exact worker-owned claim that encountered the failure.
             error_code: Stable safe public error code.
             error_message: Safe public error message.
 

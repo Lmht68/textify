@@ -1,6 +1,8 @@
 """Durable Transcription Job environment configuration."""
 
-from pydantic import Field, PostgresDsn, RedisDsn, field_validator
+from typing import Self
+
+from pydantic import Field, PostgresDsn, RedisDsn, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -54,3 +56,22 @@ class JobDispatchConfig(BaseSettings):
     broker_url: RedisDsn
     worker_concurrency: int = Field(default=4, gt=0)
     reconciler_interval_seconds: float = Field(default=1.0, gt=0)
+    attempt_heartbeat_seconds: float = Field(default=5.0, gt=0)
+    attempt_lease_seconds: float = Field(default=30.0, gt=0)
+
+    @model_validator(mode="after")
+    def require_heartbeat_lease_ratio(self) -> Self:
+        """Require a lease that tolerates two complete missed heartbeats.
+
+        Returns:
+            Validated dispatch configuration.
+
+        Raises:
+            ValueError: If the claim lease is less than three heartbeat intervals.
+        """
+        if self.attempt_lease_seconds < self.attempt_heartbeat_seconds * 3:
+            raise ValueError(
+                "TEXTIFY_ATTEMPT_LEASE_SECONDS must be at least three times "
+                "TEXTIFY_ATTEMPT_HEARTBEAT_SECONDS."
+            )
+        return self

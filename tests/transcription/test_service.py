@@ -2,7 +2,7 @@
 
 import asyncio
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 import pytest
@@ -16,6 +16,7 @@ from textify.transcription.exceptions import (
     MetadataTimeoutError,
     TranscriptionCancellationRequestedError,
     TranscriptionFailedError,
+    TranscriptionTimeoutError,
     UnsupportedMediaError,
     VideoTooLongError,
 )
@@ -110,15 +111,18 @@ class RecordingCaptionProvider:
         self,
         tracks: Sequence[CaptionTrack] = (),
         failure: Exception | None = None,
+        on_list: Callable[[], None] | None = None,
     ) -> None:
         """Initialize deterministic caption provider behavior.
 
         Args:
             tracks: Tracks returned in provider order.
             failure: Optional listing failure.
+            on_list: Optional callback invoked after track listing begins.
         """
         self._tracks = tracks
         self._failure = failure
+        self._on_list = on_list
         self.calls: list[str] = []
 
     def list_tracks(self, video_id: str) -> Sequence[CaptionTrack]:
@@ -134,6 +138,8 @@ class RecordingCaptionProvider:
             Exception: The configured listing failure.
         """
         self.calls.append(video_id)
+        if self._on_list is not None:
+            self._on_list()
         if self._failure is not None:
             raise self._failure
         return self._tracks
@@ -285,6 +291,43 @@ class FixedTranscriber:
             language="en",
             text="Transcript",
             segments=(segment,),
+        )
+
+
+class BlockingTranscriber:
+    """Retain native completion until a test-controlled release."""
+
+    def __init__(self) -> None:
+        """Initialize native start and completion synchronization."""
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.calls: list[Path] = []
+
+    def transcribe(
+        self,
+        audio_path: Path,
+        *,
+        include_segments: bool = True,
+    ) -> Transcript:
+        """Block until released, then return a normalized native transcript.
+
+        Args:
+            audio_path: Request-owned local audio path.
+            include_segments: Whether the returned transcript includes segments.
+
+        Returns:
+            Deterministic native transcription after release.
+        """
+        self.calls.append(audio_path)
+        self.started.set()
+        self.release.wait()
+        if not include_segments:
+            return Transcript(TranscriptMethod.FASTER_WHISPER, "en", "Transcript")
+        return TimedTranscript(
+            TranscriptMethod.FASTER_WHISPER,
+            "en",
+            "Transcript",
+            (Segment(0.0, 1.0, "Transcript"),),
         )
 
 
@@ -885,6 +928,76 @@ async def test_transcribe_cleans_prepared_audio_after_youtube_caption_success(
     assert not prepared_directory.exists()
     assert downloader.calls == []
     assert transcriber.calls == []
+
+
+@pytest.mark.asyncio
+async def test_transcription_execution_propagates_cancellation_during_caption_listing(
+    tmp_path: Path,
+) -> None:
+    """Abort caption traversal and native fallback when durable Cancellation arrives."""
+    control = TranscriptionExecutionControl()
+    track = RecordingCaptionTrack("en-US", False, ((0.0, 1.0, "caption"),))
+    caption_provider = RecordingCaptionProvider(
+        (track,),
+        on_list=control.request_cancellation,
+    )
+    downloader = RecordingAudioDownloader()
+    transcriber = FixedTranscriber()
+    executor = build_execution(
+        build_transcription_config(tmp_path),
+        RecordingMetadataExtractor(youtube_metadata()),
+        downloader,
+        transcriber,
+        caption_provider,
+    )
+
+    with pytest.raises(TranscriptionCancellationRequestedError):
+        await executor.execute(
+            inspection.classify_submitted_url(YOUTUBE_URL),
+            control=control,
+        )
+
+    assert caption_provider.calls == ["dQw4w9WgXcQ"]
+    assert track.fetch_calls == 0
+    assert downloader.calls == []
+    assert transcriber.calls == []
+    assert control.cleanup_complete.is_set()
+
+
+@pytest.mark.asyncio
+async def test_transcription_timeout_retains_native_permit_and_media_until_completion(
+    tmp_path: Path,
+) -> None:
+    """Publish timeout before native cleanup but retain ownership until native returns."""
+    config = build_transcription_config(tmp_path).model_copy(
+        update={"transcription_timeout_seconds": 0.01}
+    )
+    downloader = RecordingAudioDownloader()
+    transcriber = BlockingTranscriber()
+    executor = build_execution(
+        config,
+        RecordingMetadataExtractor(tiktok_metadata()),
+        downloader,
+        transcriber,
+    )
+
+    with pytest.raises(TranscriptionTimeoutError):
+        await executor.execute(
+            inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
+            control=TranscriptionExecutionControl(),
+        )
+
+    assert await asyncio.to_thread(transcriber.started.wait, 1)
+    request_directory = downloader.request_directories[0]
+    assert request_directory.is_dir()
+    shutdown_task = asyncio.create_task(executor.shutdown())
+    await asyncio.sleep(0)
+    assert not shutdown_task.done()
+
+    transcriber.release.set()
+    await shutdown_task
+
+    assert not request_directory.exists()
 
 
 @pytest.mark.asyncio
