@@ -31,6 +31,7 @@ from textify.transcription.types import (
     Segment,
     TimedTranscript,
     Transcript,
+    TranscriptionResult,
     TranscriptMethod,
 )
 
@@ -331,6 +332,64 @@ class BlockingTranscriber:
         )
 
 
+class FirstCallBlockingTranscriber:
+    """Block the first native call and expose whether a second call enters."""
+
+    def __init__(self) -> None:
+        """Initialize deterministic first-call native controls."""
+        self.first_entered = threading.Event()
+        self.second_entered = threading.Event()
+        self.release_first = threading.Event()
+        self._call_count = 0
+        self._call_lock = threading.Lock()
+
+    def transcribe(
+        self,
+        audio_path: Path,
+        *,
+        include_segments: bool = True,
+    ) -> Transcript:
+        """Block only the first native call before returning a transcript."""
+        del audio_path, include_segments
+        with self._call_lock:
+            self._call_count += 1
+            call_number = self._call_count
+        if call_number == 1:
+            self.first_entered.set()
+            self.release_first.wait()
+        else:
+            self.second_entered.set()
+        return Transcript(TranscriptMethod.FASTER_WHISPER, "en", "Transcript")
+
+
+class SecondDownloadNotifier(RecordingAudioDownloader):
+    """Signal after the second request has prepared native audio."""
+
+    def __init__(self) -> None:
+        """Initialize complete-audio recording and the second-download signal."""
+        super().__init__()
+        self.second_downloaded = threading.Event()
+
+    def download(
+        self,
+        source_url: str,
+        destination: Path,
+        *,
+        deadline: float,
+        cancellation_event: threading.Event,
+    ) -> Path:
+        """Create audio and notify when a second request has prepared its media."""
+        audio_path = super().download(
+            source_url,
+            destination,
+            deadline=deadline,
+            cancellation_event=cancellation_event,
+        )
+        if len(self.calls) == 2:
+            self.second_downloaded.set()
+        return audio_path
+
+
 class BlockingMetadataExtractor:
     """Block metadata extraction until the caller cancellation event is set."""
 
@@ -436,6 +495,8 @@ def build_transcription_config(temporary_media_root: Path) -> TranscriptionConfi
         Configuration with one native inference permit and stable limits.
     """
     return TranscriptionConfig(
+        gpu_identity="test-gpu",
+        gpu_lock_directory=temporary_media_root / "gpu-locks",
         max_duration_seconds=1800,
         temporary_media_root=temporary_media_root,
         beam_size=1,
@@ -998,6 +1059,108 @@ async def test_transcription_timeout_retains_native_permit_and_media_until_compl
     await shutdown_task
 
     assert not request_directory.exists()
+
+
+@pytest.mark.asyncio
+async def test_timed_out_native_work_keeps_a_waiting_job_outside_transcriber(
+    tmp_path: Path,
+) -> None:
+    """Hold the only native permit until timed-out thread-hosted work exits."""
+    config = build_transcription_config(tmp_path).model_copy(
+        update={"transcription_timeout_seconds": 0.01}
+    )
+    downloader = SecondDownloadNotifier()
+    transcriber = FirstCallBlockingTranscriber()
+    executor = build_execution(
+        config,
+        RecordingMetadataExtractor(tiktok_metadata()),
+        downloader,
+        transcriber,
+    )
+    second_task: asyncio.Task[TranscriptionResult] | None = None
+    second_result: TranscriptionResult | None = None
+
+    try:
+        with pytest.raises(TranscriptionTimeoutError):
+            await executor.execute(
+                inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
+                control=TranscriptionExecutionControl(),
+            )
+        assert await asyncio.to_thread(transcriber.first_entered.wait, 1)
+
+        second_task = asyncio.create_task(
+            executor.execute(
+                inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
+                control=TranscriptionExecutionControl(),
+            )
+        )
+        assert await asyncio.to_thread(downloader.second_downloaded.wait, 1)
+        assert all(directory.is_dir() for directory in downloader.request_directories)
+        assert not transcriber.second_entered.is_set()
+
+        transcriber.release_first.set()
+        second_result = await asyncio.wait_for(second_task, timeout=1)
+    finally:
+        transcriber.release_first.set()
+        if second_task is not None:
+            await asyncio.gather(second_task, return_exceptions=True)
+        await executor.shutdown()
+
+    assert second_result is not None
+    assert transcriber.second_entered.is_set()
+    assert all(not directory.exists() for directory in downloader.request_directories)
+
+
+@pytest.mark.asyncio
+async def test_durable_cancellation_keeps_a_waiting_job_outside_transcriber(
+    tmp_path: Path,
+) -> None:
+    """Keep the native permit after Cancellation until its running call returns."""
+    downloader = SecondDownloadNotifier()
+    transcriber = FirstCallBlockingTranscriber()
+    executor = build_execution(
+        build_transcription_config(tmp_path),
+        RecordingMetadataExtractor(tiktok_metadata()),
+        downloader,
+        transcriber,
+    )
+    first_control = TranscriptionExecutionControl()
+    first_task = asyncio.create_task(
+        executor.execute(
+            inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
+            control=first_control,
+        )
+    )
+    second_task: asyncio.Task[TranscriptionResult] | None = None
+    second_result: TranscriptionResult | None = None
+
+    try:
+        assert await asyncio.to_thread(transcriber.first_entered.wait, 1)
+        first_control.request_cancellation()
+        second_task = asyncio.create_task(
+            executor.execute(
+                inspection.classify_submitted_url(DIRECT_TIKTOK_URL),
+                control=TranscriptionExecutionControl(),
+            )
+        )
+        assert await asyncio.to_thread(downloader.second_downloaded.wait, 1)
+        assert all(directory.is_dir() for directory in downloader.request_directories)
+        assert not transcriber.second_entered.is_set()
+
+        transcriber.release_first.set()
+        with pytest.raises(TranscriptionCancellationRequestedError):
+            await asyncio.wait_for(first_task, timeout=1)
+        second_result = await asyncio.wait_for(second_task, timeout=1)
+    finally:
+        transcriber.release_first.set()
+        await asyncio.gather(first_task, return_exceptions=True)
+        if second_task is not None:
+            await asyncio.gather(second_task, return_exceptions=True)
+        await executor.shutdown()
+
+    assert second_result is not None
+    assert transcriber.second_entered.is_set()
+    assert all(not directory.exists() for directory in downloader.request_directories)
 
 
 @pytest.mark.asyncio

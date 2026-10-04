@@ -41,7 +41,7 @@ def _job_config(database_url: str, *, maximum_outstanding_jobs: int = 8) -> JobC
         Configuration independent of local environment files.
     """
     return JobConfig(
-        database_url=database_url,
+        database_url=database_url,  # type: ignore[arg-type]
         max_outstanding_jobs=maximum_outstanding_jobs,
         job_queue_timeout_seconds=20,
         job_retention_seconds=86_400,

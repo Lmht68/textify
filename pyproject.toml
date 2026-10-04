@@ -42,6 +42,7 @@ textify-worker = "textify.jobs.worker:main"
 asyncio_mode = "auto"
 markers = [
     "live: exercises explicitly configured public videos against a running Textify API",
+    "gpu: exercises two real local inputs through one CUDA Faster-Whisper model",
 ]
 
 [tool.ruff]

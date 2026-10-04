@@ -41,13 +41,16 @@ def test_database_url_rejects_non_async_postgresql_values(
 ) -> None:
     """Reject SQLite and synchronous PostgreSQL durable-store URLs."""
     with pytest.raises(ValidationError):
-        JobConfig(database_url=database_url, _env_file=None)  # type: ignore[call-arg]
+        JobConfig(
+            database_url=database_url,  # type: ignore[arg-type]
+            _env_file=None,  # type: ignore[call-arg]
+        )
 
 
 def test_durable_job_settings_use_bounded_defaults() -> None:
     """Default durable admission, deadline, and retention policy."""
     settings = JobConfig(
-        database_url=_DATABASE_URL,
+        database_url=_DATABASE_URL,  # type: ignore[arg-type]
         _env_file=None,  # type: ignore[call-arg]
     )
 

@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import AsyncIterator, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 from uuid import UUID, uuid1, uuid4
 
 import pytest
@@ -228,15 +229,18 @@ async def test_dispatch_recovery_migration_backfills_and_downgrades_attempts(
                     uuid4(),
                 )
             original_attempt_tokens = dict(
-                (
-                    await connection.execute(
-                        text(
-                            "SELECT job_id, execution_attempt_token "
-                            "FROM transcription_job_execution_attempt "
-                            "ORDER BY job_id"
+                cast(
+                    list[tuple[object, object]],
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT job_id, execution_attempt_token "
+                                "FROM transcription_job_execution_attempt "
+                                "ORDER BY job_id"
+                            )
                         )
-                    )
-                ).all()
+                    ).all(),
+                )
             )
 
         await asyncio.to_thread(command.upgrade, alembic_config, "head")
@@ -353,15 +357,18 @@ async def test_dispatch_recovery_migration_backfills_and_downgrades_attempts(
         )
         async with engine.connect() as connection:
             downgraded_attempt_tokens = dict(
-                (
-                    await connection.execute(
-                        text(
-                            "SELECT job_id, execution_attempt_token "
-                            "FROM transcription_job_execution_attempt "
-                            "ORDER BY job_id"
+                cast(
+                    list[tuple[object, object]],
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT job_id, execution_attempt_token "
+                                "FROM transcription_job_execution_attempt "
+                                "ORDER BY job_id"
+                            )
                         )
-                    )
-                ).all()
+                    ).all(),
+                )
             )
         assert await _revision_rows(engine) == ["0002_execution_attempts"]
         assert downgraded_attempt_tokens == original_attempt_tokens

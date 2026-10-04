@@ -73,6 +73,11 @@ def _dispatch(internal_job_id: int) -> JobDispatch:
     return JobDispatch(internal_job_id, uuid4())
 
 
+async def _owner_is_ready() -> bool:
+    """Report live ownership for ordinary claim-manager tests."""
+    return True
+
+
 def _manager(
     repository: ClaimManagerRepository, max_active_claims: int
 ) -> ExecutionClaimManager:
@@ -82,7 +87,38 @@ def _manager(
         max_active_claims=max_active_claims,
         heartbeat_interval=timedelta(milliseconds=10),
         claim_lease_duration=timedelta(milliseconds=60),
+        claim_ready=_owner_is_ready,
     )
+
+
+@pytest.mark.asyncio
+async def test_claim_manager_does_not_write_claim_when_owner_is_not_ready() -> None:
+    """Reject delivery without a durable claim after ownership readiness is lost."""
+    repository = ClaimManagerRepository()
+
+    async def owner_is_not_ready() -> bool:
+        """Report a model owner that cannot safely admit a claim."""
+        return False
+
+    manager = ExecutionClaimManager(
+        repository,
+        max_active_claims=1,
+        heartbeat_interval=timedelta(milliseconds=10),
+        claim_lease_duration=timedelta(milliseconds=60),
+        claim_ready=owner_is_not_ready,
+    )
+    try:
+        await manager.start()
+
+        claimed_job = await manager.claim(
+            _dispatch(1),
+            TranscriptionExecutionControl(),
+        )
+    finally:
+        await manager.shutdown()
+
+    assert claimed_job is None
+    assert repository.claim_calls == []
 
 
 async def _wait_for_heartbeat_count(

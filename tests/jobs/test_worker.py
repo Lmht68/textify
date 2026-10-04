@@ -106,6 +106,55 @@ class RecordingEngine:
             self._lifecycle_events.append("engine_dispose")
 
 
+class RecordingGpuOwnership:
+    """Record GPU ownership lifecycle calls without taking external locks."""
+
+    def __init__(self, lifecycle_events: list[str] | None = None) -> None:
+        """Initialize unacquired ownership state.
+
+        Args:
+            lifecycle_events: Optional ordered lifecycle event sink.
+        """
+        self.acquire_calls = 0
+        self.release_calls = 0
+        self._ready = False
+        self._lifecycle_events = lifecycle_events
+
+    @property
+    def is_ready(self) -> bool:
+        """Return whether model ownership currently admits work."""
+        return self._ready
+
+    async def acquire(self) -> None:
+        """Record host and database lock acquisition."""
+        self.acquire_calls += 1
+        if self._lifecycle_events is not None:
+            self._lifecycle_events.append("gpu_acquire")
+
+    def mark_model_ready(self) -> None:
+        """Record model readiness after deferred construction."""
+        self._ready = True
+        if self._lifecycle_events is not None:
+            self._lifecycle_events.append("gpu_model_ready")
+
+    def mark_model_not_ready(self) -> None:
+        """Prevent new work while retaining ownership for shutdown."""
+        self._ready = False
+        if self._lifecycle_events is not None:
+            self._lifecycle_events.append("gpu_model_not_ready")
+
+    async def can_claim(self) -> bool:
+        """Return current fake ownership readiness."""
+        return self._ready
+
+    async def release(self) -> None:
+        """Record final GPU ownership release."""
+        self.release_calls += 1
+        self._ready = False
+        if self._lifecycle_events is not None:
+            self._lifecycle_events.append("gpu_release")
+
+
 class CapturingRuntime:
     """Record task payload forwarding without starting a worker loop."""
 
@@ -130,7 +179,13 @@ def test_worker_runtime_processes_only_valid_payloads_on_one_loop() -> None:
     executor = ShutdownExecutor()
     claim_manager = RecordingClaimManager()
     engine = RecordingEngine()
-    runtime = TranscriptionWorkerRuntime(processor, executor, claim_manager, engine)
+    gpu_ownership = RecordingGpuOwnership()
+    runtime = TranscriptionWorkerRuntime(
+        lambda: (processor, executor),
+        claim_manager,
+        gpu_ownership,
+        engine,
+    )
     first_dispatch = JobDispatch(1, uuid4())
     second_dispatch = JobDispatch(2, uuid4())
 
@@ -151,6 +206,50 @@ def test_worker_runtime_processes_only_valid_payloads_on_one_loop() -> None:
     assert engine.dispose_calls == 1
 
 
+def test_worker_runtime_starts_and_stops_resources_in_gpu_safe_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Acquire ownership before model load and release it after native cleanup."""
+    from textify.jobs import worker
+
+    lifecycle_events: list[str] = []
+
+    async def verify_database(_engine: AsyncEngine) -> None:
+        """Record the initial PostgreSQL verification."""
+        lifecycle_events.append("database_verify")
+
+    def build_resources() -> tuple[RecordingProcessor, ShutdownExecutor]:
+        """Record deferred model-backed processor construction."""
+        lifecycle_events.append("resources_factory")
+        return RecordingProcessor(), ShutdownExecutor(lifecycle_events)
+
+    monkeypatch.setattr(worker, "verify_application_database", verify_database)
+    runtime = worker.TranscriptionWorkerRuntime(
+        build_resources,
+        RecordingClaimManager(lifecycle_events),
+        RecordingGpuOwnership(lifecycle_events),
+        RecordingEngine(lifecycle_events),
+        verify_database=True,
+    )
+
+    runtime.start()
+    runtime.shutdown()
+
+    assert lifecycle_events == [
+        "database_verify",
+        "gpu_acquire",
+        "resources_factory",
+        "gpu_model_ready",
+        "claim_manager_start",
+        "claim_manager_stop_accepting",
+        "gpu_model_not_ready",
+        "claim_manager_shutdown",
+        "executor_shutdown",
+        "gpu_release",
+        "engine_dispose",
+    ]
+
+
 def test_worker_shutdown_signal_stops_claiming_without_interrupting_work() -> None:
     """Close admission on Celery warm shutdown without cancelling the worker loop."""
     from textify.jobs.worker import (
@@ -161,9 +260,9 @@ def test_worker_shutdown_signal_stops_claiming_without_interrupting_work() -> No
 
     claim_manager = RecordingClaimManager()
     runtime = TranscriptionWorkerRuntime(
-        RecordingProcessor(),
-        ShutdownExecutor(),
+        lambda: (RecordingProcessor(), ShutdownExecutor()),
         claim_manager,
+        RecordingGpuOwnership(),
         RecordingEngine(),
     )
     runtime.start()
@@ -190,9 +289,12 @@ def test_worker_runtime_shutdown_drains_claims_before_owned_resources() -> None:
 
     lifecycle_events: list[str] = []
     runtime = TranscriptionWorkerRuntime(
-        RecordingProcessor(),
-        ShutdownExecutor(lifecycle_events),
+        lambda: (
+            RecordingProcessor(),
+            ShutdownExecutor(lifecycle_events),
+        ),
         RecordingClaimManager(lifecycle_events),
+        RecordingGpuOwnership(lifecycle_events),
         RecordingEngine(lifecycle_events),
     )
     runtime.start()
@@ -202,10 +304,163 @@ def test_worker_runtime_shutdown_drains_claims_before_owned_resources() -> None:
 
     assert lifecycle_events == [
         "claim_manager_stop_accepting",
+        "gpu_model_not_ready",
         "claim_manager_shutdown",
         "executor_shutdown",
+        "gpu_release",
         "engine_dispose",
     ]
+
+
+def test_worker_runtime_rejects_unusable_native_parallelism_before_lock_or_model_work(
+    tmp_path: Path,
+) -> None:
+    """Reject a worker that cannot drive each configured native model worker."""
+    from textify.jobs import worker
+
+    adapter_factory_calls = 0
+
+    def adapter_factory(_config: TranscriptionConfig) -> TranscriptionAdapters:
+        """Record unexpected deferred model construction."""
+        nonlocal adapter_factory_calls
+        adapter_factory_calls += 1
+        raise AssertionError("Invalid concurrency must precede model construction.")
+
+    configuration = TranscriptionConfig(
+        gpu_identity="test-gpu",
+        gpu_lock_directory=tmp_path / "gpu-locks",
+        temporary_media_root=tmp_path / "media",
+        transcription_concurrency=3,
+        max_media_bytes=1,
+    )
+    dispatch_config = JobDispatchConfig(
+        broker_url="redis://127.0.0.1:6379/15",  # type: ignore[arg-type]
+        worker_concurrency=2,
+        _env_file=None,  # type: ignore[call-arg]
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"^TEXTIFY_WORKER_CONCURRENCY must be at least "
+            r"TEXTIFY_TRANSCRIPTION_CONCURRENCY\.$"
+        ),
+    ):
+        worker.TranscriptionWorkerRuntime.from_repository(
+            cast(TranscriptionJobExecutionRepository, object()),
+            cast(AsyncEngine, object()),
+            configuration,
+            dispatch_config,
+            adapters_factory=adapter_factory,
+        )
+
+    assert adapter_factory_calls == 0
+    assert not configuration.gpu_lock_directory.exists()
+
+
+def test_worker_runtime_does_not_load_model_or_start_claims_after_lock_conflict() -> (
+    None
+):
+    """Reject startup before deferred model construction when ownership is unavailable."""
+    from textify.jobs.gpu_ownership import GpuOwnershipConflictError
+    from textify.jobs.worker import TranscriptionWorkerRuntime
+
+    lifecycle_events: list[str] = []
+    claim_manager = RecordingClaimManager(lifecycle_events)
+    gpu_ownership = RecordingGpuOwnership(lifecycle_events)
+    engine = RecordingEngine(lifecycle_events)
+    resources_factory_calls = 0
+
+    async def reject_ownership() -> None:
+        """Simulate an already-owned physical GPU."""
+        gpu_ownership.acquire_calls += 1
+        lifecycle_events.append("gpu_acquire")
+        raise GpuOwnershipConflictError(
+            "GPU ownership is already held for the configured identity."
+        )
+
+    def build_resources() -> tuple[RecordingProcessor, ShutdownExecutor]:
+        """Fail if lock conflict allows deferred model construction."""
+        nonlocal resources_factory_calls
+        resources_factory_calls += 1
+        raise AssertionError("GPU lock conflict must precede model construction.")
+
+    gpu_ownership.acquire = reject_ownership  # type: ignore[method-assign]
+    runtime = TranscriptionWorkerRuntime(
+        build_resources,
+        claim_manager,
+        gpu_ownership,
+        engine,
+    )
+
+    with pytest.raises(GpuOwnershipConflictError):
+        runtime.start()
+
+    assert resources_factory_calls == 0
+    assert claim_manager.start_calls == 0
+    assert gpu_ownership.release_calls == 1
+    assert engine.dispose_calls == 1
+
+
+def test_worker_runtime_rolls_back_ownership_when_resource_construction_fails() -> None:
+    """Release startup ownership without opening claim admission after a model failure."""
+    from textify.jobs.worker import TranscriptionWorkerRuntime
+
+    lifecycle_events: list[str] = []
+    claim_manager = RecordingClaimManager(lifecycle_events)
+    gpu_ownership = RecordingGpuOwnership(lifecycle_events)
+    engine = RecordingEngine(lifecycle_events)
+
+    def build_resources() -> tuple[RecordingProcessor, ShutdownExecutor]:
+        """Simulate deferred adapter or model construction failure."""
+        raise RuntimeError("model initialization failed")
+
+    runtime = TranscriptionWorkerRuntime(
+        build_resources,
+        claim_manager,
+        gpu_ownership,
+        engine,
+    )
+
+    with pytest.raises(RuntimeError, match=r"^model initialization failed$"):
+        runtime.start()
+
+    assert claim_manager.start_calls == 0
+    assert gpu_ownership.release_calls == 1
+    assert engine.dispose_calls == 1
+    assert lifecycle_events == [
+        "gpu_acquire",
+        "gpu_model_not_ready",
+        "gpu_release",
+        "engine_dispose",
+    ]
+
+
+def test_worker_runtime_rejects_payloads_before_runtime_or_ownership_readiness() -> (
+    None
+):
+    """Do not schedule valid private payloads until both readiness gates are true."""
+    from textify.jobs.worker import TranscriptionWorkerRuntime
+
+    processor = RecordingProcessor()
+    gpu_ownership = RecordingGpuOwnership()
+    runtime = TranscriptionWorkerRuntime(
+        lambda: (processor, ShutdownExecutor()),
+        RecordingClaimManager(),
+        gpu_ownership,
+        RecordingEngine(),
+    )
+    payload = JobDispatch(1, uuid4()).to_payload()
+
+    runtime.process_payload(payload)
+    runtime.start()
+    try:
+        gpu_ownership.mark_model_not_ready()
+        runtime.process_payload(payload)
+    finally:
+        runtime.shutdown()
+
+    assert processor.dispatches == []
 
 
 def test_registered_task_is_unbound_and_forwards_one_json_payload() -> None:
@@ -214,7 +469,7 @@ def test_registered_task_is_unbound_and_forwards_one_json_payload() -> None:
 
     celery_app = create_celery_app(
         JobDispatchConfig(
-            broker_url="redis://127.0.0.1:6379/15",
+            broker_url="redis://127.0.0.1:6379/15",  # type: ignore[arg-type]
             _env_file=None,  # type: ignore[call-arg]
         )
     )
@@ -243,24 +498,25 @@ def test_worker_runtime_checks_media_capacity_before_adapter_construction(
         raise AssertionError("Capacity failure must precede adapter construction.")
 
     monkeypatch.setattr(
-        worker.shutil,
-        "disk_usage",
-        lambda _root: SimpleNamespace(free=599),
+        "textify.jobs.worker.shutil.disk_usage",
+        lambda _root: SimpleNamespace(free=699),
     )
     configuration = TranscriptionConfig(
+        gpu_identity="test-gpu",
+        gpu_lock_directory=tmp_path / "gpu-locks",
         temporary_media_root=tmp_path / "media",
         transcription_concurrency=3,
         max_media_bytes=100,
     )
     dispatch_config = JobDispatchConfig(
-        broker_url="redis://127.0.0.1:6379/15",
-        worker_concurrency=2,
+        broker_url="redis://127.0.0.1:6379/15",  # type: ignore[arg-type]
+        worker_concurrency=3,
         _env_file=None,  # type: ignore[call-arg]
     )
 
     with pytest.raises(
         RuntimeError,
-        match=r"^Temporary media root requires 600 available bytes; 599 are available\.$",
+        match=r"^Temporary media root requires 700 available bytes; 699 are available\.$",
     ):
         worker.TranscriptionWorkerRuntime.from_repository(
             cast(TranscriptionJobExecutionRepository, object()),
@@ -313,6 +569,7 @@ async def test_worker_runtime_uses_its_own_loop_for_database_connections(
     runtime: worker.TranscriptionWorkerRuntime | None = None
 
     claim_manager = RecordingClaimManager()
+    gpu_ownership = RecordingGpuOwnership()
 
     def build_runtime(
         cls: type[worker.TranscriptionWorkerRuntime],
@@ -325,9 +582,9 @@ async def test_worker_runtime_uses_its_own_loop_for_database_connections(
         del cls, configuration, dispatch_config
         probe.repository = repository
         return worker.TranscriptionWorkerRuntime(
-            probe,
-            executor,
+            lambda: (probe, executor),
             claim_manager,
+            gpu_ownership,
             worker_engine,
         )
 
@@ -341,13 +598,17 @@ async def test_worker_runtime_uses_its_own_loop_for_database_connections(
             lambda: asyncio.run(
                 worker._create_worker_runtime(
                     engine,
-                    JobConfig(database_url=migrated_postgresql_database_url),
+                    JobConfig(
+                        database_url=migrated_postgresql_database_url,  # type: ignore[arg-type]
+                    ),
                     JobDispatchConfig(
-                        broker_url="redis://127.0.0.1:6379/0",
+                        broker_url="redis://127.0.0.1:6379/0",  # type: ignore[arg-type]
                         worker_concurrency=1,
                         _env_file=None,  # type: ignore[call-arg]
                     ),
                     TranscriptionConfig(
+                        gpu_identity="test-gpu",
+                        gpu_lock_directory=tmp_path / "gpu-locks",
                         temporary_media_root=tmp_path,
                         transcription_concurrency=1,
                         max_media_bytes=1024,
@@ -355,6 +616,7 @@ async def test_worker_runtime_uses_its_own_loop_for_database_connections(
                 )
             )
         )
+        assert runtime is not None
         runtime.start()
         runtime.process_payload(JobDispatch(1, uuid4()).to_payload())
     finally:

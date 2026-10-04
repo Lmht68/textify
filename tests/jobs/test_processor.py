@@ -5,7 +5,9 @@ from uuid import uuid4
 import pytest
 
 from textify.jobs.types import ClaimedTranscriptionJob, ExecutionClaim, JobDispatch
+from textify.transcription import inspection
 from textify.transcription.exceptions import TranscriptionFailedError
+from textify.transcription.schemas import TranscriptionResponse
 from textify.transcription.service import TranscriptionExecutionControl
 from textify.transcription.types import (
     Platform,
@@ -22,7 +24,7 @@ class RecordingExecutionRepository:
 
     def __init__(self) -> None:
         """Initialize empty terminal publication records."""
-        self.successes: list[tuple[ExecutionClaim, dict[str, object]]] = []
+        self.successes: list[tuple[ExecutionClaim, TranscriptionResponse]] = []
         self.failures: list[tuple[ExecutionClaim, str, str]] = []
         self.cancelled_claims: list[ExecutionClaim] = []
         self.success_published = True
@@ -31,7 +33,7 @@ class RecordingExecutionRepository:
     async def publish_success(
         self,
         claim: ExecutionClaim,
-        projected_result: dict[str, object],
+        projected_result: TranscriptionResponse,
     ) -> bool:
         """Record the requested success publication outcome."""
         self.successes.append((claim, projected_result))
@@ -88,11 +90,15 @@ class ResultExecutor:
         self.calls = 0
 
     async def execute(
-        self, _submitted: object, *, control: object, **_kwargs: object
+        self,
+        _submitted: inspection.SubmittedSource,
+        *,
+        control: TranscriptionExecutionControl,
+        include_segments: bool = True,
     ) -> TranscriptionResult:
         """Return a fixed result after exposing provider cleanup completion."""
         self.calls += 1
-        control.cleanup_complete.set()  # type: ignore[attr-defined]
+        control.cleanup_complete.set()
         return _result()
 
 
@@ -104,11 +110,15 @@ class FailingExecutor:
         self.calls = 0
 
     async def execute(
-        self, _submitted: object, *, control: object, **_kwargs: object
+        self,
+        _submitted: inspection.SubmittedSource,
+        *,
+        control: TranscriptionExecutionControl,
+        include_segments: bool = True,
     ) -> TranscriptionResult:
         """Raise the configured safe provider error."""
         self.calls += 1
-        control.cleanup_complete.set()  # type: ignore[attr-defined]
+        control.cleanup_complete.set()
         raise TranscriptionFailedError()
 
 

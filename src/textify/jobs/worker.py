@@ -29,6 +29,7 @@ from textify.jobs.contracts import (
     TranscriptionJobStoreUnavailableError,
 )
 from textify.jobs.database import create_application_engine, verify_application_database
+from textify.jobs.gpu_ownership import GpuModelOwnership
 from textify.jobs.processor import TranscriptionJobProcessor
 from textify.jobs.repository import PostgresTranscriptionJobRepository
 from textify.jobs.service import utc_now
@@ -87,6 +88,35 @@ class _EngineOwner(Protocol):
         ...
 
 
+class _GpuOwnershipLifecycle(Protocol):
+    """Own model readiness and both physical-GPU locks for one worker."""
+
+    @property
+    def is_ready(self) -> bool:
+        """Return whether locked ownership and the model are ready for work."""
+        ...
+
+    async def acquire(self) -> None:
+        """Acquire physical-GPU locks before model construction."""
+        ...
+
+    def mark_model_ready(self) -> None:
+        """Permit claims after the worker model is loaded."""
+        ...
+
+    def mark_model_not_ready(self) -> None:
+        """Prevent claims while retaining ownership for cleanup."""
+        ...
+
+    async def can_claim(self) -> bool:
+        """Probe current ownership before durable claim admission."""
+        ...
+
+    async def release(self) -> None:
+        """Release both ownership locks after model teardown."""
+        ...
+
+
 class _TaskPayloadProcessor(Protocol):
     """Accept one deserialized private Celery task payload."""
 
@@ -99,14 +129,17 @@ class _TaskPayloadProcessor(Protocol):
         ...
 
 
+_ExecutionResourcesFactory = Callable[[], tuple[_DispatchProcessor, _ShutdownExecutor]]
+
+
 class TranscriptionWorkerRuntime:
-    """Own one executor and one long-lived asyncio loop for Celery task threads."""
+    """Own one model and one long-lived asyncio loop for Celery task threads."""
 
     def __init__(
         self,
-        processor: _DispatchProcessor,
-        executor: _ShutdownExecutor,
+        resources_factory: _ExecutionResourcesFactory,
         claim_manager: _ExecutionClaimLifecycle,
+        gpu_ownership: _GpuOwnershipLifecycle,
         engine: _EngineOwner,
         *,
         verify_database: bool = False,
@@ -114,21 +147,24 @@ class TranscriptionWorkerRuntime:
         """Initialize unstarted worker runtime dependencies.
 
         Args:
-            processor: Claimed Execution Attempt processing boundary.
-            executor: Process-lifetime provider owner to shut down exactly once.
+            resources_factory: Deferred single construction of processor and executor.
             claim_manager: Worker-local claim ownership lifecycle.
+            gpu_ownership: Physical-GPU ownership and readiness lifecycle.
             engine: PostgreSQL connection owner disposed on this runtime's loop.
             verify_database: Whether startup validates the owned PostgreSQL engine.
         """
-        self._processor = processor
-        self._executor = executor
+        self._resources_factory = resources_factory
+        self._processor: _DispatchProcessor | None = None
+        self._executor: _ShutdownExecutor | None = None
         self._claim_manager = claim_manager
+        self._gpu_ownership = gpu_ownership
         self._engine = engine
         self._verify_database = verify_database
         self._state_lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
         self._started = False
+        self._runtime_ready = False
 
     @classmethod
     def from_repository(
@@ -139,7 +175,7 @@ class TranscriptionWorkerRuntime:
         dispatch_config: JobDispatchConfig,
         adapters_factory: TranscriptionAdaptersFactory = build_transcription_adapters,
     ) -> TranscriptionWorkerRuntime:
-        """Validate worker resources and construct one managed processing runtime.
+        """Validate worker resources and construct one deferred managed runtime.
 
         Args:
             repository: PostgreSQL claim and terminal-publication boundary.
@@ -149,19 +185,25 @@ class TranscriptionWorkerRuntime:
             adapters_factory: Process-lifetime adapter and model construction boundary.
 
         Returns:
-            Unstarted runtime with exactly one adapter bundle, executor, and manager.
+            Unstarted runtime that loads its single adapter bundle only after GPU locks.
 
         Raises:
-            RuntimeError: If temporary media cannot be created or hold configured quota.
+            RuntimeError: If media, worker capacity, or GPU ownership cannot satisfy
+                the configured runtime contract.
         """
         _ensure_writable_temporary_media_root(transcription_config.temporary_media_root)
+        _validate_worker_native_concurrency(
+            dispatch_config.worker_concurrency,
+            transcription_config.transcription_concurrency,
+        )
         _validate_temporary_media_capacity(
             transcription_config,
             dispatch_config.worker_concurrency,
         )
-        executor = TranscriptionExecutor(
-            adapters_factory(transcription_config),
-            transcription_config,
+        gpu_ownership = GpuModelOwnership(
+            engine,
+            transcription_config.gpu_identity,
+            transcription_config.gpu_lock_directory,
         )
         claim_manager = ExecutionClaimManager(
             repository,
@@ -172,11 +214,24 @@ class TranscriptionWorkerRuntime:
             claim_lease_duration=timedelta(
                 seconds=dispatch_config.attempt_lease_seconds
             ),
+            claim_ready=gpu_ownership.can_claim,
         )
+
+        def build_execution_resources() -> tuple[_DispatchProcessor, _ShutdownExecutor]:
+            """Construct the one model-backed executor after ownership locks exist."""
+            executor = TranscriptionExecutor(
+                adapters_factory(transcription_config),
+                transcription_config,
+            )
+            return (
+                TranscriptionJobProcessor(repository, executor, claim_manager),
+                executor,
+            )
+
         return cls(
-            TranscriptionJobProcessor(repository, executor, claim_manager),
-            executor,
+            build_execution_resources,
             claim_manager,
+            gpu_ownership,
             engine,
             verify_database=True,
         )
@@ -220,13 +275,14 @@ class TranscriptionWorkerRuntime:
             logger.warning("rejected malformed transcription job dispatch")
             return
         with self._state_lock:
-            loop = self._loop if self._started else None
-        if loop is None:
+            loop = self._loop if self._started and self._runtime_ready else None
+            processor = self._processor
+        if loop is None or processor is None or not self._gpu_ownership.is_ready:
             logger.error("transcription worker runtime is unavailable")
             return
         try:
             future = asyncio.run_coroutine_threadsafe(
-                self._processor.process(dispatch),
+                processor.process(dispatch),
                 loop,
             )
             future.result()
@@ -246,13 +302,14 @@ class TranscriptionWorkerRuntime:
             loop.call_soon_threadsafe(self._claim_manager.stop_accepting)
 
     def shutdown(self) -> None:
-        """Drain claims, native work, and database connections before loop teardown."""
+        """Drain claims, native work, ownership, and connections before loop teardown."""
         with self._state_lock:
             if not self._started:
                 return
             loop = self._loop
             loop_thread = self._loop_thread
             self._started = False
+            self._runtime_ready = False
         assert loop is not None
         assert loop_thread is not None
         try:
@@ -268,37 +325,76 @@ class TranscriptionWorkerRuntime:
                 self._loop_thread = None
 
     async def _start_resources(self) -> None:
-        """Verify PostgreSQL and start heartbeat monitoring on the worker loop."""
-        if self._verify_database:
-            await verify_application_database(cast(AsyncEngine, self._engine))
-        await self._claim_manager.start()
+        """Acquire ownership, load the model, and start claim monitoring."""
+        startup_complete = False
+        try:
+            if self._verify_database:
+                await verify_application_database(cast(AsyncEngine, self._engine))
+            await self._gpu_ownership.acquire()
+            processor, executor = self._resources_factory()
+            self._processor = processor
+            self._executor = executor
+            self._gpu_ownership.mark_model_ready()
+            await self._claim_manager.start()
+            with self._state_lock:
+                self._runtime_ready = True
+            startup_complete = True
+        finally:
+            if not startup_complete:
+                await self._rollback_startup()
+
+    async def _rollback_startup(self) -> None:
+        """Release every partially started resource without masking startup failure."""
+        self._gpu_ownership.mark_model_not_ready()
+        executor = self._executor
+        self._processor = None
+        self._executor = None
+        if executor is not None:
+            try:
+                await executor.shutdown()
+            except Exception:  # noqa: BLE001
+                logger.error("transcription executor startup cleanup failed")
+        try:
+            await self._gpu_ownership.release()
+        except Exception:  # noqa: BLE001
+            logger.error("GPU ownership startup cleanup failed")
+        try:
+            await self._engine.dispose()
+        except Exception:  # noqa: BLE001
+            logger.error("worker engine startup cleanup failed")
 
     async def _shutdown_resources(self) -> None:
         """Drain owned resources on the same loop that used them."""
         self._claim_manager.stop_accepting()
+        self._gpu_ownership.mark_model_not_ready()
         try:
             await self._claim_manager.shutdown()
         finally:
+            executor = self._executor
             try:
-                await self._executor.shutdown()
+                if executor is not None:
+                    await executor.shutdown()
             finally:
-                await self._engine.dispose()
+                self._processor = None
+                self._executor = None
+                try:
+                    await self._gpu_ownership.release()
+                finally:
+                    await self._engine.dispose()
 
     def _close_after_start_failure(
         self,
         loop: asyncio.AbstractEventLoop,
         loop_thread: threading.Thread,
     ) -> None:
-        """Dispose the engine and stop a loop whose claim monitor could not start."""
-        try:
-            asyncio.run_coroutine_threadsafe(self._engine.dispose(), loop).result()
-        finally:
-            loop.call_soon_threadsafe(loop.stop)
-            loop_thread.join()
-            with self._state_lock:
-                self._loop = None
-                self._loop_thread = None
-                self._started = False
+        """Stop a loop whose startup rollback already released every resource."""
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join()
+        with self._state_lock:
+            self._loop = None
+            self._loop_thread = None
+            self._started = False
+            self._runtime_ready = False
 
 
 def register_transcription_task(
@@ -374,6 +470,26 @@ def _ensure_writable_temporary_media_root(root: Path) -> None:
         raise RuntimeError(
             "Temporary media root must be a writable directory."
         ) from exc
+
+
+def _validate_worker_native_concurrency(
+    worker_concurrency: int,
+    transcription_concurrency: int,
+) -> None:
+    """Require enough Celery threads to drive every configured model worker.
+
+    Args:
+        worker_concurrency: Celery threads available to this worker process.
+        transcription_concurrency: Faster-Whisper native worker and permit count.
+
+    Raises:
+        RuntimeError: If Celery cannot drive every configured native worker.
+    """
+    if worker_concurrency < transcription_concurrency:
+        raise RuntimeError(
+            "TEXTIFY_WORKER_CONCURRENCY must be at least "
+            "TEXTIFY_TRANSCRIPTION_CONCURRENCY."
+        )
 
 
 def _validate_temporary_media_capacity(
@@ -473,7 +589,7 @@ def main() -> None:
     """Start one dedicated threads-pool Transcription Job worker process."""
     job_config = JobConfig()  # type: ignore[call-arg]
     dispatch_config = JobDispatchConfig()  # type: ignore[call-arg]
-    transcription_config = TranscriptionConfig()
+    transcription_config = TranscriptionConfig()  # type: ignore[call-arg]
     engine = create_application_engine(str(job_config.database_url))
     runtime: TranscriptionWorkerRuntime | None = None
     shutdown_receiver: Callable[..., None] | None = None

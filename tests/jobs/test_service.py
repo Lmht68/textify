@@ -1,11 +1,15 @@
 """Tests for FastAPI-owned durable job lifecycle coordination."""
 
 from datetime import UTC, datetime
+from typing import cast
 from uuid import uuid4
 
 import pytest
 
-from textify.jobs.contracts import TranscriptionJobStoreUnavailableError
+from textify.jobs.contracts import (
+    TranscriptionJobApiRepository,
+    TranscriptionJobStoreUnavailableError,
+)
 from textify.jobs.exceptions import JobStoreUnavailableError
 from textify.jobs.service import TranscriptionJobService
 from textify.jobs.types import JobStatus, ProcessingTranscriptionJob
@@ -47,7 +51,7 @@ async def test_service_latches_store_failure_and_closes_subsequent_admission() -
     repository = StoreFailingRepository()
     unavailable_transitions: list[None] = []
     service = TranscriptionJobService(
-        repository,
+        cast(TranscriptionJobApiRepository, repository),
         on_store_unavailable=lambda: unavailable_transitions.append(None),
     )
 
@@ -66,7 +70,10 @@ async def test_service_returns_processing_cancellation_without_execution_signal(
 ):
     """Return the persisted processing snapshot without a worker-local side effect."""
     repository = CancellingRepository()
-    service = TranscriptionJobService(repository, on_store_unavailable=lambda: None)
+    service = TranscriptionJobService(
+        cast(TranscriptionJobApiRepository, repository),
+        on_store_unavailable=lambda: None,
+    )
 
     cancellation = await service.cancel(str(uuid4()))
 

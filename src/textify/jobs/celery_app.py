@@ -29,6 +29,7 @@ def create_celery_app(config: JobDispatchConfig) -> Celery:
         task_ignore_result=True,
         task_store_errors_even_if_ignored=False,
         task_always_eager=False,
+        worker_pool="threads",
         task_default_queue=TRANSCRIPTION_QUEUE,
         task_queues=(Queue(TRANSCRIPTION_QUEUE),),
         task_routes={TRANSCRIPTION_TASK: {"queue": TRANSCRIPTION_QUEUE}},

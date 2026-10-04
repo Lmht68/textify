@@ -30,6 +30,7 @@ from textify.jobs.config import JobConfig, JobDispatchConfig
 from textify.jobs.contracts import TranscriptionJobStoreUnavailableError
 from textify.jobs.database import create_application_engine
 from textify.jobs.dispatch import CeleryJobDispatchPublisher
+from textify.jobs.gpu_ownership import GpuModelOwnership
 from textify.jobs.processor import TranscriptionJobProcessor
 from textify.jobs.reconciler import ReconcilerPolicy, TranscriptionJobReconciler
 from textify.jobs.repository import PostgresTranscriptionJobRepository
@@ -370,6 +371,8 @@ def _worker_transcription_config(
         Valid configuration with a short timeout for retained native work only.
     """
     return TranscriptionConfig(
+        gpu_identity="test-gpu-worker-loss",
+        gpu_lock_directory=media_root / "gpu-locks",
         temporary_media_root=media_root,
         transcription_concurrency=1,
         max_media_bytes=1024,
@@ -405,26 +408,38 @@ def _run_worker_process(
         clock=utc_now,
     )
     worker_repository = _WorkerRepository(repository, mode, control)
-    adapters = TranscriptionAdapters(
-        metadata_extractor=_WorkerMetadataExtractor(mode, control),
-        caption_provider=_WorkerCaptionProvider(mode, control, caption_starts),
-        audio_downloader=_WorkerAudioDownloader(),
-        whisper_transcriber=_WorkerNativeTranscriber(control),
-    )
-    executor = TranscriptionExecutor(
-        adapters,
-        _worker_transcription_config(Path(media_root), mode),
+    transcription_config = _worker_transcription_config(Path(media_root), mode)
+    gpu_ownership = GpuModelOwnership(
+        engine,
+        transcription_config.gpu_identity,
+        transcription_config.gpu_lock_directory,
     )
     claim_manager = ExecutionClaimManager(
         worker_repository,
         max_active_claims=1,
         heartbeat_interval=timedelta(seconds=_HEARTBEAT_SECONDS),
         claim_lease_duration=timedelta(seconds=_LEASE_SECONDS),
+        claim_ready=gpu_ownership.can_claim,
     )
+
+    def build_resources() -> tuple[TranscriptionJobProcessor, TranscriptionExecutor]:
+        """Construct process-worker providers after GPU ownership is acquired."""
+        adapters = TranscriptionAdapters(
+            metadata_extractor=_WorkerMetadataExtractor(mode, control),
+            caption_provider=_WorkerCaptionProvider(mode, control, caption_starts),
+            audio_downloader=_WorkerAudioDownloader(),
+            whisper_transcriber=_WorkerNativeTranscriber(control),
+        )
+        executor = TranscriptionExecutor(adapters, transcription_config)
+        return (
+            TranscriptionJobProcessor(worker_repository, executor, claim_manager),
+            executor,
+        )
+
     runtime = TranscriptionWorkerRuntime(
-        TranscriptionJobProcessor(worker_repository, executor, claim_manager),
-        executor,
+        build_resources,
         claim_manager,
+        gpu_ownership,
         engine,
     )
     celery_app = create_celery_app(dispatch_config)
@@ -1057,4 +1072,4 @@ async def test_warm_shutdown_rejects_new_claims_while_native_cleanup_drains(
     assert isinstance(first_error, dict)
     assert first_error["code"] == "transcription_timeout"
     assert second_snapshot["status"] == "queued"
-    assert not any(media_root.iterdir())
+    assert {entry.name for entry in media_root.iterdir()} == {"gpu-locks"}

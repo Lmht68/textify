@@ -10,6 +10,7 @@ ENV UV_PYTHON=python3.12 \
     HF_HOME=/var/cache/textify/huggingface \
     TEXTIFY_HOST=0.0.0.0 \
     TEXTIFY_TEMPORARY_MEDIA_ROOT=/var/lib/textify/media \
+    TEXTIFY_GPU_LOCK_DIRECTORY=/var/lib/textify/gpu-locks \
     TEXTIFY_WORKER_CONCURRENCY=4 \
     TEXTIFY_MAX_OUTSTANDING_JOBS=8 \
     TEXTIFY_JOB_QUEUE_TIMEOUT_SECONDS=20 \
@@ -28,7 +29,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 textify \
     && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin textify \
-    && mkdir --parents "$HF_HOME" /var/lib/textify /var/lib/textify/media \
+    && mkdir --parents "$HF_HOME" /var/lib/textify /var/lib/textify/media /var/lib/textify/gpu-locks \
     && chown --recursive textify:textify "$HF_HOME" /var/lib/textify
 
 WORKDIR /opt/textify

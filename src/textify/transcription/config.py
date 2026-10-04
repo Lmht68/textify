@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,6 +16,53 @@ class TranscriptionConfig(BaseSettings):
         extra="ignore",
         populate_by_name=True,
     )
+
+    gpu_identity: str
+    gpu_lock_directory: Path = Path("/tmp/textify/gpu-locks")
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_gpu_identity(cls, values: object) -> object:
+        """Require and normalize a stable physical-GPU identity.
+
+        Args:
+            values: Raw configuration values before field validation.
+
+        Returns:
+            Configuration values with normalized GPU identity.
+
+        Raises:
+            ValueError: If the GPU identity is missing, non-textual, or blank.
+        """
+        if not isinstance(values, dict):
+            return values
+        gpu_identity = values.get("gpu_identity")
+        if not isinstance(gpu_identity, str) or not gpu_identity.strip():
+            raise ValueError(
+                "TEXTIFY_GPU_IDENTITY must be a non-empty stable identifier."
+            )
+        values["gpu_identity"] = gpu_identity.strip()
+        return values
+
+    @field_validator("gpu_lock_directory")
+    @classmethod
+    def require_absolute_non_root_lock_directory(cls, value: Path) -> Path:
+        """Reject lock directories that cannot identify a safe lock namespace.
+
+        Args:
+            value: Parsed GPU lock-directory path.
+
+        Returns:
+            The validated absolute non-root lock directory.
+
+        Raises:
+            ValueError: If the path is relative or is the filesystem root.
+        """
+        if not value.is_absolute() or value == Path(value.root):
+            raise ValueError(
+                "TEXTIFY_GPU_LOCK_DIRECTORY must be an absolute non-root directory."
+            )
+        return value
 
     whisper_model: str = Field(default="large-v3-turbo", min_length=1)
     whisper_revision: str = Field(

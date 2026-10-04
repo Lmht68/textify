@@ -45,7 +45,7 @@ def _job_config(
         Durable job configuration independent of environment files.
     """
     return JobConfig(
-        database_url=database_url,
+        database_url=database_url,  # type: ignore[arg-type]
         max_outstanding_jobs=maximum_outstanding_jobs,
         job_queue_timeout_seconds=20,
         job_retention_seconds=86_400,
@@ -93,7 +93,13 @@ def _error_code(response: Response) -> str:
     Returns:
         Stable machine-readable public error code.
     """
-    return response.json()["error"]["code"]
+    payload = response.json()
+    assert isinstance(payload, dict)
+    error = payload["error"]
+    assert isinstance(error, dict)
+    code = error["code"]
+    assert isinstance(code, str)
+    return code
 
 
 @pytest.mark.asyncio

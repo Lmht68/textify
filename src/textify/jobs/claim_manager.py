@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from typing import Protocol
 from uuid import UUID, uuid4
@@ -51,6 +52,7 @@ class ExecutionClaimManager:
         max_active_claims: int,
         heartbeat_interval: timedelta,
         claim_lease_duration: timedelta,
+        claim_ready: Callable[[], Awaitable[bool]],
     ) -> None:
         """Initialize one worker identity and bounded claim registry.
 
@@ -59,6 +61,7 @@ class ExecutionClaimManager:
             max_active_claims: Maximum processing executions accepted by this worker.
             heartbeat_interval: Positive interval between PostgreSQL heartbeat batches.
             claim_lease_duration: Positive lifetime renewed for every live claim.
+            claim_ready: Ownership health probe required before each durable claim.
 
         Raises:
             ValueError: If the capacity or either duration is nonpositive.
@@ -76,6 +79,7 @@ class ExecutionClaimManager:
         self._max_active_claims = max_active_claims
         self._heartbeat_interval = heartbeat_interval
         self._claim_lease_duration = claim_lease_duration
+        self._claim_ready = claim_ready
         self._claims: dict[ExecutionClaim, TranscriptionExecutionControl] = {}
         self._ownership_lost: set[ExecutionClaim] = set()
         self._pending_claims = 0
@@ -125,7 +129,13 @@ class ExecutionClaimManager:
             or len(self._claims) + self._pending_claims >= self._max_active_claims
         ):
             return None
-
+        if not await self._claim_ready():
+            return None
+        if (
+            not self._accepting
+            or len(self._claims) + self._pending_claims >= self._max_active_claims
+        ):
+            return None
         self._pending_claims += 1
         self._update_drained_state()
         try:

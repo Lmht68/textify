@@ -11,7 +11,7 @@ from textify.jobs.config import JobDispatchConfig
 def test_celery_app_uses_private_redis_delivery_configuration() -> None:
     """Configure only JSON dispatch delivery and no result backend."""
     config = JobDispatchConfig(
-        broker_url="redis://127.0.0.1:6379/15",
+        broker_url="redis://127.0.0.1:6379/15",  # type: ignore[arg-type]
         _env_file=None,  # type: ignore[call-arg]
     )
 
@@ -28,6 +28,7 @@ def test_celery_app_uses_private_redis_delivery_configuration() -> None:
     assert app.conf.task_store_errors_even_if_ignored is False
     assert app.conf.task_always_eager is False
     assert app.conf.task_routes == {TRANSCRIPTION_TASK: {"queue": TRANSCRIPTION_QUEUE}}
+    assert app.conf.worker_pool == "threads"
     assert app.conf.task_default_queue == TRANSCRIPTION_QUEUE
     assert tuple(queue.name for queue in app.conf.task_queues) == (TRANSCRIPTION_QUEUE,)
 

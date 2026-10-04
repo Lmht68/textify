@@ -6,11 +6,11 @@ import asyncio
 import base64
 import json
 import threading
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -28,6 +28,7 @@ from textify.jobs.claim_manager import ExecutionClaimManager
 from textify.jobs.config import JobConfig, JobDispatchConfig
 from textify.jobs.contracts import TranscriptionJobStoreUnavailableError
 from textify.jobs.dispatch import CeleryJobDispatchPublisher, JobDispatchPublisher
+from textify.jobs.gpu_ownership import GpuModelOwnership
 from textify.jobs.processor import TranscriptionJobProcessor
 from textify.jobs.reconciler import ReconcilerPolicy, TranscriptionJobReconciler
 from textify.jobs.repository import PostgresTranscriptionJobRepository
@@ -198,7 +199,7 @@ class _RedisBroker(Protocol):
 def _job_config(database_url: str) -> JobConfig:
     """Build fixed durable lifecycle settings for integration tests."""
     return JobConfig(
-        database_url=database_url,
+        database_url=database_url,  # type: ignore[arg-type]
         max_outstanding_jobs=8,
         job_queue_timeout_seconds=int(_QUEUE_TIMEOUT.total_seconds()),
         job_retention_seconds=int(_TERMINAL_RETENTION.total_seconds()),
@@ -249,7 +250,7 @@ def _celery_app(broker_url: str) -> Celery:
     """Create a real non-eager Celery app for an isolated Redis server."""
     return create_celery_app(
         JobDispatchConfig(
-            broker_url=broker_url,
+            broker_url=broker_url,  # type: ignore[arg-type]
             worker_concurrency=1,
             _env_file=None,  # type: ignore[call-arg]
         )
@@ -274,29 +275,46 @@ def _runtime(
     metadata_extractor: _MetadataExtractor,
 ) -> TranscriptionWorkerRuntime:
     """Build the production worker with deterministic caption dependencies."""
-    executor = TranscriptionExecutor(
-        TranscriptionAdapters(
-            metadata_extractor=metadata_extractor,
-            caption_provider=provider,
-            audio_downloader=_UnexpectedNativePath(),
-            whisper_transcriber=_UnexpectedNativePath(),
-        ),
-        TranscriptionConfig(
-            temporary_media_root=temporary_media_root,
-            transcription_concurrency=1,
-            max_media_bytes=1024,
-        ),
+    transcription_config = TranscriptionConfig(
+        gpu_identity="test-gpu-dispatch-recovery",
+        gpu_lock_directory=temporary_media_root / "gpu-locks",
+        temporary_media_root=temporary_media_root,
+        transcription_concurrency=1,
+        max_media_bytes=1024,
+    )
+    gpu_ownership = GpuModelOwnership(
+        engine,
+        transcription_config.gpu_identity,
+        transcription_config.gpu_lock_directory,
     )
     claim_manager = ExecutionClaimManager(
         repository,
         max_active_claims=1,
         heartbeat_interval=timedelta(seconds=5),
         claim_lease_duration=timedelta(seconds=30),
+        claim_ready=gpu_ownership.can_claim,
     )
+
+    def build_resources() -> tuple[TranscriptionJobProcessor, TranscriptionExecutor]:
+        """Build deterministic captions after physical-GPU ownership is acquired."""
+        executor = TranscriptionExecutor(
+            TranscriptionAdapters(
+                metadata_extractor=metadata_extractor,
+                caption_provider=provider,
+                audio_downloader=_UnexpectedNativePath(),
+                whisper_transcriber=_UnexpectedNativePath(),
+            ),
+            transcription_config,
+        )
+        return (
+            TranscriptionJobProcessor(repository, executor, claim_manager),
+            executor,
+        )
+
     return TranscriptionWorkerRuntime(
-        TranscriptionJobProcessor(repository, executor, claim_manager),
-        executor,
+        build_resources,
         claim_manager,
+        gpu_ownership,
         engine,
     )
 
@@ -320,7 +338,7 @@ async def _wait_for_finished(
 async def _wait_for_empty_queue(redis_client: Redis) -> None:
     """Wait until the real worker has consumed each Redis queue message."""
     for _ in range(100):
-        if await redis_client.llen(TRANSCRIPTION_QUEUE) == 0:
+        if await cast(Awaitable[int], redis_client.llen(TRANSCRIPTION_QUEUE)) == 0:
             return
         await asyncio.sleep(0.05)
     raise AssertionError("Timed out waiting for Celery to consume Redis messages.")
@@ -395,7 +413,10 @@ async def _real_worker(
 async def _task_payloads(redis_client: Redis) -> list[dict[str, object]]:
     """Decode real queued Celery payloads without retaining message metadata."""
     payloads: list[dict[str, object]] = []
-    while message := await redis_client.lpop(TRANSCRIPTION_QUEUE):
+    while message := await cast(
+        Awaitable[str | bytes | None],
+        redis_client.lpop(TRANSCRIPTION_QUEUE),
+    ):
         envelope = json.loads(message)
         encoded_body = envelope["body"]
         assert isinstance(encoded_body, str)

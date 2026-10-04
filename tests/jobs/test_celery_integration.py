@@ -17,6 +17,7 @@ from textify.jobs.claim_manager import ExecutionClaimManager
 from textify.jobs.config import JobConfig, JobDispatchConfig
 from textify.jobs.database import create_application_engine
 from textify.jobs.dispatch import CeleryJobDispatchPublisher
+from textify.jobs.gpu_ownership import GpuModelOwnership
 from textify.jobs.processor import TranscriptionJobProcessor
 from textify.jobs.reconciler import TranscriptionJobReconciler
 from textify.jobs.repository import PostgresTranscriptionJobRepository
@@ -140,7 +141,7 @@ def _job_config(database_url: str) -> JobConfig:
         Durable job storage configuration.
     """
     return JobConfig(
-        database_url=database_url,
+        database_url=database_url,  # type: ignore[arg-type]
         max_outstanding_jobs=8,
         job_queue_timeout_seconds=20,
         job_retention_seconds=86_400,
@@ -157,6 +158,8 @@ def _transcription_config(temporary_media_root: Path) -> TranscriptionConfig:
         Normal production executor configuration without native model construction.
     """
     return TranscriptionConfig(
+        gpu_identity="test-gpu-celery-integration",
+        gpu_lock_directory=temporary_media_root / "gpu-locks",
         temporary_media_root=temporary_media_root,
         transcription_concurrency=1,
         max_media_bytes=1024,
@@ -181,9 +184,11 @@ async def _wait_for_succeeded_status(
     """
     for _ in range(80):
         response = await client.get(location)
-        if response.json()["status"] == "finished":
-            assert response.json()["outcome"] == "succeeded"
-            return response.json()
+        payload = response.json()
+        assert isinstance(payload, dict)
+        if payload["status"] == "finished":
+            assert payload["outcome"] == "succeeded"
+            return payload
         await asyncio.sleep(0.05)
     raise AssertionError("Timed out waiting for real Redis-Celery job completion.")
 
@@ -212,27 +217,42 @@ async def test_api_submission_reconciles_and_retrieves_celery_caption_result(
         terminal_retention=timedelta(seconds=job_config.job_retention_seconds),
         clock=utc_now,
     )
+    transcription_config = _transcription_config(tmp_path)
     adapters = TranscriptionAdapters(
         metadata_extractor=_MetadataExtractor(),
         caption_provider=_CaptionProvider(),
         audio_downloader=_UnexpectedNativePath(),
         whisper_transcriber=_UnexpectedNativePath(),
     )
-    executor = TranscriptionExecutor(adapters, _transcription_config(tmp_path))
+    gpu_ownership = GpuModelOwnership(
+        worker_engine,
+        transcription_config.gpu_identity,
+        transcription_config.gpu_lock_directory,
+    )
     claim_manager = ExecutionClaimManager(
         worker_repository,
         max_active_claims=1,
         heartbeat_interval=timedelta(seconds=5),
         claim_lease_duration=timedelta(seconds=30),
+        claim_ready=gpu_ownership.can_claim,
     )
+
+    def build_resources() -> tuple[TranscriptionJobProcessor, TranscriptionExecutor]:
+        """Construct deterministic worker resources after GPU ownership is acquired."""
+        executor = TranscriptionExecutor(adapters, transcription_config)
+        return (
+            TranscriptionJobProcessor(worker_repository, executor, claim_manager),
+            executor,
+        )
+
     runtime = TranscriptionWorkerRuntime(
-        TranscriptionJobProcessor(worker_repository, executor, claim_manager),
-        executor,
+        build_resources,
         claim_manager,
+        gpu_ownership,
         worker_engine,
     )
     dispatch_config = JobDispatchConfig(
-        broker_url=redis_broker_url,
+        broker_url=redis_broker_url,  # type: ignore[arg-type]
         worker_concurrency=1,
         _env_file=None,  # type: ignore[call-arg]
     )

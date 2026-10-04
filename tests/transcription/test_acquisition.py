@@ -1,5 +1,6 @@
 """Tests for provider adapters and bounded yt-dlp retries."""
 
+import asyncio
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -19,7 +20,10 @@ from textify.transcription.acquisition import (
     acquire_transcript,
 )
 from textify.transcription.config import TranscriptionConfig
-from textify.transcription.exceptions import TranscriptionCancellationRequestedError
+from textify.transcription.exceptions import (
+    TranscriptionCancellationRequestedError,
+    TranscriptionTimeoutError,
+)
 from textify.transcription.types import RawSegment, TimedTranscript, TranscriptMethod
 from textify.transcription.util import (
     MediaByteLimitExceeded,
@@ -375,6 +379,8 @@ def _assert_shared_ytdlp_policy(options: Mapping[str, object]) -> None:
 def isolated_transcription_config() -> TranscriptionConfig:
     """Return a test configuration independent of local environment files."""
     return TranscriptionConfig(
+        gpu_identity="test-gpu",
+        gpu_lock_directory=Path("/tmp/textify-test-gpu-locks"),
         whisper_model="large-v3-turbo",
         whisper_revision="0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf",
         whisper_device="cuda",
@@ -721,9 +727,119 @@ def test_load_whisper_transcriber_uses_model_environment_settings(
                 "device": "cpu",
                 "device_index": 2,
                 "revision": "release-2026-09",
+                "num_workers": 1,
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_whisper_acquirer_unloads_model_after_retained_native_work_drains(
+    tmp_path: Path,
+) -> None:
+    """Wait for timed-out native inference before unloading its CTranslate2 model."""
+
+    class RecordingCtranslateWhisper:
+        """Record the pinned native model release."""
+
+        def __init__(self) -> None:
+            """Initialize the release counter."""
+            self.unload_calls = 0
+
+        def unload_model(self) -> None:
+            """Record model-memory release."""
+            self.unload_calls += 1
+
+    class BlockingWhisperModel:
+        """Block one Faster-Whisper call until the test releases it."""
+
+        def __init__(self) -> None:
+            """Initialize native-entry and release controls."""
+            self.model = RecordingCtranslateWhisper()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def transcribe(
+            self,
+            audio: str,
+            *,
+            beam_size: int,
+            vad_filter: bool,
+            temperature: float,
+            condition_on_previous_text: bool,
+            initial_prompt: str,
+        ) -> tuple[Iterable[FakeWhisperSegment], FakeWhisperInfo]:
+            """Block until release and then return an empty native transcript."""
+            del (
+                audio,
+                beam_size,
+                vad_filter,
+                temperature,
+                condition_on_previous_text,
+                initial_prompt,
+            )
+            self.entered.set()
+            self.release.wait()
+            return (), FakeWhisperInfo("en")
+
+    class AudioDownloader:
+        """Create one complete local audio file for native inference."""
+
+        def download(
+            self,
+            source_url: str,
+            destination: Path,
+            *,
+            deadline: float,
+            cancellation_event: threading.Event,
+        ) -> Path:
+            """Return a request-owned native audio file."""
+            del source_url, deadline, cancellation_event
+            audio_path = destination / "audio.webm"
+            audio_path.write_bytes(b"native")
+            return audio_path
+
+    settings = isolated_transcription_config().model_copy(
+        update={
+            "temporary_media_root": tmp_path,
+            "transcription_timeout_seconds": 0.01,
+        }
+    )
+    native_model = BlockingWhisperModel()
+    acquirer = acquisition.WhisperAcquirer(
+        AudioDownloader(),
+        FasterWhisperTranscriber(native_model, settings),
+        settings,
+    )
+    ownership = acquisition.TranscriptionOwnership(
+        None,
+        threading.Event(),
+        asyncio.Event(),
+    )
+    shutdown_task: asyncio.Task[None] | None = None
+
+    try:
+        with pytest.raises(TranscriptionTimeoutError):
+            await acquirer.acquire(
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                ownership,
+                cancellation_requested=asyncio.Event(),
+            )
+        ownership.finish_caller()
+        assert native_model.entered.wait(timeout=1)
+
+        shutdown_task = asyncio.create_task(acquirer.shutdown())
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(shutdown_task), timeout=0.01)
+        assert native_model.model.unload_calls == 0
+    finally:
+        native_model.release.set()
+        if shutdown_task is None:
+            await acquirer.shutdown()
+        else:
+            await shutdown_task
+
+    assert native_model.model.unload_calls == 1
 
 
 def test_faster_whisper_adapter_normalizes_timed_external_segments(

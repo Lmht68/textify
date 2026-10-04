@@ -9,7 +9,7 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from decimal import Decimal
 from numbers import Real
 from pathlib import Path
-from typing import Final, Protocol, cast
+from typing import Final, Protocol, cast, runtime_checkable
 from xml.etree import ElementTree
 
 import ctranslate2
@@ -206,6 +206,15 @@ class WhisperTranscriber(Protocol):
         ...
 
 
+@runtime_checkable
+class ShutdownableWhisperTranscriber(Protocol):
+    """Release process-lifetime native model memory after work drains."""
+
+    def shutdown(self) -> None:
+        """Release the underlying native model memory."""
+        ...
+
+
 class _LibrarySnippet(Protocol):
     """Expose one timed youtube-transcript-api snippet."""
 
@@ -386,8 +395,18 @@ class _WhisperInfo(Protocol):
     language: object
 
 
+class _CtranslateWhisperModel(Protocol):
+    """Expose the CTranslate2 model unload operation."""
+
+    def unload_model(self) -> None:
+        """Release model memory from the configured CUDA device."""
+        ...
+
+
 class _WhisperModel(Protocol):
     """Expose the faster-whisper method used by the adapter."""
+
+    model: _CtranslateWhisperModel
 
     def transcribe(
         self,
@@ -536,6 +555,7 @@ class FasterWhisperTranscriber:
         """
         self._model = model
         self._settings = settings
+        self._shutdown = False
 
     def transcribe(
         self,
@@ -588,6 +608,13 @@ class FasterWhisperTranscriber:
         )
         return transcript
 
+    def shutdown(self) -> None:
+        """Release the pinned CTranslate2 model once native work has drained."""
+        if self._shutdown:
+            return
+        self._shutdown = True
+        cast(_WhisperModel, self._model).model.unload_model()
+
 
 def load_whisper_transcriber(
     settings: TranscriptionConfig,
@@ -617,6 +644,7 @@ def load_whisper_transcriber(
         "device": settings.whisper_device,
         "device_index": settings.whisper_device_index,
         "revision": settings.whisper_revision,
+        "num_workers": settings.transcription_concurrency,
     }
     if settings.hf_token is not None:
         model_options["use_auth_token"] = settings.hf_token.get_secret_value()
@@ -1155,10 +1183,12 @@ class WhisperAcquirer:
             )
 
     async def shutdown(self) -> None:
-        """Wait for abandoned native workers without cancelling their inference."""
+        """Drain native work before releasing optional model-owned memory."""
         while self._native_finalizers:
             finalizers = tuple(self._native_finalizers)
             await asyncio.gather(*finalizers, return_exceptions=True)
+        if isinstance(self._transcriber, ShutdownableWhisperTranscriber):
+            await asyncio.to_thread(self._transcriber.shutdown)
 
     async def _prepare_audio(
         self,

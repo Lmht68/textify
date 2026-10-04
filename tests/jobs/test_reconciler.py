@@ -1,6 +1,7 @@
 """Tests for PostgreSQL-driven Job Dispatch reconciliation."""
 
 from collections import deque
+from collections.abc import Callable
 from datetime import timedelta
 from uuid import UUID, uuid4
 
@@ -258,17 +259,17 @@ async def test_reconciler_owns_expired_terminal_job_cleanup() -> None:
 
 
 @pytest.mark.parametrize(
-    "policy_kwargs",
+    "build_policy",
     (
-        {"interval": timedelta()},
-        {"publication_lease_duration": timedelta()},
-        {"dispatch_batch_size": 0},
-        {"retention_cleanup_interval": timedelta()},
+        lambda: ReconcilerPolicy(interval=timedelta()),
+        lambda: ReconcilerPolicy(publication_lease_duration=timedelta()),
+        lambda: ReconcilerPolicy(dispatch_batch_size=0),
+        lambda: ReconcilerPolicy(retention_cleanup_interval=timedelta()),
     ),
 )
 def test_reconciler_policy_rejects_nonpositive_values(
-    policy_kwargs: dict[str, object],
+    build_policy: Callable[[], ReconcilerPolicy],
 ) -> None:
     """Reject scheduling policies that could strand due dispatches."""
     with pytest.raises(ValueError):
-        ReconcilerPolicy(**policy_kwargs)
+        build_policy()
