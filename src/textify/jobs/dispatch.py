@@ -10,6 +10,7 @@ from kombu.exceptions import OperationalError
 from redis.exceptions import RedisError
 
 from textify.jobs.celery_app import TRANSCRIPTION_QUEUE, TRANSCRIPTION_TASK
+from textify.jobs.readiness import BrokerReadiness
 from textify.jobs.types import JobDispatch
 
 
@@ -42,6 +43,18 @@ class CeleryJobDispatchPublisher:
             celery_app: Private transcription Celery delivery application.
         """
         self._celery_app = celery_app
+
+    async def initialize(self, broker_readiness: BrokerReadiness) -> None:
+        """Verify the shared broker probe before reconciler publication begins.
+
+        Args:
+            broker_readiness: Dedicated readiness probe for the Celery broker.
+
+        Raises:
+            JobDispatchUnavailableError: If the broker cannot answer readiness PING.
+        """
+        if not await broker_readiness.is_ready():
+            raise JobDispatchUnavailableError()
 
     async def publish(self, dispatch: JobDispatch) -> None:
         """Publish one dispatch without blocking the reconciler event loop.

@@ -26,12 +26,17 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from textify.config import AppConfig, Environment
 from textify.jobs.celery_app import TRANSCRIPTION_QUEUE, create_celery_app
 from textify.jobs.claim_manager import ExecutionClaimManager
-from textify.jobs.config import JobConfig, JobDispatchConfig
+from textify.jobs.config import CacheConfig, JobConfig, JobDispatchConfig
 from textify.jobs.contracts import TranscriptionJobStoreUnavailableError
 from textify.jobs.database import create_application_engine
 from textify.jobs.dispatch import CeleryJobDispatchPublisher
 from textify.jobs.gpu_ownership import GpuModelOwnership
 from textify.jobs.processor import TranscriptionJobProcessor
+from textify.jobs.readiness import (
+    PostgresServiceHeartbeatRepository,
+    ServiceHeartbeatReporter,
+    ServiceRole,
+)
 from textify.jobs.reconciler import ReconcilerPolicy, TranscriptionJobReconciler
 from textify.jobs.repository import PostgresTranscriptionJobRepository
 from textify.jobs.service import utc_now
@@ -45,6 +50,7 @@ from textify.jobs.worker import (
     TranscriptionWorkerRuntime,
     _connect_worker_shutdown_signal,
     _disconnect_worker_shutdown_signal,
+    _ExecutionResources,
     register_transcription_task,
 )
 from textify.main import create_app
@@ -422,7 +428,7 @@ def _run_worker_process(
         claim_ready=gpu_ownership.can_claim,
     )
 
-    def build_resources() -> tuple[TranscriptionJobProcessor, TranscriptionExecutor]:
+    def build_resources() -> _ExecutionResources:
         """Construct process-worker providers after GPU ownership is acquired."""
         adapters = TranscriptionAdapters(
             metadata_extractor=_WorkerMetadataExtractor(mode, control),
@@ -431,9 +437,17 @@ def _run_worker_process(
             whisper_transcriber=_WorkerNativeTranscriber(control),
         )
         executor = TranscriptionExecutor(adapters, transcription_config)
-        return (
+        return _ExecutionResources(
             TranscriptionJobProcessor(worker_repository, executor, claim_manager),
             executor,
+            ServiceHeartbeatReporter(
+                PostgresServiceHeartbeatRepository(engine),
+                ServiceRole.GPU_WORKER,
+                refresh_interval=timedelta(
+                    seconds=dispatch_config.service_heartbeat_ttl_seconds / 3
+                ),
+                readiness_probe=gpu_ownership.can_claim,
+            ),
         )
 
     runtime = TranscriptionWorkerRuntime(
@@ -560,7 +574,15 @@ async def _public_client(database_url: str) -> AsyncGenerator[AsyncClient]:
     Yields:
         ASGI client connected to the production public API composition.
     """
-    application = create_app(_app_config(), job_config=_job_config(database_url))
+    application = create_app(
+        _app_config(),
+        job_config=_job_config(database_url),
+        dispatch_config=JobDispatchConfig(
+            broker_url=RedisDsn("redis://127.0.0.1:1/15"),
+            _env_file=None,  # type: ignore[call-arg]
+        ),
+        cache_config=CacheConfig(_env_file=None),  # type: ignore[call-arg]
+    )
     async with (
         application.router.lifespan_context(application),
         AsyncClient(

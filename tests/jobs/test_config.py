@@ -3,7 +3,12 @@
 import pytest
 from pydantic import ValidationError
 
-from textify.jobs.config import JobConfig, JobDispatchConfig
+from textify.jobs.config import (
+    CacheConfig,
+    JobConfig,
+    JobDispatchConfig,
+    validate_redis_role_isolation,
+)
 
 _DATABASE_URL = "postgresql+asyncpg://textify:change-me@127.0.0.1:5432/textify"
 
@@ -85,6 +90,19 @@ def test_dispatch_settings_use_bounded_defaults(
     assert settings.reconciler_interval_seconds == 1.0
     assert settings.attempt_heartbeat_seconds == 5.0
     assert settings.attempt_lease_seconds == 30.0
+    assert settings.service_heartbeat_ttl_seconds == 30.0
+
+
+def test_dispatch_settings_accept_positive_service_heartbeat_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Allow deployments to select a positive heartbeat freshness interval."""
+    monkeypatch.setenv("TEXTIFY_BROKER_URL", "redis://127.0.0.1:6379/15")
+    monkeypatch.setenv("TEXTIFY_SERVICE_HEARTBEAT_TTL_SECONDS", "12.5")
+
+    settings = JobDispatchConfig(_env_file=None)  # type: ignore[call-arg]
+
+    assert settings.service_heartbeat_ttl_seconds == 12.5
 
 
 @pytest.mark.parametrize(
@@ -122,6 +140,8 @@ def test_nonpositive_job_settings_are_rejected(
         ("TEXTIFY_ATTEMPT_HEARTBEAT_SECONDS", "-1"),
         ("TEXTIFY_ATTEMPT_LEASE_SECONDS", "0"),
         ("TEXTIFY_ATTEMPT_LEASE_SECONDS", "-1"),
+        ("TEXTIFY_SERVICE_HEARTBEAT_TTL_SECONDS", "0"),
+        ("TEXTIFY_SERVICE_HEARTBEAT_TTL_SECONDS", "-1"),
     ),
 )
 def test_nonpositive_dispatch_settings_are_rejected(
@@ -153,3 +173,75 @@ def test_attempt_lease_requires_three_heartbeat_intervals(
         ),
     ):
         JobDispatchConfig(_env_file=None)  # type: ignore[call-arg]
+
+
+def test_cache_url_is_optional(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Allow deployments without an implemented cache role."""
+    monkeypatch.delenv("TEXTIFY_CACHE_URL", raising=False)
+
+    settings = CacheConfig(_env_file=None)  # type: ignore[call-arg]
+
+    assert settings.cache_url is None
+
+
+@pytest.mark.parametrize(
+    ("broker_url", "cache_url"),
+    (
+        ("redis://broker.example:6379/0", "redis://cache.example:6379/0"),
+        ("redis://redis.example:6379/0", "redis://redis.example:6380/0"),
+        ("redis://[::1]:6379/0", "redis://[::2]:6379/0"),
+    ),
+)
+def test_redis_role_isolation_accepts_distinct_server_endpoints(
+    broker_url: str,
+    cache_url: str,
+) -> None:
+    """Allow only broker-cache pairs that identify separate Redis servers."""
+    dispatch_config = JobDispatchConfig(
+        broker_url=broker_url,  # type: ignore[arg-type]
+        _env_file=None,  # type: ignore[call-arg]
+    )
+    cache_config = CacheConfig(
+        cache_url=cache_url,  # type: ignore[arg-type]
+        _env_file=None,  # type: ignore[call-arg]
+    )
+
+    validate_redis_role_isolation(dispatch_config, cache_config)
+
+
+@pytest.mark.parametrize(
+    ("broker_url", "cache_url"),
+    (
+        ("redis://redis.example:6379/0", "redis://redis.example:6379/15"),
+        ("redis://redis.example/0", "redis://redis.example:6379/1"),
+        (
+            "redis://broker:secret@redis.example:6379/0",
+            "rediss://cache:secret@redis.example:6379/1",
+        ),
+        ("redis://[::1]:6379/0", "redis://[::1]:6379/1"),
+    ),
+)
+def test_redis_role_isolation_rejects_shared_server_endpoints(
+    broker_url: str,
+    cache_url: str,
+) -> None:
+    """Reject credential, scheme, and logical-database differences on one server."""
+    dispatch_config = JobDispatchConfig(
+        broker_url=broker_url,  # type: ignore[arg-type]
+        _env_file=None,  # type: ignore[call-arg]
+    )
+    cache_config = CacheConfig(
+        cache_url=cache_url,  # type: ignore[arg-type]
+        _env_file=None,  # type: ignore[call-arg]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"^TEXTIFY_BROKER_URL and TEXTIFY_CACHE_URL must identify different "
+            r"Redis server endpoints\.$"
+        ),
+    ):
+        validate_redis_role_isolation(dispatch_config, cache_config)

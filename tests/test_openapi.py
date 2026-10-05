@@ -100,10 +100,6 @@ async def test_openapi_describes_job_only_transcription_contract() -> None:
         "schema"
     ] == {"$ref": "#/components/schemas/HealthResponse"}
     assert components["HealthResponse"]["examples"] == [{"status": "ok"}]
-    assert (
-        "runtime durable-store failure"
-        in health_operation["responses"]["503"]["description"]
-    )
     for health_response in health_operation["responses"].values():
         assert set(health_response["headers"]) == {"X-Request-ID"}
 

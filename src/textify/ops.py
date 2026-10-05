@@ -13,7 +13,7 @@ class HealthResponse(BaseModel):
 
     status: Literal["ok"] = Field(
         default="ok",
-        description="Application readiness state after successful startup.",
+        description="Application topology readiness after successful startup.",
     )
 
 
@@ -31,24 +31,23 @@ _REQUEST_ID_HEADER = {
     response_model=HealthResponse,
     summary="Check application readiness",
     description=(
-        "Return success only while lifespan startup completed and durable "
-        "Transcription Job storage remains available."
+        "Return success only while PostgreSQL, the Redis broker, and fresh "
+        "reconciler and model-ready GPU-worker service heartbeats are ready."
     ),
-    response_description="The application is ready to serve Transcription Jobs.",
+    response_description="The application processing topology is ready.",
     tags=["health"],
     responses={
         status.HTTP_200_OK: {"headers": {"X-Request-ID": _REQUEST_ID_HEADER}},
         status.HTTP_503_SERVICE_UNAVAILABLE: {
             "description": (
-                "Startup is incomplete or a runtime durable-store failure made "
-                "the application unready."
+                "Startup is incomplete or a required processing dependency is unready."
             ),
             "headers": {"X-Request-ID": _REQUEST_ID_HEADER},
         },
     },
 )
 async def health(request: Request) -> HealthResponse:
-    """Return readiness after lifespan-created dependencies are available.
+    """Return full processing-topology readiness without dependency details.
 
     Args:
         request: Current HTTP request.
@@ -57,8 +56,13 @@ async def health(request: Request) -> HealthResponse:
         Stable ready payload.
 
     Raises:
-        HTTPException: If startup has not completed.
+        HTTPException: If startup is incomplete or any required dependency is unready.
     """
-    if not bool(getattr(request.app.state, "ready", False)):
+    readiness = getattr(request.app.state, "readiness", None)
+    if (
+        not bool(getattr(request.app.state, "ready", False))
+        or readiness is None
+        or not await readiness.is_ready()
+    ):
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
     return HealthResponse()

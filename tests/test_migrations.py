@@ -21,6 +21,7 @@ from textify.jobs.database import EXPECTED_DATABASE_REVISION, create_application
 
 PROJECT_ROOT = Path(__file__).parent.parent
 APPLICATION_TABLES = {
+    "service_heartbeat",
     "transcription_job",
     "transcription_job_execution_attempt",
     "transcription_job_exclusion",
@@ -57,6 +58,8 @@ _CHECK_CONSTRAINT_NAMES = {
     "transcription_job_result_source_url_length_check",
     "transcription_job_result_language_length_check",
     "transcription_job_segment_values_check",
+    "service_heartbeat_role_check",
+    "service_heartbeat_instance_id_uuid4_check",
 }
 
 
@@ -167,7 +170,8 @@ async def test_execution_attempt_migration_backfills_and_round_trips_populated_j
         )
         assert await _revision_rows(engine) == ["0001_postgresql_jobs"]
         assert await _application_table_names(engine) == (
-            APPLICATION_TABLES - {"transcription_job_execution_attempt"}
+            APPLICATION_TABLES
+            - {"service_heartbeat", "transcription_job_execution_attempt"}
         )
 
         await asyncio.to_thread(command.upgrade, alembic_config, "head")
@@ -536,6 +540,120 @@ async def test_execution_claim_migration_backfills_processing_jobs_and_round_tri
                 )
             )
         assert list(remaining_claim_columns) == []
+    finally:
+        await engine.dispose()
+
+
+async def test_service_heartbeat_migration_round_trips_without_backfill(
+    monkeypatch: pytest.MonkeyPatch,
+    postgresql_database_url: str,
+) -> None:
+    """Add only the ready-service schema and retain migration reversibility."""
+    monkeypatch.setenv("TEXTIFY_DATABASE_URL", postgresql_database_url)
+    alembic_config = Config(str(PROJECT_ROOT / "alembic.ini"))
+    engine = create_application_engine(postgresql_database_url)
+    try:
+        await asyncio.to_thread(
+            command.upgrade,
+            alembic_config,
+            "0004_execution_claims",
+        )
+        assert await _application_table_names(engine) == (
+            APPLICATION_TABLES - {"service_heartbeat"}
+        )
+
+        await asyncio.to_thread(command.upgrade, alembic_config, "head")
+        async with engine.connect() as connection:
+            columns = {
+                row["column_name"]: row
+                for row in (
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT column_name, data_type, udt_name, "
+                                "character_maximum_length, is_nullable "
+                                "FROM information_schema.columns "
+                                "WHERE table_schema = 'public' "
+                                "AND table_name = 'service_heartbeat'"
+                            )
+                        )
+                    )
+                    .mappings()
+                    .all()
+                )
+            }
+            index_names = set(
+                (
+                    await connection.scalars(
+                        text(
+                            "SELECT indexname FROM pg_indexes "
+                            "WHERE schemaname = 'public' "
+                            "AND tablename = 'service_heartbeat'"
+                        )
+                    )
+                ).all()
+            )
+            primary_key_names = set(
+                (
+                    await connection.scalars(
+                        text(
+                            "SELECT constraint_name "
+                            "FROM information_schema.table_constraints "
+                            "WHERE table_schema = 'public' "
+                            "AND table_name = 'service_heartbeat' "
+                            "AND constraint_type = 'PRIMARY KEY'"
+                        )
+                    )
+                ).all()
+            )
+            heartbeat_count = await connection.scalar(
+                text("SELECT count(*) FROM service_heartbeat")
+            )
+
+        assert columns["service_role"] == {
+            "column_name": "service_role",
+            "data_type": "character varying",
+            "udt_name": "varchar",
+            "character_maximum_length": 32,
+            "is_nullable": "NO",
+        }
+        assert columns["instance_id"]["udt_name"] == "uuid"
+        assert columns["last_ready_at"]["data_type"] == "timestamp with time zone"
+        assert index_names >= {"service_heartbeat_role_last_ready_at_idx"}
+        assert primary_key_names == {"service_heartbeat_pkey"}
+        assert heartbeat_count == 0
+
+        with pytest.raises(IntegrityError):
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO service_heartbeat "
+                        "(service_role, instance_id, last_ready_at) "
+                        "VALUES ('unknown', :instance_id, now())"
+                    ),
+                    {"instance_id": uuid4()},
+                )
+        with pytest.raises(IntegrityError):
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO service_heartbeat "
+                        "(service_role, instance_id, last_ready_at) "
+                        "VALUES ('reconciler', :instance_id, now())"
+                    ),
+                    {"instance_id": uuid1()},
+                )
+
+        await asyncio.to_thread(
+            command.downgrade,
+            alembic_config,
+            "0004_execution_claims",
+        )
+        assert await _application_table_names(engine) == (
+            APPLICATION_TABLES - {"service_heartbeat"}
+        )
+        await asyncio.to_thread(command.upgrade, alembic_config, "head")
+        assert await _application_table_names(engine) == APPLICATION_TABLES
     finally:
         await engine.dispose()
 

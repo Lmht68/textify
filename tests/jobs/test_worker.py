@@ -155,6 +155,56 @@ class RecordingGpuOwnership:
             self._lifecycle_events.append("gpu_release")
 
 
+class RecordingServiceHeartbeat:
+    """Record worker service-readiness lifecycle operations."""
+
+    def __init__(
+        self,
+        lifecycle_events: list[str] | None = None,
+        start_error: RuntimeError | None = None,
+    ) -> None:
+        """Initialize optional lifecycle logging and startup failure."""
+        self._lifecycle_events = lifecycle_events
+        self._start_error = start_error
+        self.start_calls = 0
+        self.stop_calls = 0
+        self.stopped = threading.Event()
+
+    async def start(self) -> None:
+        """Record a first readiness heartbeat or simulate a storage failure."""
+        self.start_calls += 1
+        if self._lifecycle_events is not None:
+            self._lifecycle_events.append("heartbeat_start")
+        if self._start_error is not None:
+            raise self._start_error
+
+    async def pulse(self) -> None:
+        """Reject unexpected reconciler-style worker heartbeat pulses."""
+        raise AssertionError("Worker readiness refreshes must be periodic.")
+
+    async def stop(self) -> None:
+        """Record idempotent heartbeat removal."""
+        self.stop_calls += 1
+        self.stopped.set()
+        if self._lifecycle_events is not None:
+            self._lifecycle_events.append("heartbeat_stop")
+
+
+def _execution_resources(
+    processor: RecordingProcessor,
+    executor: ShutdownExecutor,
+    heartbeat: RecordingServiceHeartbeat | None = None,
+) -> object:
+    """Build the worker's deferred private resource bundle for one test."""
+    from textify.jobs.worker import _ExecutionResources
+
+    return _ExecutionResources(
+        processor,
+        executor,
+        heartbeat or RecordingServiceHeartbeat(),
+    )
+
+
 class CapturingRuntime:
     """Record task payload forwarding without starting a worker loop."""
 
@@ -181,7 +231,7 @@ def test_worker_runtime_processes_only_valid_payloads_on_one_loop() -> None:
     engine = RecordingEngine()
     gpu_ownership = RecordingGpuOwnership()
     runtime = TranscriptionWorkerRuntime(
-        lambda: (processor, executor),
+        lambda: _execution_resources(processor, executor),
         claim_manager,
         gpu_ownership,
         engine,
@@ -218,10 +268,14 @@ def test_worker_runtime_starts_and_stops_resources_in_gpu_safe_order(
         """Record the initial PostgreSQL verification."""
         lifecycle_events.append("database_verify")
 
-    def build_resources() -> tuple[RecordingProcessor, ShutdownExecutor]:
+    def build_resources() -> object:
         """Record deferred model-backed processor construction."""
         lifecycle_events.append("resources_factory")
-        return RecordingProcessor(), ShutdownExecutor(lifecycle_events)
+        return _execution_resources(
+            RecordingProcessor(),
+            ShutdownExecutor(lifecycle_events),
+            RecordingServiceHeartbeat(lifecycle_events),
+        )
 
     monkeypatch.setattr(worker, "verify_application_database", verify_database)
     runtime = worker.TranscriptionWorkerRuntime(
@@ -241,7 +295,9 @@ def test_worker_runtime_starts_and_stops_resources_in_gpu_safe_order(
         "resources_factory",
         "gpu_model_ready",
         "claim_manager_start",
+        "heartbeat_start",
         "claim_manager_stop_accepting",
+        "heartbeat_stop",
         "gpu_model_not_ready",
         "claim_manager_shutdown",
         "executor_shutdown",
@@ -259,8 +315,13 @@ def test_worker_shutdown_signal_stops_claiming_without_interrupting_work() -> No
     )
 
     claim_manager = RecordingClaimManager()
+    heartbeat = RecordingServiceHeartbeat()
     runtime = TranscriptionWorkerRuntime(
-        lambda: (RecordingProcessor(), ShutdownExecutor()),
+        lambda: _execution_resources(
+            RecordingProcessor(),
+            ShutdownExecutor(),
+            heartbeat,
+        ),
         claim_manager,
         RecordingGpuOwnership(),
         RecordingEngine(),
@@ -276,6 +337,7 @@ def test_worker_shutdown_signal_stops_claiming_without_interrupting_work() -> No
         )
 
         assert claim_manager.admission_closed.wait(timeout=1)
+        assert heartbeat.stopped.wait(timeout=1)
     finally:
         _disconnect_worker_shutdown_signal(receiver)
         runtime.shutdown()
@@ -289,9 +351,10 @@ def test_worker_runtime_shutdown_drains_claims_before_owned_resources() -> None:
 
     lifecycle_events: list[str] = []
     runtime = TranscriptionWorkerRuntime(
-        lambda: (
+        lambda: _execution_resources(
             RecordingProcessor(),
             ShutdownExecutor(lifecycle_events),
+            RecordingServiceHeartbeat(lifecycle_events),
         ),
         RecordingClaimManager(lifecycle_events),
         RecordingGpuOwnership(lifecycle_events),
@@ -304,6 +367,7 @@ def test_worker_runtime_shutdown_drains_claims_before_owned_resources() -> None:
 
     assert lifecycle_events == [
         "claim_manager_stop_accepting",
+        "heartbeat_stop",
         "gpu_model_not_ready",
         "claim_manager_shutdown",
         "executor_shutdown",
@@ -370,6 +434,7 @@ def test_worker_runtime_does_not_load_model_or_start_claims_after_lock_conflict(
     gpu_ownership = RecordingGpuOwnership(lifecycle_events)
     engine = RecordingEngine(lifecycle_events)
     resources_factory_calls = 0
+    heartbeat = RecordingServiceHeartbeat(lifecycle_events)
 
     async def reject_ownership() -> None:
         """Simulate an already-owned physical GPU."""
@@ -379,11 +444,15 @@ def test_worker_runtime_does_not_load_model_or_start_claims_after_lock_conflict(
             "GPU ownership is already held for the configured identity."
         )
 
-    def build_resources() -> tuple[RecordingProcessor, ShutdownExecutor]:
+    def build_resources() -> object:
         """Fail if lock conflict allows deferred model construction."""
         nonlocal resources_factory_calls
         resources_factory_calls += 1
-        raise AssertionError("GPU lock conflict must precede model construction.")
+        return _execution_resources(
+            RecordingProcessor(),
+            ShutdownExecutor(lifecycle_events),
+            heartbeat,
+        )
 
     gpu_ownership.acquire = reject_ownership  # type: ignore[method-assign]
     runtime = TranscriptionWorkerRuntime(
@@ -400,6 +469,45 @@ def test_worker_runtime_does_not_load_model_or_start_claims_after_lock_conflict(
     assert claim_manager.start_calls == 0
     assert gpu_ownership.release_calls == 1
     assert engine.dispose_calls == 1
+    assert heartbeat.start_calls == 0
+
+
+def test_worker_runtime_rolls_back_claims_and_heartbeat_start_failure() -> None:
+    """Delete partial readiness before draining claims and owned worker resources."""
+    from textify.jobs.worker import TranscriptionWorkerRuntime
+
+    lifecycle_events: list[str] = []
+    heartbeat = RecordingServiceHeartbeat(
+        lifecycle_events,
+        start_error=RuntimeError("heartbeat write failed"),
+    )
+    runtime = TranscriptionWorkerRuntime(
+        lambda: _execution_resources(
+            RecordingProcessor(),
+            ShutdownExecutor(lifecycle_events),
+            heartbeat,
+        ),
+        RecordingClaimManager(lifecycle_events),
+        RecordingGpuOwnership(lifecycle_events),
+        RecordingEngine(lifecycle_events),
+    )
+
+    with pytest.raises(RuntimeError, match=r"^heartbeat write failed$"):
+        runtime.start()
+
+    assert lifecycle_events == [
+        "gpu_acquire",
+        "gpu_model_ready",
+        "claim_manager_start",
+        "heartbeat_start",
+        "heartbeat_stop",
+        "gpu_model_not_ready",
+        "claim_manager_stop_accepting",
+        "claim_manager_shutdown",
+        "executor_shutdown",
+        "gpu_release",
+        "engine_dispose",
+    ]
 
 
 def test_worker_runtime_rolls_back_ownership_when_resource_construction_fails() -> None:
@@ -445,7 +553,7 @@ def test_worker_runtime_rejects_payloads_before_runtime_or_ownership_readiness()
     processor = RecordingProcessor()
     gpu_ownership = RecordingGpuOwnership()
     runtime = TranscriptionWorkerRuntime(
-        lambda: (processor, ShutdownExecutor()),
+        lambda: _execution_resources(processor, ShutdownExecutor()),
         RecordingClaimManager(),
         gpu_ownership,
         RecordingEngine(),
@@ -582,7 +690,7 @@ async def test_worker_runtime_uses_its_own_loop_for_database_connections(
         del cls, configuration, dispatch_config
         probe.repository = repository
         return worker.TranscriptionWorkerRuntime(
-            lambda: (probe, executor),
+            lambda: _execution_resources(probe, executor),
             claim_manager,
             gpu_ownership,
             worker_engine,

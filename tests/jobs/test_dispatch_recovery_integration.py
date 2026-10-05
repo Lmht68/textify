@@ -25,11 +25,16 @@ from sqlalchemy.pool import NullPool
 from textify.config import AppConfig, Environment
 from textify.jobs.celery_app import TRANSCRIPTION_QUEUE, create_celery_app
 from textify.jobs.claim_manager import ExecutionClaimManager
-from textify.jobs.config import JobConfig, JobDispatchConfig
+from textify.jobs.config import CacheConfig, JobConfig, JobDispatchConfig
 from textify.jobs.contracts import TranscriptionJobStoreUnavailableError
 from textify.jobs.dispatch import CeleryJobDispatchPublisher, JobDispatchPublisher
 from textify.jobs.gpu_ownership import GpuModelOwnership
 from textify.jobs.processor import TranscriptionJobProcessor
+from textify.jobs.readiness import (
+    PostgresServiceHeartbeatRepository,
+    ServiceHeartbeatReporter,
+    ServiceRole,
+)
 from textify.jobs.reconciler import ReconcilerPolicy, TranscriptionJobReconciler
 from textify.jobs.repository import PostgresTranscriptionJobRepository
 from textify.jobs.types import (
@@ -37,7 +42,11 @@ from textify.jobs.types import (
     NewQueuedTranscriptionJob,
     TranscriptionJob,
 )
-from textify.jobs.worker import TranscriptionWorkerRuntime, register_transcription_task
+from textify.jobs.worker import (
+    TranscriptionWorkerRuntime,
+    _ExecutionResources,
+    register_transcription_task,
+)
 from textify.main import create_app
 from textify.transcription import inspection
 from textify.transcription.config import TranscriptionConfig
@@ -47,6 +56,7 @@ from textify.transcription.types import TimedTranscript
 
 _YOUTUBE_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 _QUEUE_TIMEOUT = timedelta(seconds=20)
+
 _TERMINAL_RETENTION = timedelta(days=1)
 
 
@@ -87,6 +97,86 @@ class _CaptionProvider:
         if self.mode == "failing":
             raise NoUsableTranscriptError()
         return (_CaptionTrack(),)
+
+
+class _TaskCompletionTracker:
+    """Synchronize test teardown with completed Celery task call paths."""
+
+    def __init__(self) -> None:
+        """Initialize a condition that counts completed private task calls."""
+        self._condition = threading.Condition()
+        self._completion_count = 0
+
+    def record_completion(self) -> None:
+        """Record one task return and wake any bounded waiters."""
+        with self._condition:
+            self._completion_count += 1
+            self._condition.notify_all()
+
+    def wait_for(self, completion_count: int, timeout: float) -> bool:
+        """Wait for the requested number of private task returns.
+
+        Args:
+            completion_count: Minimum number of expected completed tasks.
+            timeout: Maximum seconds to wait.
+
+        Returns:
+            ``True`` when at least the requested task count is reached before the
+            timeout.
+        """
+        with self._condition:
+            return self._condition.wait_for(
+                lambda: self._completion_count >= completion_count,
+                timeout,
+            )
+
+
+async def _wait_for_task_completions(
+    completion_tracker: _TaskCompletionTracker,
+    completion_count: int,
+) -> None:
+    """Require each reserved task to return before the test worker shuts down.
+
+    Args:
+        completion_tracker: Test-owned completed private task counter.
+        completion_count: Minimum number of dispatched task returns required.
+
+    Raises:
+        AssertionError: If a reserved task does not return promptly.
+    """
+    completed = await asyncio.to_thread(
+        completion_tracker.wait_for, completion_count, 5
+    )
+    assert completed, "Celery did not finish every reserved private task."
+
+
+class _CompletionRecordingRuntime:
+    """Record private task completion while delegating to the real worker runtime."""
+
+    def __init__(
+        self,
+        runtime: TranscriptionWorkerRuntime,
+        completion_tracker: _TaskCompletionTracker,
+    ) -> None:
+        """Initialize one exact runtime delegate and task-completion observer.
+
+        Args:
+            runtime: Started production worker runtime.
+            completion_tracker: Test-owned completed task counter.
+        """
+        self._runtime = runtime
+        self._completion_tracker = completion_tracker
+
+    def process_payload(self, payload: object) -> None:
+        """Delegate one private Celery task and record its terminal return.
+
+        Args:
+            payload: Deserialized private Job Dispatch payload.
+        """
+        try:
+            self._runtime.process_payload(payload)
+        finally:
+            self._completion_tracker.record_completion()
 
 
 class _MetadataExtractor:
@@ -295,7 +385,7 @@ def _runtime(
         claim_ready=gpu_ownership.can_claim,
     )
 
-    def build_resources() -> tuple[TranscriptionJobProcessor, TranscriptionExecutor]:
+    def build_resources() -> _ExecutionResources:
         """Build deterministic captions after physical-GPU ownership is acquired."""
         executor = TranscriptionExecutor(
             TranscriptionAdapters(
@@ -306,9 +396,15 @@ def _runtime(
             ),
             transcription_config,
         )
-        return (
+        return _ExecutionResources(
             TranscriptionJobProcessor(repository, executor, claim_manager),
             executor,
+            ServiceHeartbeatReporter(
+                PostgresServiceHeartbeatRepository(engine),
+                ServiceRole.GPU_WORKER,
+                refresh_interval=timedelta(seconds=10),
+                readiness_probe=gpu_ownership.can_claim,
+            ),
         )
 
     return TranscriptionWorkerRuntime(
@@ -366,6 +462,11 @@ async def _public_client(database_url: str) -> AsyncGenerator[AsyncClient]:
             port=8182,
         ),
         job_config=_job_config(database_url),
+        dispatch_config=JobDispatchConfig(
+            broker_url="redis://127.0.0.1:1/15",  # type: ignore[arg-type]
+            _env_file=None,  # type: ignore[call-arg]
+        ),
+        cache_config=CacheConfig(_env_file=None),  # type: ignore[call-arg]
     )
     async with (
         application.router.lifespan_context(application),
@@ -385,7 +486,7 @@ async def _real_worker(
     temporary_media_root: Path,
     provider: _CaptionProvider,
     metadata_extractor: _MetadataExtractor,
-) -> AsyncGenerator[None]:
+) -> AsyncGenerator[_TaskCompletionTracker, None]:
     """Run one worker runtime with one Celery consumer for a bounded assertion."""
     worker_celery_app = _celery_app(broker_url)
     runtime = _runtime(
@@ -396,16 +497,21 @@ async def _real_worker(
         metadata_extractor,
     )
     runtime.start()
+    completion_tracker = _TaskCompletionTracker()
     try:
-        register_transcription_task(worker_celery_app, runtime)
+        register_transcription_task(
+            worker_celery_app,
+            _CompletionRecordingRuntime(runtime, completion_tracker),
+        )
         with start_worker(
             worker_celery_app,
             pool="threads",
             concurrency=1,
             perform_ping_check=False,
             queues=TRANSCRIPTION_QUEUE,
+            shutdown_timeout=20,
         ):
-            yield
+            yield completion_tracker
     finally:
         runtime.shutdown()
 
@@ -936,12 +1042,13 @@ async def test_duplicate_deliveries_start_attempts_once_across_terminal_outcomes
             tmp_path,
             provider,
             metadata_extractor,
-        ):
+        ) as completion_tracker:
             succeeded = await _wait_for_finished(
                 repository,
                 before_claim_job.public_id,
             )
             await _wait_for_empty_queue(redis_client)
+            await _wait_for_task_completions(completion_tracker, 2)
 
         await publisher.publish(before_claim_dispatch)
         async with _real_worker(
@@ -951,8 +1058,9 @@ async def test_duplicate_deliveries_start_attempts_once_across_terminal_outcomes
             tmp_path,
             provider,
             metadata_extractor,
-        ):
+        ) as completion_tracker:
             await _wait_for_empty_queue(redis_client)
+            await _wait_for_task_completions(completion_tracker, 1)
 
         provider.mode = "blocked"
         provider.started.clear()
@@ -970,11 +1078,12 @@ async def test_duplicate_deliveries_start_attempts_once_across_terminal_outcomes
             tmp_path,
             provider,
             metadata_extractor,
-        ):
+        ) as completion_tracker:
             assert await asyncio.to_thread(provider.started.wait, 5)
             provider.release.set()
             blocked = await _wait_for_finished(repository, blocked_job.public_id)
             await _wait_for_empty_queue(redis_client)
+            await _wait_for_task_completions(completion_tracker, 2)
 
         provider.mode = "failing"
         provider.started.clear()
@@ -991,9 +1100,10 @@ async def test_duplicate_deliveries_start_attempts_once_across_terminal_outcomes
             tmp_path,
             provider,
             metadata_extractor,
-        ):
+        ) as completion_tracker:
             failed = await _wait_for_finished(repository, failed_job.public_id)
             await _wait_for_empty_queue(redis_client)
+            await _wait_for_task_completions(completion_tracker, 2)
 
         provider.mode = "normal"
         cancelled_job = await repository.create_queued(
@@ -1010,8 +1120,9 @@ async def test_duplicate_deliveries_start_attempts_once_across_terminal_outcomes
             tmp_path,
             provider,
             metadata_extractor,
-        ):
+        ) as completion_tracker:
             await _wait_for_empty_queue(redis_client)
+            await _wait_for_task_completions(completion_tracker, 2)
 
         await repository.create_queued(
             NewQueuedTranscriptionJob(f"{_YOUTUBE_URL}&job=timeout", ())
@@ -1028,8 +1139,9 @@ async def test_duplicate_deliveries_start_attempts_once_across_terminal_outcomes
             tmp_path,
             provider,
             metadata_extractor,
-        ):
+        ) as completion_tracker:
             await _wait_for_empty_queue(redis_client)
+            await _wait_for_task_completions(completion_tracker, 2)
     finally:
         await redis_client.aclose()
         await worker_engine.dispose()

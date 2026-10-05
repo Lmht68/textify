@@ -8,6 +8,7 @@ import shutil
 import tempfile
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import Protocol, cast
@@ -23,7 +24,12 @@ from textify.jobs.celery_app import (
     create_celery_app,
 )
 from textify.jobs.claim_manager import ExecutionClaimManager
-from textify.jobs.config import JobConfig, JobDispatchConfig
+from textify.jobs.config import (
+    CacheConfig,
+    JobConfig,
+    JobDispatchConfig,
+    validate_redis_role_isolation,
+)
 from textify.jobs.contracts import (
     TranscriptionJobExecutionRepository,
     TranscriptionJobStoreUnavailableError,
@@ -31,6 +37,11 @@ from textify.jobs.contracts import (
 from textify.jobs.database import create_application_engine, verify_application_database
 from textify.jobs.gpu_ownership import GpuModelOwnership
 from textify.jobs.processor import TranscriptionJobProcessor
+from textify.jobs.readiness import (
+    PostgresServiceHeartbeatRepository,
+    ServiceHeartbeatReporter,
+    ServiceRole,
+)
 from textify.jobs.repository import PostgresTranscriptionJobRepository
 from textify.jobs.service import utc_now
 from textify.jobs.types import JobDispatch
@@ -129,7 +140,16 @@ class _TaskPayloadProcessor(Protocol):
         ...
 
 
-_ExecutionResourcesFactory = Callable[[], tuple[_DispatchProcessor, _ShutdownExecutor]]
+@dataclass(frozen=True, slots=True)
+class _ExecutionResources:
+    """Own deferred worker processing, native cleanup, and service readiness."""
+
+    processor: _DispatchProcessor
+    executor: _ShutdownExecutor
+    heartbeat: ServiceHeartbeatReporter
+
+
+_ExecutionResourcesFactory = Callable[[], _ExecutionResources]
 
 
 class TranscriptionWorkerRuntime:
@@ -156,6 +176,7 @@ class TranscriptionWorkerRuntime:
         self._resources_factory = resources_factory
         self._processor: _DispatchProcessor | None = None
         self._executor: _ShutdownExecutor | None = None
+        self._heartbeat: ServiceHeartbeatReporter | None = None
         self._claim_manager = claim_manager
         self._gpu_ownership = gpu_ownership
         self._engine = engine
@@ -165,6 +186,9 @@ class TranscriptionWorkerRuntime:
         self._loop_thread: threading.Thread | None = None
         self._started = False
         self._runtime_ready = False
+        self._claim_monitoring_started = False
+        self._heartbeat_reporting_started = False
+        self._heartbeat_stop_task: asyncio.Task[None] | None = None
 
     @classmethod
     def from_repository(
@@ -217,15 +241,24 @@ class TranscriptionWorkerRuntime:
             claim_ready=gpu_ownership.can_claim,
         )
 
-        def build_execution_resources() -> tuple[_DispatchProcessor, _ShutdownExecutor]:
-            """Construct the one model-backed executor after ownership locks exist."""
+        def build_execution_resources() -> _ExecutionResources:
+            """Construct model resources after locks and before ready reporting."""
             executor = TranscriptionExecutor(
                 adapters_factory(transcription_config),
                 transcription_config,
             )
-            return (
+            heartbeat = ServiceHeartbeatReporter(
+                PostgresServiceHeartbeatRepository(engine),
+                ServiceRole.GPU_WORKER,
+                refresh_interval=timedelta(
+                    seconds=dispatch_config.service_heartbeat_ttl_seconds / 3
+                ),
+                readiness_probe=gpu_ownership.can_claim,
+            )
+            return _ExecutionResources(
                 TranscriptionJobProcessor(repository, executor, claim_manager),
                 executor,
+                heartbeat,
             )
 
         return cls(
@@ -295,11 +328,11 @@ class TranscriptionWorkerRuntime:
             )
 
     def stop_claiming(self) -> None:
-        """Close worker admission from any Celery or task thread."""
+        """Close worker admission and remove readiness from any Celery thread."""
         with self._state_lock:
             loop = self._loop if self._started else None
         if loop is not None:
-            loop.call_soon_threadsafe(self._claim_manager.stop_accepting)
+            loop.call_soon_threadsafe(self._stop_claiming_on_worker_loop)
 
     def shutdown(self) -> None:
         """Drain claims, native work, ownership, and connections before loop teardown."""
@@ -325,17 +358,21 @@ class TranscriptionWorkerRuntime:
                 self._loop_thread = None
 
     async def _start_resources(self) -> None:
-        """Acquire ownership, load the model, and start claim monitoring."""
+        """Acquire ownership, load the model, and report readiness before work."""
         startup_complete = False
         try:
             if self._verify_database:
                 await verify_application_database(cast(AsyncEngine, self._engine))
             await self._gpu_ownership.acquire()
-            processor, executor = self._resources_factory()
-            self._processor = processor
-            self._executor = executor
+            resources = self._resources_factory()
+            self._processor = resources.processor
+            self._executor = resources.executor
+            self._heartbeat = resources.heartbeat
             self._gpu_ownership.mark_model_ready()
             await self._claim_manager.start()
+            self._claim_monitoring_started = True
+            await resources.heartbeat.start()
+            self._heartbeat_reporting_started = True
             with self._state_lock:
                 self._runtime_ready = True
             startup_complete = True
@@ -344,11 +381,23 @@ class TranscriptionWorkerRuntime:
                 await self._rollback_startup()
 
     async def _rollback_startup(self) -> None:
-        """Release every partially started resource without masking startup failure."""
+        """Release partial startup resources without masking the startup exception."""
+        try:
+            await self._stop_service_heartbeat()
+        except (OSError, RuntimeError):
+            logger.error("worker service heartbeat startup cleanup failed")
         self._gpu_ownership.mark_model_not_ready()
+        if self._claim_monitoring_started:
+            self._claim_manager.stop_accepting()
+            try:
+                await self._claim_manager.shutdown()
+            except (OSError, RuntimeError):
+                logger.error("worker claim manager startup cleanup failed")
+            self._claim_monitoring_started = False
         executor = self._executor
         self._processor = None
         self._executor = None
+        self._heartbeat = None
         if executor is not None:
             try:
                 await executor.shutdown()
@@ -366,9 +415,12 @@ class TranscriptionWorkerRuntime:
     async def _shutdown_resources(self) -> None:
         """Drain owned resources on the same loop that used them."""
         self._claim_manager.stop_accepting()
+        await self._stop_service_heartbeat()
         self._gpu_ownership.mark_model_not_ready()
         try:
-            await self._claim_manager.shutdown()
+            if self._claim_monitoring_started:
+                await self._claim_manager.shutdown()
+                self._claim_monitoring_started = False
         finally:
             executor = self._executor
             try:
@@ -377,10 +429,31 @@ class TranscriptionWorkerRuntime:
             finally:
                 self._processor = None
                 self._executor = None
+                self._heartbeat = None
                 try:
                     await self._gpu_ownership.release()
                 finally:
                     await self._engine.dispose()
+
+    def _stop_claiming_on_worker_loop(self) -> None:
+        """Close claims and asynchronously remove readiness on the worker loop."""
+        self._claim_manager.stop_accepting()
+        if self._heartbeat_reporting_started and self._heartbeat_stop_task is None:
+            self._heartbeat_stop_task = asyncio.create_task(
+                self._stop_service_heartbeat()
+            )
+
+    async def _stop_service_heartbeat(self) -> None:
+        """Remove worker readiness, awaiting any warm-shutdown removal in flight."""
+        scheduled_stop = self._heartbeat_stop_task
+        if scheduled_stop is not None and scheduled_stop is not asyncio.current_task():
+            await scheduled_stop
+            self._heartbeat_stop_task = None
+        heartbeat = self._heartbeat
+        if heartbeat is None:
+            return
+        await heartbeat.stop()
+        self._heartbeat_reporting_started = False
 
     def _close_after_start_failure(
         self,
@@ -589,6 +662,8 @@ def main() -> None:
     """Start one dedicated threads-pool Transcription Job worker process."""
     job_config = JobConfig()  # type: ignore[call-arg]
     dispatch_config = JobDispatchConfig()  # type: ignore[call-arg]
+    cache_config = CacheConfig()
+    validate_redis_role_isolation(dispatch_config, cache_config)
     transcription_config = TranscriptionConfig()  # type: ignore[call-arg]
     engine = create_application_engine(str(job_config.database_url))
     runtime: TranscriptionWorkerRuntime | None = None

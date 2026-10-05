@@ -9,7 +9,7 @@ from pydantic import ValidationError
 from sqlalchemy import text
 
 from textify.config import AppConfig, Environment
-from textify.jobs.config import JobConfig
+from textify.jobs.config import CacheConfig, JobConfig, JobDispatchConfig
 from textify.jobs.database import create_application_engine
 from textify.main import create_app
 
@@ -45,7 +45,32 @@ def _job_config(database_url: str, *, maximum_outstanding_jobs: int = 8) -> JobC
         max_outstanding_jobs=maximum_outstanding_jobs,
         job_queue_timeout_seconds=20,
         job_retention_seconds=86_400,
+        _env_file=None,  # type: ignore[call-arg]
     )
+
+
+def _dispatch_config(broker_url: str) -> JobDispatchConfig:
+    """Create isolated Redis broker settings for ASGI tests.
+
+    Args:
+        broker_url: Valid Redis URL, whether or not its server is reachable.
+
+    Returns:
+        Dispatch configuration independent of local environment files.
+    """
+    return JobDispatchConfig(
+        broker_url=broker_url,  # type: ignore[arg-type]
+        _env_file=None,  # type: ignore[call-arg]
+    )
+
+
+def _cache_config() -> CacheConfig:
+    """Create an omitted-cache configuration for ASGI tests.
+
+    Returns:
+        Configuration with no cache client or endpoint.
+    """
+    return CacheConfig(_env_file=None)  # type: ignore[call-arg]
 
 
 def _assert_generated_request_id(response: Response) -> str:
@@ -76,15 +101,15 @@ def test_app_config_defaults_to_deployment_port(
 
 
 @pytest.mark.asyncio
-async def test_api_starts_without_broker_or_worker_dependencies(
+async def test_api_admits_jobs_during_broker_readiness_degradation(
     migrated_postgresql_database_url: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Admit and inspect a job when only PostgreSQL lifecycle settings exist."""
-    monkeypatch.delenv("TEXTIFY_BROKER_URL", raising=False)
+    """Keep direct durable admission available while full health reports 503."""
     application = create_app(
         _app_config(),
         job_config=_job_config(migrated_postgresql_database_url),
+        dispatch_config=_dispatch_config("redis://127.0.0.1:1/15"),
+        cache_config=_cache_config(),
     )
 
     async with application.router.lifespan_context(application):
@@ -99,7 +124,9 @@ async def test_api_starts_without_broker_or_worker_dependencies(
             )
             status_response = await client.get(submission_response.headers["Location"])
 
-    assert health_response.json() == {"status": "ok"}
+    assert health_response.status_code == 503
+    assert health_response.json() == {"detail": "Service Unavailable"}
+    assert _assert_generated_request_id(health_response)
     assert submission_response.status_code == 202
     assert (
         submission_response.headers["Location"]
@@ -118,7 +145,11 @@ async def test_api_rejects_unconfigured_database_at_lifespan_startup(
     """Defer required PostgreSQL validation until the application lifespan begins."""
     monkeypatch.delenv("TEXTIFY_DATABASE_URL", raising=False)
     monkeypatch.chdir(tmp_path)
-    application = create_app(_app_config())
+    application = create_app(
+        _app_config(),
+        dispatch_config=_dispatch_config("redis://127.0.0.1:1/15"),
+        cache_config=_cache_config(),
+    )
 
     with pytest.raises(ValidationError):
         async with application.router.lifespan_context(application):
@@ -128,16 +159,15 @@ async def test_api_rejects_unconfigured_database_at_lifespan_startup(
 
 
 @pytest.mark.asyncio
-async def test_api_rejects_unavailable_postgresql(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_api_rejects_unavailable_postgresql() -> None:
     """Map an unreachable PostgreSQL server to the stable startup failure."""
-    monkeypatch.delenv("TEXTIFY_BROKER_URL", raising=False)
     application = create_app(
         _app_config(),
         job_config=_job_config(
             "postgresql+asyncpg://textify:change-me@127.0.0.1:1/textify"
         ),
+        dispatch_config=_dispatch_config("redis://127.0.0.1:1/15"),
+        cache_config=_cache_config(),
     )
 
     with pytest.raises(
@@ -170,6 +200,8 @@ async def test_api_rejects_postgresql_without_current_migration(
     application = create_app(
         _app_config(),
         job_config=_job_config(postgresql_database_url),
+        dispatch_config=_dispatch_config("redis://127.0.0.1:1/15"),
+        cache_config=_cache_config(),
     )
 
     with pytest.raises(
@@ -191,6 +223,8 @@ async def test_api_adds_fresh_request_ids_to_job_route_outcomes(
     application = create_app(
         _app_config(),
         job_config=_job_config(migrated_postgresql_database_url),
+        dispatch_config=_dispatch_config("redis://127.0.0.1:1/15"),
+        cache_config=_cache_config(),
     )
 
     async with application.router.lifespan_context(application):
@@ -222,7 +256,7 @@ async def test_api_adds_fresh_request_ids_to_job_route_outcomes(
         unmatched_response,
     )
     request_ids = {_assert_generated_request_id(response) for response in responses}
-    assert health_response.status_code == 200
+    assert health_response.status_code == 503
     assert submission_response.status_code == 202
     assert validation_response.status_code == 422
     assert unmatched_response.status_code == 404

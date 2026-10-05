@@ -21,12 +21,22 @@ from textify.errors import (
     textify_error_handler,
     unhandled_error_handler,
 )
-from textify.jobs.config import JobConfig
+from textify.jobs.config import (
+    CacheConfig,
+    JobConfig,
+    JobDispatchConfig,
+    validate_redis_role_isolation,
+)
 from textify.jobs.database import (
     create_application_engine,
     verify_application_database,
 )
 from textify.jobs.http import TranscriptionJobHeadersMiddleware
+from textify.jobs.readiness import (
+    ApplicationReadiness,
+    PostgresServiceHeartbeatRepository,
+    RedisBrokerReadiness,
+)
 from textify.jobs.repository import PostgresTranscriptionJobRepository
 from textify.jobs.router import router as transcription_job_router
 from textify.jobs.service import TranscriptionJobService, utc_now
@@ -118,30 +128,44 @@ def create_app(
     app_config: AppConfig | None = None,
     *,
     job_config: JobConfig | None = None,
+    dispatch_config: JobDispatchConfig | None = None,
+    cache_config: CacheConfig | None = None,
     clock: Callable[[], datetime] = utc_now,
 ) -> FastAPI:
-    """Create the configured PostgreSQL-only Textify FastAPI application.
+    """Create the configured PostgreSQL-backed Textify FastAPI application.
 
     Args:
         app_config: Optional application configuration for composition or tests.
         job_config: Optional durable-job configuration for composition or tests.
+        dispatch_config: Optional broker configuration used only for readiness.
+        cache_config: Optional validation-only future cache configuration.
         clock: UTC clock supplied to durable job storage.
 
     Returns:
-        Unstarted FastAPI application with PostgreSQL-backed job lifecycle state.
+        Unstarted FastAPI application with durable admission and full topology
+        readiness checks.
     """
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
-        """Create PostgreSQL lifecycle state before accepting HTTP traffic."""
+        """Create durable admission and aggregate readiness state before traffic."""
         application.state.ready = False
+        application.state.readiness = None
         resolved_app_config = app_config if app_config is not None else AppConfig()
         resolved_job_config = (
             job_config if job_config is not None else JobConfig()  # type: ignore[call-arg]
         )
+        resolved_dispatch_config = (
+            dispatch_config if dispatch_config is not None else JobDispatchConfig()  # type: ignore[call-arg]
+        )
+        resolved_cache_config = (
+            cache_config if cache_config is not None else CacheConfig()
+        )
+        validate_redis_role_isolation(resolved_dispatch_config, resolved_cache_config)
 
         configure_logging(resolved_app_config.log_level)
         engine = create_application_engine(str(resolved_job_config.database_url))
+        broker_readiness: RedisBrokerReadiness | None = None
         try:
             await verify_application_database(engine)
             repository = PostgresTranscriptionJobRepository(
@@ -164,12 +188,25 @@ def create_app(
                 repository,
                 mark_application_unready,
             )
+            heartbeat_repository = PostgresServiceHeartbeatRepository(engine)
+            broker_readiness = RedisBrokerReadiness(resolved_dispatch_config)
+            application.state.readiness = ApplicationReadiness(
+                engine,
+                heartbeat_repository,
+                broker_readiness,
+                timedelta(
+                    seconds=resolved_dispatch_config.service_heartbeat_ttl_seconds
+                ),
+            )
             application.state.ready = True
             try:
                 yield
             finally:
                 application.state.ready = False
         finally:
+            application.state.readiness = None
+            if broker_readiness is not None:
+                await broker_readiness.aclose()
             await engine.dispose()
 
     application = FastAPI(
@@ -184,8 +221,8 @@ def create_app(
             {
                 "name": "health",
                 "description": (
-                    "Readiness after the lifespan verifies PostgreSQL and creates "
-                    "the durable job lifecycle service."
+                    "Readiness across PostgreSQL, the Redis broker, and fresh "
+                    "reconciler and model-ready GPU-worker service heartbeats."
                 ),
             },
             {
@@ -199,6 +236,7 @@ def create_app(
         lifespan=lifespan,
     )
     application.state.ready = False
+    application.state.readiness = None
     application.add_middleware(_RequestObservabilityMiddleware)
     application.add_middleware(TranscriptionJobHeadersMiddleware)
     application.add_exception_handler(TextifyError, textify_error_handler)

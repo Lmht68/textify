@@ -58,6 +58,7 @@ class JobDispatchConfig(BaseSettings):
     reconciler_interval_seconds: float = Field(default=1.0, gt=0)
     attempt_heartbeat_seconds: float = Field(default=5.0, gt=0)
     attempt_lease_seconds: float = Field(default=30.0, gt=0)
+    service_heartbeat_ttl_seconds: float = Field(default=30.0, gt=0)
 
     @model_validator(mode="after")
     def require_heartbeat_lease_ratio(self) -> Self:
@@ -75,3 +76,49 @@ class JobDispatchConfig(BaseSettings):
                 "TEXTIFY_ATTEMPT_HEARTBEAT_SECONDS."
             )
         return self
+
+
+class CacheConfig(BaseSettings):
+    """Validate optional cache endpoint isolation settings."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="TEXTIFY_",
+        env_file=".env",
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+    cache_url: RedisDsn | None = None
+
+
+def validate_redis_role_isolation(
+    dispatch_config: JobDispatchConfig,
+    cache_config: CacheConfig,
+) -> None:
+    """Reject broker and cache URLs that identify one Redis server endpoint.
+
+    Args:
+        dispatch_config: Required Celery broker connection settings.
+        cache_config: Optional future cache connection settings.
+
+    Raises:
+        ValueError: If both URLs resolve to the same normalized host and port.
+    """
+    cache_url = cache_config.cache_url
+    if cache_url is None:
+        return
+    if _redis_server_endpoint(dispatch_config.broker_url) == _redis_server_endpoint(
+        cache_url
+    ):
+        raise ValueError(
+            "TEXTIFY_BROKER_URL and TEXTIFY_CACHE_URL must identify different "
+            "Redis server endpoints."
+        )
+
+
+def _redis_server_endpoint(redis_url: RedisDsn) -> tuple[str, int]:
+    """Return Pydantic-normalized physical Redis host and effective port."""
+    host = redis_url.host
+    if host is None:
+        raise RuntimeError("Redis URL must include a host.")
+    return host, redis_url.port or 6379

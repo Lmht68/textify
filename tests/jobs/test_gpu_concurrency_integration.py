@@ -18,7 +18,7 @@ from httpx import ASGITransport, AsyncClient
 
 from textify.config import AppConfig, Environment
 from textify.jobs.celery_app import TRANSCRIPTION_QUEUE, create_celery_app
-from textify.jobs.config import JobConfig, JobDispatchConfig
+from textify.jobs.config import CacheConfig, JobConfig, JobDispatchConfig
 from textify.jobs.database import create_application_engine
 from textify.jobs.dispatch import CeleryJobDispatchPublisher
 from textify.jobs.reconciler import TranscriptionJobReconciler
@@ -282,6 +282,8 @@ async def _running_harness(
             port=8182,
         ),
         job_config=job_config,
+        dispatch_config=dispatch_config,
+        cache_config=CacheConfig(_env_file=None),  # type: ignore[call-arg]
     )
 
     runtime.start()

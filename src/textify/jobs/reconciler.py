@@ -10,7 +10,12 @@ from datetime import timedelta
 from uuid import uuid4
 
 from textify.jobs.celery_app import create_celery_app
-from textify.jobs.config import JobConfig, JobDispatchConfig
+from textify.jobs.config import (
+    CacheConfig,
+    JobConfig,
+    JobDispatchConfig,
+    validate_redis_role_isolation,
+)
 from textify.jobs.contracts import (
     TranscriptionJobDispatchRepository,
     TranscriptionJobStoreUnavailableError,
@@ -20,6 +25,13 @@ from textify.jobs.dispatch import (
     CeleryJobDispatchPublisher,
     JobDispatchPublisher,
     JobDispatchUnavailableError,
+)
+from textify.jobs.readiness import (
+    PostgresServiceHeartbeatRepository,
+    RedisBrokerReadiness,
+    ServiceHeartbeatReporter,
+    ServiceReadinessUnavailableError,
+    ServiceRole,
 )
 from textify.jobs.repository import PostgresTranscriptionJobRepository
 from textify.jobs.service import utc_now
@@ -76,8 +88,13 @@ class TranscriptionJobReconciler:
         self._policy = policy or ReconcilerPolicy()
         self._lease_owner = uuid4()
 
-    async def reconcile_once(self) -> None:
-        """Recover expired claims, expire queued work, then publish due dispatches.
+    async def reconcile_once(self) -> bool:
+        """Recover, expire, and publish every currently due Job Dispatch.
+
+        Returns:
+            ``True`` when recovery, queue expiry, all publication records, and the
+            current due-dispatch scan complete. ``False`` when Redis rejects a
+            leased dispatch and its unpublished suffix is released.
 
         Raises:
             TranscriptionJobStoreUnavailableError: If PostgreSQL recovery cannot
@@ -92,7 +109,7 @@ class TranscriptionJobReconciler:
                 self._policy.dispatch_batch_size,
             )
             if not dispatches:
-                return
+                return True
             for index, dispatch in enumerate(dispatches):
                 try:
                     await self._publisher.publish(dispatch)
@@ -102,7 +119,7 @@ class TranscriptionJobReconciler:
                         dispatches[index:],
                         self._lease_owner,
                     )
-                    return
+                    return False
                 await self._repository.record_dispatch_published(
                     dispatch,
                     self._lease_owner,
@@ -131,29 +148,44 @@ class TranscriptionJobReconciler:
         """
         await self._repository.delete_expired_terminal_jobs()
 
-    async def run(self, stop_event: asyncio.Event) -> None:
-        """Reconcile until the caller requests shutdown.
+    async def run(
+        self,
+        stop_event: asyncio.Event,
+        heartbeat: ServiceHeartbeatReporter,
+    ) -> None:
+        """Reconcile and report readiness until the caller requests shutdown.
 
         Args:
             stop_event: Event set by the process owner to stop scans cleanly.
+            heartbeat: Reconciler service-readiness lifecycle.
         """
+        await heartbeat.start()
         next_cleanup_at = time.monotonic()
-        while not stop_event.is_set():
-            try:
-                await self.reconcile_once()
-                if time.monotonic() >= next_cleanup_at:
-                    await self.cleanup_once()
-                    next_cleanup_at = (
-                        time.monotonic()
-                        + self._policy.retention_cleanup_interval.total_seconds()
+        try:
+            while not stop_event.is_set():
+                try:
+                    reconciliation_succeeded = await self.reconcile_once()
+                    if time.monotonic() >= next_cleanup_at:
+                        await self.cleanup_once()
+                        next_cleanup_at = (
+                            time.monotonic()
+                            + self._policy.retention_cleanup_interval.total_seconds()
+                        )
+                    if reconciliation_succeeded:
+                        await heartbeat.pulse()
+                except TranscriptionJobStoreUnavailableError:
+                    logger.error(
+                        "transcription job storage is unavailable to reconciler"
                     )
-            except TranscriptionJobStoreUnavailableError:
-                logger.error("transcription job storage is unavailable to reconciler")
-            try:
-                async with asyncio.timeout(self._policy.interval.total_seconds()):
-                    await stop_event.wait()
-            except TimeoutError:
-                continue
+                except ServiceReadinessUnavailableError:
+                    logger.error("reconciler service readiness storage is unavailable")
+                try:
+                    async with asyncio.timeout(self._policy.interval.total_seconds()):
+                        await stop_event.wait()
+                except TimeoutError:
+                    continue
+        finally:
+            await heartbeat.stop()
 
 
 async def run_reconciler() -> None:
@@ -164,6 +196,8 @@ async def run_reconciler() -> None:
     """
     job_config = JobConfig()  # type: ignore[call-arg]
     dispatch_config = JobDispatchConfig()  # type: ignore[call-arg]
+    cache_config = CacheConfig()
+    validate_redis_role_isolation(dispatch_config, cache_config)
     engine = create_application_engine(str(job_config.database_url))
     try:
         await verify_application_database(engine)
@@ -175,6 +209,15 @@ async def run_reconciler() -> None:
             clock=utc_now,
         )
         publisher = CeleryJobDispatchPublisher(create_celery_app(dispatch_config))
+        broker_readiness = RedisBrokerReadiness(dispatch_config)
+        try:
+            await publisher.initialize(broker_readiness)
+        finally:
+            await broker_readiness.aclose()
+        heartbeat = ServiceHeartbeatReporter(
+            PostgresServiceHeartbeatRepository(engine),
+            ServiceRole.RECONCILER,
+        )
         reconciler = TranscriptionJobReconciler(
             repository,
             publisher,
@@ -182,7 +225,7 @@ async def run_reconciler() -> None:
                 interval=timedelta(seconds=dispatch_config.reconciler_interval_seconds)
             ),
         )
-        await reconciler.run(asyncio.Event())
+        await reconciler.run(asyncio.Event(), heartbeat)
     finally:
         await engine.dispose()
 

@@ -10,7 +10,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient, Response
 
 from textify.config import AppConfig, Environment
-from textify.jobs.config import JobConfig
+from textify.jobs.config import CacheConfig, JobConfig, JobDispatchConfig
 from textify.main import create_app
 
 _TIKTOK_URL = "https://www.tiktok.com/@creator/video/1234567890123456789"
@@ -49,7 +49,29 @@ def _job_config(
         max_outstanding_jobs=maximum_outstanding_jobs,
         job_queue_timeout_seconds=20,
         job_retention_seconds=86_400,
+        _env_file=None,  # type: ignore[call-arg]
     )
+
+
+def _dispatch_config() -> JobDispatchConfig:
+    """Build unreachable Redis settings for isolated API lifecycle tests.
+
+    Returns:
+        Broker configuration that keeps health unready without blocking admission.
+    """
+    return JobDispatchConfig(
+        broker_url="redis://127.0.0.1:1/15",  # type: ignore[arg-type]
+        _env_file=None,  # type: ignore[call-arg]
+    )
+
+
+def _cache_config() -> CacheConfig:
+    """Build absent cache settings for isolated API lifecycle tests.
+
+    Returns:
+        Validation-only cache configuration with no endpoint.
+    """
+    return CacheConfig(_env_file=None)  # type: ignore[call-arg]
 
 
 @asynccontextmanager
@@ -73,6 +95,8 @@ async def _client_for(
             database_url,
             maximum_outstanding_jobs=maximum_outstanding_jobs,
         ),
+        dispatch_config=_dispatch_config(),
+        cache_config=_cache_config(),
     )
     async with (
         application.router.lifespan_context(application),

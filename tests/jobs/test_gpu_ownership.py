@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from textify.jobs.config import JobDispatchConfig
@@ -201,19 +202,39 @@ def test_runtime_conflict_prevents_second_model_factory_before_claim_start(
         adapters_factory=adapters_factory,
     )
 
+    async def heartbeat_count() -> int:
+        """Count every current worker row through an independent engine loop."""
+        readiness_engine = create_application_engine(migrated_postgresql_database_url)
+        try:
+            async with readiness_engine.connect() as connection:
+                count = await connection.scalar(
+                    text(
+                        "SELECT count(*) FROM service_heartbeat "
+                        "WHERE service_role = 'gpu_worker'"
+                    )
+                )
+        finally:
+            await readiness_engine.dispose()
+        assert isinstance(count, int)
+        return count
+
     try:
         first_runtime.start()
+        assert asyncio.run(heartbeat_count()) == 1
         with pytest.raises(
             GpuOwnershipConflictError,
             match="GPU ownership is already held for the configured identity.",
         ):
             second_runtime.start()
+        assert asyncio.run(heartbeat_count()) == 1
 
         assert factory_calls == [None]
         first_runtime.shutdown()
+        assert asyncio.run(heartbeat_count()) == 0
 
         third_runtime.start()
         assert factory_calls == [None, None]
+        assert asyncio.run(heartbeat_count()) == 1
     finally:
         first_runtime.shutdown()
         second_runtime.shutdown()

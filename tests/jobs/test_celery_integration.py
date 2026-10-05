@@ -14,15 +14,24 @@ from httpx import ASGITransport, AsyncClient
 from textify.config import AppConfig, Environment
 from textify.jobs.celery_app import TRANSCRIPTION_QUEUE, create_celery_app
 from textify.jobs.claim_manager import ExecutionClaimManager
-from textify.jobs.config import JobConfig, JobDispatchConfig
+from textify.jobs.config import CacheConfig, JobConfig, JobDispatchConfig
 from textify.jobs.database import create_application_engine
 from textify.jobs.dispatch import CeleryJobDispatchPublisher
 from textify.jobs.gpu_ownership import GpuModelOwnership
 from textify.jobs.processor import TranscriptionJobProcessor
+from textify.jobs.readiness import (
+    PostgresServiceHeartbeatRepository,
+    ServiceHeartbeatReporter,
+    ServiceRole,
+)
 from textify.jobs.reconciler import TranscriptionJobReconciler
 from textify.jobs.repository import PostgresTranscriptionJobRepository
 from textify.jobs.service import utc_now
-from textify.jobs.worker import TranscriptionWorkerRuntime, register_transcription_task
+from textify.jobs.worker import (
+    TranscriptionWorkerRuntime,
+    _ExecutionResources,
+    register_transcription_task,
+)
 from textify.main import create_app
 from textify.transcription import inspection
 from textify.transcription.config import TranscriptionConfig
@@ -237,12 +246,26 @@ async def test_api_submission_reconciles_and_retrieves_celery_caption_result(
         claim_ready=gpu_ownership.can_claim,
     )
 
-    def build_resources() -> tuple[TranscriptionJobProcessor, TranscriptionExecutor]:
+    dispatch_config = JobDispatchConfig(
+        broker_url=redis_broker_url,  # type: ignore[arg-type]
+        worker_concurrency=1,
+        _env_file=None,  # type: ignore[call-arg]
+    )
+
+    def build_resources() -> _ExecutionResources:
         """Construct deterministic worker resources after GPU ownership is acquired."""
         executor = TranscriptionExecutor(adapters, transcription_config)
-        return (
+        return _ExecutionResources(
             TranscriptionJobProcessor(worker_repository, executor, claim_manager),
             executor,
+            ServiceHeartbeatReporter(
+                PostgresServiceHeartbeatRepository(worker_engine),
+                ServiceRole.GPU_WORKER,
+                refresh_interval=timedelta(
+                    seconds=dispatch_config.service_heartbeat_ttl_seconds / 3
+                ),
+                readiness_probe=gpu_ownership.can_claim,
+            ),
         )
 
     runtime = TranscriptionWorkerRuntime(
@@ -250,11 +273,6 @@ async def test_api_submission_reconciles_and_retrieves_celery_caption_result(
         claim_manager,
         gpu_ownership,
         worker_engine,
-    )
-    dispatch_config = JobDispatchConfig(
-        broker_url=redis_broker_url,  # type: ignore[arg-type]
-        worker_concurrency=1,
-        _env_file=None,  # type: ignore[call-arg]
     )
     celery_app = create_celery_app(dispatch_config)
     register_transcription_task(celery_app, runtime)
@@ -267,7 +285,12 @@ async def test_api_submission_reconciles_and_retrieves_celery_caption_result(
             perform_ping_check=False,
             queues=TRANSCRIPTION_QUEUE,
         ):
-            application = create_app(_app_config(), job_config=job_config)
+            application = create_app(
+                _app_config(),
+                job_config=job_config,
+                dispatch_config=dispatch_config,
+                cache_config=CacheConfig(_env_file=None),  # type: ignore[call-arg]
+            )
             reconciler = TranscriptionJobReconciler(
                 reconciler_repository,
                 CeleryJobDispatchPublisher(celery_app),

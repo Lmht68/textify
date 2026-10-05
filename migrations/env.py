@@ -7,10 +7,10 @@ from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 from textify.jobs.config import JobConfig
-from textify.jobs.repository import metadata
+from textify.jobs.readiness import service_heartbeat
 
 config = context.config
-target_metadata = metadata
+target_metadata = service_heartbeat.metadata
 
 
 def _configured_database_url() -> str:

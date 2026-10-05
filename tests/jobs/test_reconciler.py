@@ -1,5 +1,6 @@
 """Tests for PostgreSQL-driven Job Dispatch reconciliation."""
 
+import asyncio
 from collections import deque
 from collections.abc import Callable
 from datetime import timedelta
@@ -113,6 +114,45 @@ class RecordingPublisher:
         self.dispatches.append(dispatch)
 
 
+class RecordingServiceHeartbeat:
+    """Record reconciler readiness lifecycle operations."""
+
+    def __init__(self, stop_event: asyncio.Event | None = None) -> None:
+        """Initialize observable calls and an optional pulse-stop event."""
+        self._stop_event = stop_event
+        self.start_calls = 0
+        self.pulse_calls = 0
+        self.stop_calls = 0
+
+    async def start(self) -> None:
+        """Record the required first readiness write."""
+        self.start_calls += 1
+
+    async def pulse(self) -> None:
+        """Record a successful reconciliation-cycle readiness refresh."""
+        self.pulse_calls += 1
+        if self._stop_event is not None:
+            self._stop_event.set()
+
+    async def stop(self) -> None:
+        """Record graceful removal of this reconciler heartbeat."""
+        self.stop_calls += 1
+
+
+class StopOnBrokerFailurePublisher:
+    """Stop one run-loop test after an unavailable broker publication attempt."""
+
+    def __init__(self, stop_event: asyncio.Event) -> None:
+        """Initialize the run-loop stop event."""
+        self._stop_event = stop_event
+
+    async def publish(self, dispatch: JobDispatch) -> None:
+        """Stop the loop and simulate a rejected broker publication."""
+        del dispatch
+        self._stop_event.set()
+        raise JobDispatchUnavailableError()
+
+
 def _dispatch(internal_job_id: int) -> JobDispatch:
     """Build one valid private dispatch.
 
@@ -146,11 +186,14 @@ async def test_reconciler_recovers_claims_before_expiry_and_dispatch() -> None:
     )
     publisher = RecordingPublisher()
 
-    await TranscriptionJobReconciler(
-        repository,
-        publisher,
-        policy=_policy(dispatch_batch_size=2),
-    ).reconcile_once()
+    assert (
+        await TranscriptionJobReconciler(
+            repository,
+            publisher,
+            policy=_policy(dispatch_batch_size=2),
+        ).reconcile_once()
+        is True
+    )
 
     assert repository.calls == [
         "recover",
@@ -180,11 +223,14 @@ async def test_reconciler_drains_due_dispatch_batches() -> None:
     )
     publisher = RecordingPublisher()
 
-    await TranscriptionJobReconciler(
-        repository,
-        publisher,
-        policy=_policy(dispatch_batch_size=2),
-    ).reconcile_once()
+    assert (
+        await TranscriptionJobReconciler(
+            repository,
+            publisher,
+            policy=_policy(dispatch_batch_size=2),
+        ).reconcile_once()
+        is True
+    )
 
     assert publisher.dispatches == [
         first_dispatch,
@@ -212,11 +258,14 @@ async def test_reconciler_releases_unpublished_suffix_when_broker_is_unavailable
     )
     publisher = RecordingPublisher(unavailable_after=1)
 
-    await TranscriptionJobReconciler(
-        repository,
-        publisher,
-        policy=_policy(),
-    ).reconcile_once()
+    assert (
+        await TranscriptionJobReconciler(
+            repository,
+            publisher,
+            policy=_policy(),
+        ).reconcile_once()
+        is False
+    )
 
     assert publisher.dispatches == [first_dispatch]
     assert [record[0] for record in repository.recorded_dispatches] == [first_dispatch]
@@ -256,6 +305,44 @@ async def test_reconciler_owns_expired_terminal_job_cleanup() -> None:
     ).cleanup_once()
 
     assert repository.cleanup_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_reconciler_reports_only_after_a_complete_successful_cycle() -> None:
+    """Start, refresh, and remove readiness around one completed reconciliation."""
+    stop_event = asyncio.Event()
+    repository = RecordingDispatchRepository(())
+    reporter = RecordingServiceHeartbeat(stop_event)
+    reconciler = TranscriptionJobReconciler(
+        repository,
+        RecordingPublisher(),
+        policy=_policy(),
+    )
+
+    await reconciler.run(stop_event, reporter)  # type: ignore[arg-type]
+
+    assert reporter.start_calls == 1
+    assert reporter.pulse_calls == 1
+    assert reporter.stop_calls == 1
+    assert repository.cleanup_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_reconciler_does_not_refresh_readiness_after_broker_failure() -> None:
+    """Remove the row without a refresh after a failed broker publication cycle."""
+    stop_event = asyncio.Event()
+    reporter = RecordingServiceHeartbeat()
+    reconciler = TranscriptionJobReconciler(
+        RecordingDispatchRepository(((_dispatch(3),),)),
+        StopOnBrokerFailurePublisher(stop_event),
+        policy=_policy(),
+    )
+
+    await reconciler.run(stop_event, reporter)  # type: ignore[arg-type]
+
+    assert reporter.start_calls == 1
+    assert reporter.pulse_calls == 0
+    assert reporter.stop_calls == 1
 
 
 @pytest.mark.parametrize(
