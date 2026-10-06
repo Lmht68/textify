@@ -267,6 +267,7 @@ async def test_configured_public_videos_match_transcription_job_contract() -> No
             location = submission.headers["Location"]
             submission_payload = _mapping(submission.json())
             job_id = _assert_active_job(submission_payload, location)
+            await asyncio.sleep(int(submission.headers["Retry-After"]))
 
             response = await _poll_until_succeeded(client, location, job_id)
             result = _assert_succeeded_job(_mapping(response.json()), location, job_id)

@@ -42,7 +42,6 @@ COPY alembic.ini ./
 COPY migrations ./migrations
 RUN uv sync --frozen --no-dev --no-editable
 
-VOLUME ["/var/cache/textify/huggingface", "/var/lib/textify"]
 EXPOSE 8182
 USER 10001:10001
 CMD ["textify"]

@@ -1,0 +1,162 @@
+x-job-environment: &job-environment
+  TEXTIFY_DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:?POSTGRES_USER must be set}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB must be set}"
+  TEXTIFY_MAX_OUTSTANDING_JOBS: "${TEXTIFY_MAX_OUTSTANDING_JOBS:-8}"
+  TEXTIFY_JOB_QUEUE_TIMEOUT_SECONDS: "${TEXTIFY_JOB_QUEUE_TIMEOUT_SECONDS:-20}"
+  TEXTIFY_JOB_RETENTION_SECONDS: "${TEXTIFY_JOB_RETENTION_SECONDS:-86400}"
+
+x-dispatch-environment: &dispatch-environment
+  TEXTIFY_BROKER_URL: "redis://broker:6379/0"
+  TEXTIFY_WORKER_CONCURRENCY: "${TEXTIFY_WORKER_CONCURRENCY:-4}"
+  TEXTIFY_RECONCILER_INTERVAL_SECONDS: "${TEXTIFY_RECONCILER_INTERVAL_SECONDS:-1.0}"
+  TEXTIFY_ATTEMPT_HEARTBEAT_SECONDS: "${TEXTIFY_ATTEMPT_HEARTBEAT_SECONDS:-5.0}"
+  TEXTIFY_ATTEMPT_LEASE_SECONDS: "${TEXTIFY_ATTEMPT_LEASE_SECONDS:-30.0}"
+  TEXTIFY_SERVICE_HEARTBEAT_TTL_SECONDS: "${TEXTIFY_SERVICE_HEARTBEAT_TTL_SECONDS:-30.0}"
+
+x-transcription-environment: &transcription-environment
+  TEXTIFY_GPU_IDENTITY: "${TEXTIFY_GPU_IDENTITY:-}"
+  TEXTIFY_GPU_LOCK_DIRECTORY: /var/lib/textify/gpu-locks
+  TEXTIFY_MAX_DURATION_SECONDS: "${TEXTIFY_MAX_DURATION_SECONDS:-1800}"
+  TEXTIFY_TEMPORARY_MEDIA_ROOT: /var/lib/textify/media
+  TEXTIFY_WHISPER_MODEL: "${TEXTIFY_WHISPER_MODEL:-large-v3-turbo}"
+  TEXTIFY_WHISPER_REVISION: "${TEXTIFY_WHISPER_REVISION:-0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf}"
+  TEXTIFY_WHISPER_DEVICE: "${TEXTIFY_WHISPER_DEVICE:-cuda}"
+  TEXTIFY_WHISPER_DEVICE_INDEX: "${TEXTIFY_WHISPER_DEVICE_INDEX:-0}"
+  TEXTIFY_WHISPER_COMPUTE_TYPE: "${TEXTIFY_WHISPER_COMPUTE_TYPE:-float16}"
+  TEXTIFY_BEAM_SIZE: "${TEXTIFY_BEAM_SIZE:-1}"
+  TEXTIFY_VAD_FILTER: "${TEXTIFY_VAD_FILTER:-true}"
+  TEXTIFY_TEMPERATURE: "${TEXTIFY_TEMPERATURE:-0.0}"
+  TEXTIFY_CONDITION_ON_PREVIOUS_TEXT: "${TEXTIFY_CONDITION_ON_PREVIOUS_TEXT:-true}"
+  TEXTIFY_INITIAL_PROMPT: "${TEXTIFY_INITIAL_PROMPT:-}"
+  TEXTIFY_TRANSCRIPTION_CONCURRENCY: "${TEXTIFY_TRANSCRIPTION_CONCURRENCY:-2}"
+  TEXTIFY_MAX_MEDIA_BYTES: "${TEXTIFY_MAX_MEDIA_BYTES:-536870912}"
+  TEXTIFY_METADATA_TIMEOUT_SECONDS: "${TEXTIFY_METADATA_TIMEOUT_SECONDS:-30.0}"
+  TEXTIFY_AUDIO_DOWNLOAD_TIMEOUT_SECONDS: "${TEXTIFY_AUDIO_DOWNLOAD_TIMEOUT_SECONDS:-300.0}"
+  TEXTIFY_TRANSCRIPTION_TIMEOUT_SECONDS: "${TEXTIFY_TRANSCRIPTION_TIMEOUT_SECONDS:-1800.0}"
+
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:?POSTGRES_DB must be set}"
+      POSTGRES_USER: "${POSTGRES_USER:?POSTGRES_USER must be set}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}"
+    ports:
+      - "127.0.0.1:${TEXTIFY_POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  broker:
+    image: redis:7.4
+    restart: unless-stopped
+    command: ["redis-server", "/usr/local/etc/redis/redis-broker.conf"]
+    ports:
+      - "127.0.0.1:${TEXTIFY_BROKER_HOST_PORT:-6379}:6379"
+    volumes:
+      - ./deploy/redis-broker.conf:/usr/local/etc/redis/redis-broker.conf:ro
+      - broker-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    environment:
+      <<: *job-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  reconciler:
+    build: .
+    command: ["textify-reconciler"]
+    restart: unless-stopped
+    environment:
+      <<: [*job-environment, *dispatch-environment]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  api:
+    build: .
+    command: ["textify"]
+    restart: unless-stopped
+    environment:
+      <<: [*job-environment, *dispatch-environment]
+      TEXTIFY_ENVIRONMENT: "${TEXTIFY_ENVIRONMENT:-local}"
+      TEXTIFY_LOG_LEVEL: "${TEXTIFY_LOG_LEVEL:-INFO}"
+      TEXTIFY_HOST: 0.0.0.0
+      TEXTIFY_PORT: "8182"
+    ports:
+      - "127.0.0.1:${TEXTIFY_API_HOST_PORT:-8182}:8182"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  cache:
+    image: redis:7.4
+    profiles: [cache]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${TEXTIFY_CACHE_HOST_PORT:-6380}:6379"
+    volumes:
+      - cache-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  worker:
+    build: .
+    command: ["textify-worker"]
+    profiles: [gpu]
+    restart: unless-stopped
+    stop_grace_period: "${TEXTIFY_WORKER_STOP_GRACE_PERIOD:-30m}"
+    environment:
+      <<: [*job-environment, *dispatch-environment, *transcription-environment]
+      TEXTIFY_HF_TOKEN:
+    volumes:
+      - model-cache:/var/cache/textify/huggingface
+      - gpu-locks:/var/lib/textify/gpu-locks
+      - worker-media:/var/lib/textify/media
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${TEXTIFY_GPU_DEVICE_ID:-0}"]
+              capabilities: [gpu]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-data:
+  broker-data:
+  cache-data:
+  model-cache:
+  gpu-locks:
+  worker-media:
