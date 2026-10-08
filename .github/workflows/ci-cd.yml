@@ -69,6 +69,12 @@ jobs:
           uv run ruff check .
       - name: Type-check application code
         run: uv run mypy src
+      - name: Run distributed integration tests
+        run: >-
+          uv run pytest -q tests/jobs/test_celery_integration.py
+          tests/jobs/test_dispatch_recovery_integration.py
+          tests/jobs/test_worker_loss_integration.py
+          tests/jobs/test_gpu_concurrency_integration.py
       - name: Run non-live tests
         run: uv run pytest -m "not live"
       - name: Build distribution artifacts
