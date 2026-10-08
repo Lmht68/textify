@@ -131,6 +131,56 @@ async def test_openapi_describes_job_only_transcription_contract() -> None:
         EXPECTED_RESPONSE_FIELD_PATHS
     )
 
+    assert request_component["additionalProperties"] is False
+    assert set(request_component["required"]) == {"url"}
+    assert set(request_component["properties"]) == {"url", "exclude"}
+    assert request_component["properties"]["url"]["minLength"] == 1
+    assert request_component["properties"]["url"]["maxLength"] == 2048
+
+    transcription_component = components["TranscriptionResponse"]
+    assert set(transcription_component["required"]) == {"source", "transcript"}
+
+    source_component = components["SourceResponse"]
+    assert set(source_component["properties"]) == {
+        "platform",
+        "video_id",
+        "url",
+        "title",
+        "description",
+        "channel",
+        "duration_seconds",
+    }
+    assert source_component["minProperties"] == 1
+    assert set(components["Platform"]["enum"]) == {
+        "youtube",
+        "instagram",
+        "facebook",
+        "tiktok",
+        "x",
+    }
+
+    transcript_component = components["TranscriptResponse"]
+    assert set(transcript_component["properties"]) == {
+        "method",
+        "language",
+        "text",
+        "segments",
+    }
+    assert transcript_component["minProperties"] == 1
+    assert set(components["TranscriptMethod"]["enum"]) == {
+        "youtube_captions",
+        "faster_whisper",
+    }
+
+    segment_component = components["SegmentResponse"]
+    assert set(segment_component["required"]) == {"start", "end", "text"}
+
+    error_detail_component = components["ErrorDetail"]
+    assert set(error_detail_component["required"]) == {"code", "message"}
+    error_response_component = components["ErrorResponse"]
+    assert set(error_response_component["required"]) == {"error"}
+    assert set(error_response_component["properties"]) == {"error"}
+
     expected_state_fields = {
         "QueuedTranscriptionJobResponse": {
             "id",

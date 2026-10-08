@@ -1,6 +1,9 @@
 """Tests for Textify's safe structured logging boundary."""
 
 import logging
+import subprocess
+import sys
+import textwrap
 
 import pytest
 
@@ -29,6 +32,15 @@ def test_configured_logging_renders_only_safe_request_fields(
         "cookie": "cookie-sentinel",
         "media_path": "path-sentinel",
         "reason": "reason-sentinel",
+        "postgresql_url": "postgresql-url-sentinel",
+        "postgresql_password": "postgresql-password-sentinel",
+        "redis_url": "redis-url-sentinel",
+        "redis_password": "redis-password-sentinel",
+        "public_capability": "capability-sentinel",
+        "cancellation_link": "cancellation-link-sentinel",
+        "execution_attempt_token": "execution-attempt-token-sentinel",
+        "hugging_face_credential": "hugging-face-credential-sentinel",
+        "provider_detail": "provider-detail-sentinel",
         "segment_count": "segment-count-sentinel",
     }
     configure_logging("INFO")
@@ -81,3 +93,42 @@ def test_configured_logging_renders_only_safe_request_fields(
     assert "dependency-sentinel" not in rendered_output
     for sensitive_value in sensitive_values.values():
         assert sensitive_value not in rendered_output
+
+
+def test_celery_setup_preserves_safe_textify_logging() -> None:
+    """Keep Celery records and private execution tokens out of rendered output."""
+    child_program = textwrap.dedent(
+        """
+        import logging
+
+        from textify.jobs.celery_app import create_celery_app
+        from textify.jobs.config import JobDispatchConfig
+        from textify.logging import configure_logging
+
+        configure_logging("INFO")
+        celery_app = create_celery_app(
+            JobDispatchConfig(
+                broker_url="redis://127.0.0.1:6379/15",
+                _env_file=None,
+            )
+        )
+        celery_app.log.setup_logging_subsystem(loglevel="INFO")
+        logging.getLogger("celery.test").error(
+            "celery-message-sentinel execution-attempt-token-sentinel",
+            extra={"execution_attempt_token": "execution-attempt-token-sentinel"},
+        )
+        logging.getLogger("textify.test").info("textify-message-sentinel")
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", child_program],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert completed.returncode == 0
+    assert "textify-message-sentinel" in completed.stderr
+    assert "celery-message-sentinel" not in completed.stderr
+    assert "execution-attempt-token-sentinel" not in completed.stderr

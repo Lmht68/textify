@@ -5,6 +5,7 @@ from uuid import uuid4
 import pytest
 
 from textify.jobs.types import ClaimedTranscriptionJob, ExecutionClaim, JobDispatch
+from textify.logging import configure_logging
 from textify.transcription import inspection
 from textify.transcription.exceptions import TranscriptionFailedError
 from textify.transcription.schemas import TranscriptionResponse
@@ -120,6 +121,30 @@ class FailingExecutor:
         self.calls += 1
         control.cleanup_complete.set()
         raise TranscriptionFailedError()
+
+
+class UnexpectedFailureExecutor:
+    """Raise an unsafe provider detail that must not reach rendered logs."""
+
+    async def execute(
+        self,
+        _submitted: inspection.SubmittedSource,
+        *,
+        control: TranscriptionExecutionControl,
+        include_segments: bool = True,
+    ) -> TranscriptionResult:
+        """Raise the controlled unexpected provider failure.
+
+        Args:
+            control: Execution state whose cleanup release is recorded.
+            include_segments: Whether the result should include segments, unused.
+
+        Raises:
+            RuntimeError: Always, with the controlled unsafe provider detail.
+        """
+        del include_segments
+        control.cleanup_complete.set()
+        raise RuntimeError("provider-detail-sentinel")
 
 
 def _dispatch() -> JobDispatch:
@@ -286,3 +311,27 @@ async def test_processor_publishes_cancellation_when_terminal_write_loses_race()
     assert repository.successes[0][0] == claimed_job.claim
     assert repository.cancelled_claims == [claimed_job.claim]
     assert claim_manager.released_claims == [claimed_job.claim]
+
+
+@pytest.mark.asyncio
+async def test_processor_logs_only_safe_failure_for_unexpected_provider_detail(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Render only the stable internal error for an unexpected provider failure."""
+    from textify.jobs.processor import TranscriptionJobProcessor
+
+    configure_logging("INFO")
+    dispatch = _dispatch()
+    claimed_job = _claimed_job(dispatch)
+    repository = RecordingExecutionRepository()
+    claim_manager = RecordingClaimManager(claimed_job)
+    executor = UnexpectedFailureExecutor()
+
+    await TranscriptionJobProcessor(repository, executor, claim_manager).process(
+        dispatch
+    )
+
+    rendered_output = capsys.readouterr().err
+    assert "transcription job processor failed" in rendered_output
+    assert "code=internal_error" in rendered_output
+    assert "provider-detail-sentinel" not in rendered_output

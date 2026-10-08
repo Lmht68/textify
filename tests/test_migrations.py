@@ -62,6 +62,14 @@ _CHECK_CONSTRAINT_NAMES = {
     "service_heartbeat_instance_id_uuid4_check",
 }
 
+_NAMED_PRIMARY_KEY_AND_UNIQUE_CONSTRAINTS = {
+    "transcription_job_public_id_key",
+    "transcription_job_exclusion_pkey",
+    "transcription_job_segment_pkey",
+    "transcription_job_execution_attempt_token_key",
+    "service_heartbeat_pkey",
+}
+
 
 InvalidJobValues = Callable[[datetime], dict[str, object]]
 
@@ -739,6 +747,23 @@ async def test_postgresql_baseline_uses_required_native_schema(
                 )
             ).all()
         )
+        named_primary_key_and_unique_constraints = set(
+            (
+                await connection.scalars(
+                    text(
+                        "SELECT constraint_name FROM information_schema.table_constraints "
+                        "WHERE table_schema = 'public' "
+                        "AND constraint_name = ANY(:constraint_names) "
+                        "AND constraint_type IN ('PRIMARY KEY', 'UNIQUE')"
+                    ),
+                    {
+                        "constraint_names": list(
+                            _NAMED_PRIMARY_KEY_AND_UNIQUE_CONSTRAINTS
+                        )
+                    },
+                )
+            ).all()
+        )
         foreign_keys = {
             (row["table_name"], row["referenced_table"], row["delete_action"])
             for row in (
@@ -835,6 +860,10 @@ async def test_postgresql_baseline_uses_required_native_schema(
         "transcription_job_attempt_claim_lease_expires_at_job_id_idx",
     }
     assert check_constraint_names == _CHECK_CONSTRAINT_NAMES
+    assert (
+        named_primary_key_and_unique_constraints
+        == _NAMED_PRIMARY_KEY_AND_UNIQUE_CONSTRAINTS
+    )
     assert foreign_keys == {
         ("transcription_job_execution_attempt", "transcription_job", "c"),
         ("transcription_job_exclusion", "transcription_job", "c"),
@@ -848,12 +877,6 @@ async def test_postgresql_baseline_uses_required_native_schema(
         and row["proname"] == "enforce_transcription_job_storage_invariants"
         for row in trigger_rows
     )
-    assert not APPLICATION_TABLES & {
-        "user",
-        "account",
-        "billing",
-        "owner",
-    }
     assert not application_columns & {
         "user_id",
         "account_id",
@@ -1132,39 +1155,75 @@ async def test_postgresql_baseline_rejects_projection_and_segment_mismatches(
 async def test_postgresql_cascades_execution_attempt_and_success_projection_deletion(
     migrated_engine: AsyncEngine,
 ) -> None:
-    """Delete private attempts and normalized results with their retained job."""
+    """Cascade durable child rows when their retained job is deleted."""
     now = datetime.now(UTC)
     async with migrated_engine.begin() as connection:
-        job_id = await _insert_succeeded_job(connection, now)
-        await _insert_result(connection, job_id)
-        await _insert_segment(connection, job_id, ordinal=0)
+        succeeded_job_id = await _insert_succeeded_job(connection, now)
+        excluded_job_id = await _insert_job(connection, _queued_values(now))
+        await _insert_result(connection, succeeded_job_id)
+        await _insert_segment(connection, succeeded_job_id, ordinal=0)
+        await connection.execute(
+            text(
+                "INSERT INTO transcription_job_exclusion (job_id, field_path) "
+                "VALUES (:job_id, 'source.title')"
+            ),
+            {"job_id": excluded_job_id},
+        )
 
     async with migrated_engine.begin() as connection:
         await connection.execute(
-            text("DELETE FROM transcription_job WHERE id = :job_id"),
-            {"job_id": job_id},
+            text(
+                "DELETE FROM transcription_job "
+                "WHERE id IN (:succeeded_job_id, :excluded_job_id)"
+            ),
+            {
+                "succeeded_job_id": succeeded_job_id,
+                "excluded_job_id": excluded_job_id,
+            },
         )
         execution_attempt_count = await connection.scalar(
             text(
                 "SELECT count(*) FROM transcription_job_execution_attempt "
-                "WHERE job_id = :job_id"
+                "WHERE job_id IN (:succeeded_job_id, :excluded_job_id)"
             ),
-            {"job_id": job_id},
+            {
+                "succeeded_job_id": succeeded_job_id,
+                "excluded_job_id": excluded_job_id,
+            },
+        )
+        exclusion_count = await connection.scalar(
+            text(
+                "SELECT count(*) FROM transcription_job_exclusion "
+                "WHERE job_id IN (:succeeded_job_id, :excluded_job_id)"
+            ),
+            {
+                "succeeded_job_id": succeeded_job_id,
+                "excluded_job_id": excluded_job_id,
+            },
         )
         result_count = await connection.scalar(
             text(
-                "SELECT count(*) FROM transcription_job_result WHERE job_id = :job_id"
+                "SELECT count(*) FROM transcription_job_result "
+                "WHERE job_id IN (:succeeded_job_id, :excluded_job_id)"
             ),
-            {"job_id": job_id},
+            {
+                "succeeded_job_id": succeeded_job_id,
+                "excluded_job_id": excluded_job_id,
+            },
         )
         segment_count = await connection.scalar(
             text(
-                "SELECT count(*) FROM transcription_job_segment WHERE job_id = :job_id"
+                "SELECT count(*) FROM transcription_job_segment "
+                "WHERE job_id IN (:succeeded_job_id, :excluded_job_id)"
             ),
-            {"job_id": job_id},
+            {
+                "succeeded_job_id": succeeded_job_id,
+                "excluded_job_id": excluded_job_id,
+            },
         )
 
     assert execution_attempt_count == 0
+    assert exclusion_count == 0
     assert result_count == 0
     assert segment_count == 0
 
@@ -1179,7 +1238,7 @@ async def _application_table_names(engine: AsyncEngine) -> set[str]:
                 )
             ).all()
         )
-    return table_names & APPLICATION_TABLES
+    return table_names - {"alembic_version"}
 
 
 async def _revision_rows(engine: AsyncEngine) -> list[str]:

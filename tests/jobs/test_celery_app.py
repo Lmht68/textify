@@ -27,6 +27,11 @@ def test_celery_app_uses_private_redis_delivery_configuration() -> None:
     assert app.conf.task_ignore_result is True
     assert app.conf.task_store_errors_even_if_ignored is False
     assert app.conf.task_always_eager is False
+    assert app.conf.worker_hijack_root_logger is False
+    assert app.conf.worker_send_task_events is False
+    assert app.conf.task_send_sent_event is False
+    assert app.conf.task_time_limit is None
+    assert app.conf.task_soft_time_limit is None
     assert app.conf.task_routes == {TRANSCRIPTION_TASK: {"queue": TRANSCRIPTION_QUEUE}}
     assert app.conf.worker_pool == "threads"
     assert app.conf.task_default_queue == TRANSCRIPTION_QUEUE

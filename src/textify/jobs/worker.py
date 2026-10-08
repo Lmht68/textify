@@ -17,6 +17,7 @@ from celery import Celery, Task
 from celery.signals import worker_shutting_down
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from textify.config import AppConfig
 from textify.errors import InternalError
 from textify.jobs.celery_app import (
     TRANSCRIPTION_QUEUE,
@@ -45,6 +46,7 @@ from textify.jobs.readiness import (
 from textify.jobs.repository import PostgresTranscriptionJobRepository
 from textify.jobs.service import utc_now
 from textify.jobs.types import JobDispatch
+from textify.logging import configure_logging
 from textify.transcription.config import TranscriptionConfig
 from textify.transcription.service import (
     TranscriptionAdaptersFactory,
@@ -660,6 +662,8 @@ def _disconnect_worker_shutdown_signal(receiver: Callable[..., None]) -> None:
 
 def main() -> None:
     """Start one dedicated threads-pool Transcription Job worker process."""
+    app_config = AppConfig()
+    configure_logging(app_config.log_level)
     job_config = JobConfig()  # type: ignore[call-arg]
     dispatch_config = JobDispatchConfig()  # type: ignore[call-arg]
     cache_config = CacheConfig()

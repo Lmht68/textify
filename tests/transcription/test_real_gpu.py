@@ -181,7 +181,7 @@ async def test_one_model_overlaps_two_real_gpu_transcriptions(
     second_task = asyncio.create_task(asyncio.to_thread(transcribe, audio_b))
     memory_samples_mib: list[int] = []
     try:
-        while not first_task.done() and not second_task.done():
+        while not first_task.done() or not second_task.done():
             memory_samples_mib.append(
                 await asyncio.to_thread(_sample_gpu_memory, device_index)
             )
@@ -189,23 +189,31 @@ async def test_one_model_overlaps_two_real_gpu_transcriptions(
     finally:
         await asyncio.to_thread(adapter.shutdown)
 
-    peak_memory_mib = max(memory_samples_mib, default=0)
+    assert memory_samples_mib
+    peak_memory_mib = max(memory_samples_mib)
+    first_interval = call_intervals[audio_a]
+    second_interval = call_intervals[audio_b]
+    gpu_overlap_seconds = max(
+        0.0,
+        min(first_interval[1], second_interval[1])
+        - max(first_interval[0], second_interval[0]),
+    )
     record_property("gpu_memory_baseline_mib", baseline_memory_mib)
     record_property("gpu_memory_peak_mib", peak_memory_mib)
+    record_property("gpu_overlap_seconds", gpu_overlap_seconds)
     logger.info(
-        "real GPU concurrency observation",
-        extra={
-            "gpu_memory_baseline_mib": baseline_memory_mib,
-            "gpu_memory_peak_mib": peak_memory_mib,
-        },
+        "real GPU concurrency observation model=%s revision=%s num_workers=2 "
+        "gpu_overlap_seconds=%.6f gpu_memory_baseline_mib=%d "
+        "gpu_memory_peak_mib=%d",
+        settings.whisper_model,
+        settings.whisper_revision,
+        gpu_overlap_seconds,
+        baseline_memory_mib,
+        peak_memory_mib,
     )
 
     assert construction_calls == 1
     assert first_result.method is TranscriptMethod.FASTER_WHISPER
     assert second_result.method is TranscriptMethod.FASTER_WHISPER
-    first_interval = call_intervals[audio_a]
-    second_interval = call_intervals[audio_b]
-    assert max(first_interval[0], second_interval[0]) < min(
-        first_interval[1], second_interval[1]
-    )
+    assert gpu_overlap_seconds > 0
     assert peak_memory_mib > 0

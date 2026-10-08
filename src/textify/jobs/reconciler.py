@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from uuid import uuid4
 
+from textify.config import AppConfig
 from textify.jobs.celery_app import create_celery_app
 from textify.jobs.config import (
     CacheConfig,
@@ -35,6 +36,7 @@ from textify.jobs.readiness import (
 )
 from textify.jobs.repository import PostgresTranscriptionJobRepository
 from textify.jobs.service import utc_now
+from textify.logging import configure_logging
 
 logger = logging.getLogger(__name__)
 
@@ -238,4 +240,6 @@ def _require_positive_duration(value: timedelta, name: str) -> None:
 
 def main() -> None:
     """Start the dedicated Transcription Job reconciler process."""
+    app_config = AppConfig()
+    configure_logging(app_config.log_level)
     asyncio.run(run_reconciler())

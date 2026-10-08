@@ -22,17 +22,10 @@ LIVE_SOURCES = tuple(
     )
     if (source_url := os.environ.get(environment_name))
 )
+LIVE_YOUTUBE_URL_A = os.environ.get("TEXTIFY_LIVE_YOUTUBE_URL_A")
+LIVE_YOUTUBE_URL_B = os.environ.get("TEXTIFY_LIVE_YOUTUBE_URL_B")
 
-pytestmark = [
-    pytest.mark.live,
-    pytest.mark.skipif(
-        not LIVE_BASE_URL or not LIVE_SOURCES,
-        reason=(
-            "TEXTIFY_LIVE_BASE_URL and at least one TEXTIFY_LIVE_<PLATFORM>_URL "
-            "are required for live API checks."
-        ),
-    ),
-]
+pytestmark = [pytest.mark.live]
 
 
 def _mapping(value: object) -> dict[str, object]:
@@ -243,6 +236,84 @@ async def _poll_until_succeeded(
     )
 
 
+@pytest.mark.skipif(
+    not LIVE_BASE_URL or (LIVE_YOUTUBE_URL_A is None and LIVE_YOUTUBE_URL_B is None),
+    reason=(
+        "TEXTIFY_LIVE_BASE_URL and both TEXTIFY_LIVE_YOUTUBE_URL_A and "
+        "TEXTIFY_LIVE_YOUTUBE_URL_B are required for the captionless live check."
+    ),
+)
+async def test_two_captionless_youtube_videos_complete_through_native_worker() -> None:
+    """Run two distinct captionless YouTube jobs concurrently through native work."""
+    assert LIVE_YOUTUBE_URL_A is not None, (
+        "TEXTIFY_LIVE_YOUTUBE_URL_A and TEXTIFY_LIVE_YOUTUBE_URL_B must both be set."
+    )
+    assert LIVE_YOUTUBE_URL_B is not None, (
+        "TEXTIFY_LIVE_YOUTUBE_URL_A and TEXTIFY_LIVE_YOUTUBE_URL_B must both be set."
+    )
+    assert LIVE_YOUTUBE_URL_A != LIVE_YOUTUBE_URL_B, (
+        "TEXTIFY_LIVE_YOUTUBE_URL_A and TEXTIFY_LIVE_YOUTUBE_URL_B must differ."
+    )
+    assert LIVE_BASE_URL is not None
+
+    async with AsyncClient(
+        base_url=LIVE_BASE_URL,
+        timeout=Timeout(2500.0),
+    ) as client:
+        health_response = await client.get("/health")
+        assert health_response.status_code == 200
+        assert health_response.json() == {"status": "ok"}
+        assert health_response.headers.get("X-Request-ID")
+
+        submissions = await asyncio.gather(
+            *(
+                client.post("/api/transcription-jobs", json={"url": source_url})
+                for source_url in (LIVE_YOUTUBE_URL_A, LIVE_YOUTUBE_URL_B)
+            )
+        )
+        locations: list[str] = []
+        job_ids: list[str] = []
+        submission_delays: list[int] = []
+        for submission in submissions:
+            assert submission.status_code == 202
+            assert submission.headers.get("X-Request-ID")
+            assert submission.headers["Cache-Control"] == "no-store"
+            retry_after = submission.headers["Retry-After"]
+            assert retry_after.isdecimal()
+            assert int(retry_after) > 0
+            location = submission.headers["Location"]
+            job_id = _assert_active_job(_mapping(submission.json()), location)
+            locations.append(location)
+            job_ids.append(job_id)
+            submission_delays.append(int(retry_after))
+
+        await asyncio.gather(*(asyncio.sleep(delay) for delay in submission_delays))
+        completed = await asyncio.gather(
+            *(
+                _poll_until_succeeded(client, location, job_id)
+                for location, job_id in zip(locations, job_ids, strict=True)
+            )
+        )
+
+        for response, location, job_id in zip(
+            completed,
+            locations,
+            job_ids,
+            strict=True,
+        ):
+            result = _assert_succeeded_job(_mapping(response.json()), location, job_id)
+            _assert_transcription_response(result, "youtube")
+            transcript = _mapping(result["transcript"])
+            assert transcript["method"] == "faster_whisper"
+
+
+@pytest.mark.skipif(
+    not LIVE_BASE_URL or not LIVE_SOURCES,
+    reason=(
+        "TEXTIFY_LIVE_BASE_URL and at least one TEXTIFY_LIVE_<PLATFORM>_URL "
+        "are required for live API checks."
+    ),
+)
 async def test_configured_public_videos_match_transcription_job_contract() -> None:
     """Exercise each configured public video through submission and polling."""
     assert LIVE_BASE_URL is not None

@@ -990,6 +990,62 @@ async def test_worker_loss_after_accepted_cancellation_finishes_cancelled(
 
 
 @pytest.mark.asyncio
+async def test_processing_cancellation_stays_processing_until_cleanup_then_finishes_cancelled(
+    migrated_postgresql_database_url: str,
+    restartable_redis_broker: _RestartableRedisBroker,
+    tmp_path: Path,
+) -> None:
+    """Keep active Cancellation visible until the worker completes cleanup."""
+    broker_url = restartable_redis_broker.url
+    context = multiprocessing.get_context("spawn")
+    caption_starts = context.Value("i", 0)
+    repository, engine = _repository(migrated_postgresql_database_url)
+    control = _new_control(context)
+    control.cancellation_release.clear()
+    worker: BaseProcess | None = None
+    try:
+        worker = await _start_worker(
+            context,
+            migrated_postgresql_database_url,
+            broker_url,
+            tmp_path / "processing-cancellation",
+            "metadata_block",
+            control,
+            caption_starts,
+        )
+        reconciler, _ = _reconciler(repository, broker_url)
+        async with _public_client(migrated_postgresql_database_url) as client:
+            location = await _submit_job(client, "processing-cancellation")
+            await reconciler.reconcile_once()
+            assert await asyncio.to_thread(control.execution_started.wait, 5)
+
+            cancellation = await client.put(f"{location}/cancellation")
+            assert cancellation.status_code == 202
+            assert cancellation.headers["Retry-After"] == "2"
+            assert cancellation.headers["Cache-Control"] == "no-store"
+            assert cancellation.json()["status"] == "processing"
+            assert cancellation.json()["cancellation_requested"] is True
+            assert await asyncio.to_thread(control.cancellation_observed.wait, 5)
+
+            processing = await client.get(location)
+            assert processing.status_code == 200
+            assert processing.json()["status"] == "processing"
+            assert processing.json()["cancellation_requested"] is True
+
+            control.cancellation_release.set()
+            terminal = await _wait_for_finished(client, location)
+    finally:
+        if worker is not None:
+            await _stop_worker(worker)
+        await engine.dispose()
+
+    assert terminal["status"] == "finished"
+    assert terminal["outcome"] == "cancelled"
+    assert "result" not in terminal
+    assert "error" not in terminal
+
+
+@pytest.mark.asyncio
 async def test_stale_heartbeat_reconnection_cannot_replace_worker_interrupted(
     migrated_postgresql_database_url: str,
     restartable_redis_broker: _RestartableRedisBroker,
