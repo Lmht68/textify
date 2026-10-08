@@ -1,138 +1,97 @@
 # Textify
 
-Textify is an asynchronous API for transcribing eligible public YouTube,
-Facebook, Instagram, TikTok, and X videos.
-It uses available YouTube captions and falls back to Faster-Whisper on an
-NVIDIA CUDA GPU.
+Textify is an asynchronous API for transcribing public YouTube, Facebook, Instagram, TikTok, and X videos.
+It uses available YouTube captions and falls back to Faster-Whisper on an NVIDIA CUDA GPU.
 
 ## Requirements
 
-Textify runs as three separate processes backed by an externally managed
-PostgreSQL database:
+For the recommended Compose setup:
 
-| Role | Command | Additional dependency |
-| --- | --- | --- |
-| API | `textify` | None |
-| Reconciler | `textify-reconciler` | Redis |
-| Worker | `textify-worker` | Redis and one NVIDIA CUDA GPU |
+- Docker Engine
+- Docker Compose 2.20 or newer
+- An NVIDIA driver and NVIDIA Container Toolkit for the GPU worker
 
-Source deployments require Python 3.12, [uv](https://docs.astral.sh/uv/), and
-FFmpeg.
-Container deployments require Docker and NVIDIA Container Toolkit for the
-worker.
+Running from source also requires Python 3.12, [uv](https://docs.astral.sh/uv/), and FFmpeg.
 
-## Configuration
+## Quick start
 
-For a source deployment, copy the environment template and update it:
+Copy the environment template and set a URL-safe PostgreSQL password:
 
 ```shell
 cp .env.example .env
 ```
 
-At minimum, configure:
-
-- `TEXTIFY_DATABASE_URL` for every role. It must use the
-  `postgresql+asyncpg` scheme.
-- `TEXTIFY_BROKER_URL` for the reconciler and worker.
-- `TEXTIFY_GPU_IDENTITY` for the worker. Use the stable physical GPU UUID from:
-
-  ```shell
-  nvidia-smi --query-gpu=uuid --format=csv,noheader
-  ```
-
-See `.env.example` for optional listener, queue, model, storage, timeout, and
-inference settings.
-Keep `.env` private because it may contain database, Redis, or Hugging Face
-credentials.
-
-## Run from source
-
-Install dependencies and apply migrations:
+Set the GPU selector and its stable UUID in `.env`:
 
 ```shell
-uv sync --frozen
-uv run alembic upgrade head
+nvidia-smi --id=0 --query-gpu=uuid --format=csv,noheader
 ```
 
-Start each role in a separate terminal or process supervisor:
+Use the returned value for `TEXTIFY_GPU_IDENTITY`.
+Change `TEXTIFY_GPU_DEVICE_ID` as well if the worker should use a different GPU.
+
+Start the API and GPU worker:
 
 ```shell
-uv run textify
-uv run textify-reconciler
-uv run textify-worker
+docker compose --profile gpu up --build -d
 ```
 
-The API listens on `http://127.0.0.1:8182` by default.
-Check readiness with:
+The API is available at `http://127.0.0.1:8182`.
+Open `http://127.0.0.1:8182/docs` for the interactive API documentation, or check readiness with:
 
 ```shell
 curl --fail http://127.0.0.1:8182/health
 ```
 
-The worker downloads the configured Whisper model on first startup.
+Job status and cancellation URLs returned by the API are bearer capabilities.
+Keep them private.
 
-## Deploy with Docker
+## Run from source
 
-Build one image for all roles:
-
-```shell
-docker build -t textify .
-```
-
-The examples below assume the PostgreSQL and Redis hostnames are reachable
-from the containers.
-Attach the containers to the appropriate Docker network when those services
-also run in Docker.
-
-Apply migrations once before starting or updating the roles:
+Install dependencies and start PostgreSQL and Redis:
 
 ```shell
-docker run --rm \
-  -e TEXTIFY_DATABASE_URL='postgresql+asyncpg://textify:change-me@postgres:5432/textify' \
-  textify \
-  alembic upgrade head
+uv sync --frozen
+docker compose up -d --wait postgres broker
+uv run alembic upgrade head
 ```
 
-Start the API:
+Start each process in its own terminal:
 
 ```shell
-docker run -d \
-  --name textify-api \
-  --restart unless-stopped \
-  -p 8182:8182 \
-  -e TEXTIFY_DATABASE_URL='postgresql+asyncpg://textify:change-me@postgres:5432/textify' \
-  textify
+uv run textify-reconciler
+uv run textify
+uv run textify-worker
 ```
 
-Start the reconciler:
+Source processes read configuration from `.env`.
+The worker requires CUDA, FFmpeg, and a valid `TEXTIFY_GPU_IDENTITY`.
+
+## Configuration
+
+See [`.env.example`](.env.example) for available settings, including ports, queue limits, model selection, storage paths, and transcription timeouts.
+Keep `.env` private because it may contain database or Hugging Face credentials.
+
+The default Compose topology starts PostgreSQL, Redis, migrations, the reconciler, and the API.
+Add the `gpu` profile to process transcription jobs.
+
+## Development
 
 ```shell
-docker run -d \
-  --name textify-reconciler \
-  --restart unless-stopped \
-  -e TEXTIFY_DATABASE_URL='postgresql+asyncpg://textify:change-me@postgres:5432/textify' \
-  -e TEXTIFY_BROKER_URL='redis://redis:6379/0' \
-  textify \
-  textify-reconciler
+uv run pytest
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src tests
 ```
 
-Start one worker for each GPU, using a distinct GPU identity:
+## Shutdown
+
+Stop the worker before the remaining services:
 
 ```shell
-docker run -d \
-  --name textify-worker-0 \
-  --restart unless-stopped \
-  --gpus 'device=0' \
-  -e TEXTIFY_DATABASE_URL='postgresql+asyncpg://textify:change-me@postgres:5432/textify' \
-  -e TEXTIFY_BROKER_URL='redis://redis:6379/0' \
-  -e TEXTIFY_GPU_IDENTITY='GPU-REPLACE-WITH-NVIDIA-UUID' \
-  -v textify-model-cache:/var/cache/textify/huggingface \
-  -v textify-worker-0-state:/var/lib/textify \
-  textify \
-  textify-worker
+docker compose stop worker
+docker compose down
 ```
 
-Use a process supervisor or container orchestrator to keep all three roles
-running.
-Each role checks the expected database migration at startup; roles do not
-apply migrations automatically.
+`docker compose down` preserves named volumes.
+Adding `--volumes` deletes all local persisted data.
