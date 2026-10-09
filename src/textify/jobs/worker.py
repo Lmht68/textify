@@ -315,6 +315,7 @@ class TranscriptionWorkerRuntime:
         if loop is None or processor is None or not self._gpu_ownership.is_ready:
             logger.error("transcription worker runtime is unavailable")
             return
+        logger.info("processing transcription job dispatch")
         try:
             future = asyncio.run_coroutine_threadsafe(
                 processor.process(dispatch),
@@ -328,6 +329,8 @@ class TranscriptionWorkerRuntime:
                 "transcription job task failed",
                 extra={"code": InternalError.code},
             )
+        else:
+            logger.info("finished processing transcription job dispatch")
 
     def stop_claiming(self) -> None:
         """Close worker admission and remove readiness from any Celery thread."""
@@ -664,6 +667,7 @@ def main() -> None:
     """Start one dedicated threads-pool Transcription Job worker process."""
     app_config = AppConfig()
     configure_logging(app_config.log_level)
+    logger.info("starting transcription worker")
     job_config = JobConfig()  # type: ignore[call-arg]
     dispatch_config = JobDispatchConfig()  # type: ignore[call-arg]
     cache_config = CacheConfig()
@@ -682,6 +686,7 @@ def main() -> None:
             )
         )
         runtime.start()
+        logger.info("transcription worker is ready")
         shutdown_receiver = _connect_worker_shutdown_signal(runtime)
         celery_app = create_celery_app(dispatch_config)
         register_transcription_task(celery_app, runtime)
@@ -695,6 +700,7 @@ def main() -> None:
             ]
         )
     finally:
+        logger.info("stopping transcription worker")
         if shutdown_receiver is not None:
             _disconnect_worker_shutdown_signal(shutdown_receiver)
         if runtime is None:

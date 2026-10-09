@@ -1,6 +1,9 @@
 """Tests for the private Celery threads worker runtime."""
 
 import asyncio
+import subprocess
+import sys
+import textwrap
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -219,6 +222,139 @@ class CapturingRuntime:
             payload: Deserialized Celery task payload.
         """
         self.payloads.append(payload)
+
+
+def test_worker_cli_emits_safe_lifecycle_logs() -> None:
+    """Report worker startup, dispatch handling, and shutdown without private data."""
+    child_program = textwrap.dedent(
+        """
+        from types import SimpleNamespace
+        from uuid import UUID
+
+        from textify.jobs import worker
+        from textify.jobs.celery_app import TRANSCRIPTION_TASK
+        from textify.jobs.types import JobDispatch
+
+
+        class ClaimManager:
+            async def start(self):
+                pass
+
+            def stop_accepting(self):
+                pass
+
+            async def shutdown(self):
+                pass
+
+
+        class Engine:
+            async def dispose(self):
+                pass
+
+
+        class Executor:
+            async def shutdown(self):
+                pass
+
+
+        class GpuOwnership:
+            is_ready = False
+
+            async def acquire(self):
+                pass
+
+            def mark_model_ready(self):
+                self.is_ready = True
+
+            def mark_model_not_ready(self):
+                self.is_ready = False
+
+            async def release(self):
+                pass
+
+
+        class Heartbeat:
+            async def start(self):
+                pass
+
+            async def stop(self):
+                pass
+
+
+        class Processor:
+            async def process(self, dispatch):
+                pass
+
+
+        class CeleryApp:
+            def __init__(self):
+                self.tasks = {}
+
+            def task(self, **options):
+                def register(task):
+                    self.tasks[options["name"]] = task
+                    return task
+
+                return register
+
+            def worker_main(self, arguments):
+                self.tasks[TRANSCRIPTION_TASK](
+                    JobDispatch(
+                        1,
+                        UUID("00000000-0000-4000-8000-000000000001"),
+                    ).to_payload()
+                )
+
+
+        async def create_worker_runtime(*_arguments):
+            return worker.TranscriptionWorkerRuntime(
+                lambda: worker._ExecutionResources(
+                    Processor(),
+                    Executor(),
+                    Heartbeat(),
+                ),
+                ClaimManager(),
+                GpuOwnership(),
+                Engine(),
+                verify_database=False,
+            )
+
+
+        worker.AppConfig = lambda: SimpleNamespace(log_level="INFO")
+        worker.JobConfig = lambda: SimpleNamespace(
+            database_url="postgresql+asyncpg://test:test@localhost/test",
+        )
+        worker.JobDispatchConfig = lambda: SimpleNamespace(
+            broker_url="memory://",
+            worker_concurrency=1,
+        )
+        worker.CacheConfig = lambda: SimpleNamespace()
+        worker.TranscriptionConfig = lambda: SimpleNamespace()
+        worker.validate_redis_role_isolation = lambda *_arguments: None
+        worker.create_application_engine = lambda _database_url: Engine()
+        worker._create_worker_runtime = create_worker_runtime
+        worker.create_celery_app = lambda _config: CeleryApp()
+        worker.main()
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", child_program],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert completed.returncode == 0
+    for message in (
+        "starting transcription worker",
+        "transcription worker is ready",
+        "processing transcription job dispatch",
+        "finished processing transcription job dispatch",
+        "stopping transcription worker",
+    ):
+        assert message in completed.stderr
+    assert "00000000-0000-4000-8000-000000000001" not in completed.stderr
 
 
 def test_worker_runtime_processes_only_valid_payloads_on_one_loop() -> None:
