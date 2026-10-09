@@ -18,6 +18,11 @@ from textify.jobs.celery_app import create_celery_app
 from textify.jobs.config import JobConfig, JobDispatchConfig
 from textify.jobs.contracts import TranscriptionJobExecutionRepository
 from textify.jobs.types import JobDispatch
+from textify.jobs.worker import (
+    _DispatchProcessor,
+    _ExecutionResources,
+    _ShutdownExecutor,
+)
 from textify.transcription.config import TranscriptionConfig
 from textify.transcription.service import TranscriptionAdapters
 
@@ -194,13 +199,11 @@ class RecordingServiceHeartbeat:
 
 
 def _execution_resources(
-    processor: RecordingProcessor,
-    executor: ShutdownExecutor,
+    processor: _DispatchProcessor,
+    executor: _ShutdownExecutor,
     heartbeat: RecordingServiceHeartbeat | None = None,
-) -> object:
+) -> _ExecutionResources:
     """Build the worker's deferred private resource bundle for one test."""
-    from textify.jobs.worker import _ExecutionResources
-
     return _ExecutionResources(
         processor,
         executor,
@@ -404,7 +407,7 @@ def test_worker_runtime_starts_and_stops_resources_in_gpu_safe_order(
         """Record the initial PostgreSQL verification."""
         lifecycle_events.append("database_verify")
 
-    def build_resources() -> object:
+    def build_resources() -> _ExecutionResources:
         """Record deferred model-backed processor construction."""
         lifecycle_events.append("resources_factory")
         return _execution_resources(
@@ -580,7 +583,7 @@ def test_worker_runtime_does_not_load_model_or_start_claims_after_lock_conflict(
             "GPU ownership is already held for the configured identity."
         )
 
-    def build_resources() -> object:
+    def build_resources() -> _ExecutionResources:
         """Fail if lock conflict allows deferred model construction."""
         nonlocal resources_factory_calls
         resources_factory_calls += 1
@@ -655,7 +658,7 @@ def test_worker_runtime_rolls_back_ownership_when_resource_construction_fails() 
     gpu_ownership = RecordingGpuOwnership(lifecycle_events)
     engine = RecordingEngine(lifecycle_events)
 
-    def build_resources() -> tuple[RecordingProcessor, ShutdownExecutor]:
+    def build_resources() -> _ExecutionResources:
         """Simulate deferred adapter or model construction failure."""
         raise RuntimeError("model initialization failed")
 

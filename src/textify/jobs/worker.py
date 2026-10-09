@@ -77,6 +77,18 @@ class _ShutdownExecutor(Protocol):
         ...
 
 
+class _ServiceHeartbeatLifecycle(Protocol):
+    """Record and remove process readiness for the worker lifecycle."""
+
+    async def start(self) -> None:
+        """Record readiness once the worker can safely process jobs."""
+        ...
+
+    async def stop(self) -> None:
+        """Remove readiness when the worker stops accepting work."""
+        ...
+
+
 class _ExecutionClaimLifecycle(Protocol):
     """Coordinate manager startup, admission closure, and worker drain."""
 
@@ -148,7 +160,7 @@ class _ExecutionResources:
 
     processor: _DispatchProcessor
     executor: _ShutdownExecutor
-    heartbeat: ServiceHeartbeatReporter
+    heartbeat: _ServiceHeartbeatLifecycle
 
 
 _ExecutionResourcesFactory = Callable[[], _ExecutionResources]
@@ -178,7 +190,7 @@ class TranscriptionWorkerRuntime:
         self._resources_factory = resources_factory
         self._processor: _DispatchProcessor | None = None
         self._executor: _ShutdownExecutor | None = None
-        self._heartbeat: ServiceHeartbeatReporter | None = None
+        self._heartbeat: _ServiceHeartbeatLifecycle | None = None
         self._claim_manager = claim_manager
         self._gpu_ownership = gpu_ownership
         self._engine = engine

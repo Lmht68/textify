@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import timedelta
 from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
+from redis.asyncio import Redis
 from redis.exceptions import RedisError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine
+
+from textify.jobs.readiness import ServiceRole
 
 
 class RecordingHeartbeatRepository:
@@ -19,12 +22,12 @@ class RecordingHeartbeatRepository:
 
     def __init__(self) -> None:
         """Initialize observable heartbeat operations."""
-        self.recorded: list[tuple[object, UUID]] = []
-        self.deleted: list[tuple[object, UUID]] = []
+        self.recorded: list[tuple[ServiceRole, UUID]] = []
+        self.deleted: list[tuple[ServiceRole, UUID]] = []
         self.first_recorded = asyncio.Event()
         self.periodic_recorded = asyncio.Event()
 
-    async def record_ready(self, role: object, instance_id: UUID) -> None:
+    async def record_ready(self, role: ServiceRole, instance_id: UUID) -> None:
         """Record one ready heartbeat."""
         self.recorded.append((role, instance_id))
         if len(self.recorded) == 1:
@@ -32,11 +35,11 @@ class RecordingHeartbeatRepository:
         else:
             self.periodic_recorded.set()
 
-    async def delete(self, role: object, instance_id: UUID) -> None:
+    async def delete(self, role: ServiceRole, instance_id: UUID) -> None:
         """Record removal of one ready heartbeat."""
         self.deleted.append((role, instance_id))
 
-    async def fresh_roles(self, _freshness: timedelta) -> frozenset[object]:
+    async def fresh_roles(self, freshness: timedelta) -> frozenset[ServiceRole]:
         """Return no roles because this fake is only used by reporter tests."""
         return frozenset()
 
@@ -44,21 +47,21 @@ class RecordingHeartbeatRepository:
 class FixedHeartbeatRepository:
     """Return a fixed role set for aggregate readiness tests."""
 
-    def __init__(self, roles: frozenset[object]) -> None:
+    def __init__(self, roles: frozenset[ServiceRole]) -> None:
         """Initialize roles returned by the storage seam."""
         self._roles = roles
         self.freshness: timedelta | None = None
         self.unavailable = False
 
-    async def record_ready(self, _role: object, _instance_id: UUID) -> None:
+    async def record_ready(self, role: ServiceRole, instance_id: UUID) -> None:
         """Reject unused writes in aggregate readiness tests."""
         raise AssertionError("Aggregate readiness must not write service heartbeats.")
 
-    async def delete(self, _role: object, _instance_id: UUID) -> None:
+    async def delete(self, role: ServiceRole, instance_id: UUID) -> None:
         """Reject unused deletes in aggregate readiness tests."""
         raise AssertionError("Aggregate readiness must not delete service heartbeats.")
 
-    async def fresh_roles(self, freshness: timedelta) -> frozenset[object]:
+    async def fresh_roles(self, freshness: timedelta) -> frozenset[ServiceRole]:
         """Return configured roles or simulate unavailable readiness storage."""
         self.freshness = freshness
         if self.unavailable:
@@ -106,7 +109,7 @@ class RecordingRedisClient:
 @pytest.fixture
 async def heartbeat_repository(
     migrated_postgresql_database_url: str,
-) -> AsyncEngine:
+) -> AsyncIterator[AsyncEngine]:
     """Create an engine for PostgreSQL service-heartbeat tests."""
     from textify.jobs.database import create_application_engine
 
@@ -224,7 +227,7 @@ async def test_heartbeat_reporter_writes_periodically_and_removes_its_exact_inst
         return probe_ready
 
     reporter = ServiceHeartbeatReporter(
-        repository,  # type: ignore[arg-type]
+        repository,
         ServiceRole.GPU_WORKER,
         refresh_interval=timedelta(milliseconds=1),
         readiness_probe=readiness_probe,
@@ -260,7 +263,7 @@ async def test_heartbeat_reporter_rejects_unready_initial_prerequisites() -> Non
         return False
 
     reporter = ServiceHeartbeatReporter(
-        repository,  # type: ignore[arg-type]
+        repository,
         ServiceRole.GPU_WORKER,
         refresh_interval=timedelta(seconds=1),
         readiness_probe=unavailable_probe,
@@ -293,7 +296,7 @@ def test_heartbeat_reporter_requires_a_positive_matched_periodic_policy(
 
     with pytest.raises(ValueError):
         ServiceHeartbeatReporter(
-            RecordingHeartbeatRepository(),  # type: ignore[arg-type]
+            RecordingHeartbeatRepository(),
             ServiceRole.RECONCILER,
             refresh_interval=refresh_interval,
             readiness_probe=readiness_probe,
@@ -309,7 +312,7 @@ async def test_redis_broker_readiness_uses_one_broker_client_and_hides_failures(
 
     client = RecordingRedisClient()
     broker_url = "redis://broker.example:6379/15"
-    monkeypatch.setattr(readiness.Redis, "from_url", lambda _url: client)
+    monkeypatch.setattr(Redis, "from_url", lambda _url: client)
     broker = readiness.RedisBrokerReadiness(
         JobDispatchConfig(
             broker_url=broker_url,  # type: ignore[arg-type]
@@ -330,13 +333,13 @@ async def test_redis_broker_readiness_uses_one_broker_client_and_hides_failures(
     "roles",
     (
         frozenset(),
-        frozenset({"reconciler"}),
-        frozenset({"gpu_worker"}),
+        frozenset({ServiceRole.RECONCILER}),
+        frozenset({ServiceRole.GPU_WORKER}),
     ),
 )
 async def test_application_readiness_requires_every_processing_role(
     monkeypatch: pytest.MonkeyPatch,
-    roles: frozenset[object],
+    roles: frozenset[ServiceRole],
 ) -> None:
     """Reject aggregate health when either processing role lacks a fresh row."""
     from textify.jobs import readiness
@@ -349,8 +352,8 @@ async def test_application_readiness_requires_every_processing_role(
     broker = FixedBrokerReadiness(True)
     checker = readiness.ApplicationReadiness(
         cast(AsyncEngine, object()),
-        repository,  # type: ignore[arg-type]
-        broker,  # type: ignore[arg-type]
+        repository,
+        broker,
         timedelta(seconds=30),
     )
 
@@ -385,8 +388,8 @@ async def test_application_readiness_checks_broker_after_database(
     broker = FixedBrokerReadiness(broker_ready)
     checker = readiness.ApplicationReadiness(
         cast(AsyncEngine, object()),
-        repository,  # type: ignore[arg-type]
-        broker,  # type: ignore[arg-type]
+        repository,
+        broker,
         timedelta(seconds=30),
     )
 
@@ -413,8 +416,8 @@ async def test_application_readiness_returns_false_for_private_dependency_failur
     broker = FixedBrokerReadiness(True)
     checker = readiness.ApplicationReadiness(
         cast(AsyncEngine, object()),
-        repository,  # type: ignore[arg-type]
-        broker,  # type: ignore[arg-type]
+        repository,
+        broker,
         timedelta(seconds=30),
     )
 

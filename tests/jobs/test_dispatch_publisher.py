@@ -92,10 +92,10 @@ async def test_publisher_initialization_requires_a_ready_shared_broker_probe() -
     ready_broker = RecordingBrokerReadiness(True)
     unavailable_broker = RecordingBrokerReadiness(False)
 
-    await publisher.initialize(ready_broker)  # type: ignore[arg-type]
+    await publisher.initialize(ready_broker)
 
     with pytest.raises(JobDispatchUnavailableError):
-        await publisher.initialize(unavailable_broker)  # type: ignore[arg-type]
+        await publisher.initialize(unavailable_broker)
 
     assert ready_broker.calls == 1
     assert unavailable_broker.calls == 1

@@ -1,6 +1,9 @@
 """Tests for PostgreSQL-driven Job Dispatch reconciliation."""
 
 import asyncio
+import subprocess
+import sys
+import textwrap
 from collections import deque
 from collections.abc import Callable
 from datetime import timedelta
@@ -173,6 +176,80 @@ def _policy(dispatch_batch_size: int = 100) -> ReconcilerPolicy:
         dispatch_batch_size=dispatch_batch_size,
         retention_cleanup_interval=timedelta(hours=1),
     )
+
+
+def test_reconciler_cli_emits_lifecycle_logs() -> None:
+    """Emit each process lifecycle record once in chronological stderr order."""
+    child_program = textwrap.dedent(
+        """
+        import asyncio
+        from types import SimpleNamespace
+
+        from textify.jobs import reconciler
+
+
+        class Repository:
+            async def recover_expired_claims(self, batch_size):
+                return 0
+
+            async def expire_queued_jobs(self, batch_size):
+                return 0
+
+            async def lease_due_dispatches(self, lease_owner, lease_duration, batch_size):
+                return ()
+
+            async def delete_expired_terminal_jobs(self):
+                return None
+
+
+        class Publisher:
+            async def publish(self, dispatch):
+                return None
+
+
+        class Heartbeat:
+            async def start(self):
+                return None
+
+            async def pulse(self):
+                stop_event.set()
+
+            async def stop(self):
+                return None
+
+
+        async def run_reconciler():
+            await reconciler.TranscriptionJobReconciler(
+                Repository(),
+                Publisher(),
+            ).run(stop_event, Heartbeat())
+
+
+        stop_event = asyncio.Event()
+        reconciler.AppConfig = lambda: SimpleNamespace(log_level="INFO")
+        reconciler.run_reconciler = run_reconciler
+        reconciler.main()
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", child_program],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert completed.returncode == 0
+    lifecycle_messages = (
+        "starting transcription job reconciler",
+        "transcription job reconciler is ready",
+        "stopping transcription job reconciler",
+    )
+    for message in lifecycle_messages:
+        assert completed.stderr.count(message) == 1
+    assert [
+        completed.stderr.index(message) for message in lifecycle_messages
+    ] == sorted(completed.stderr.index(message) for message in lifecycle_messages)
 
 
 @pytest.mark.asyncio

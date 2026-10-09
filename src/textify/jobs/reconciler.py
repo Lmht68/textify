@@ -162,6 +162,7 @@ class TranscriptionJobReconciler:
             heartbeat: Reconciler service-readiness lifecycle.
         """
         await heartbeat.start()
+        logger.info("transcription job reconciler is ready")
         next_cleanup_at = time.monotonic()
         try:
             while not stop_event.is_set():
@@ -242,4 +243,8 @@ def main() -> None:
     """Start the dedicated Transcription Job reconciler process."""
     app_config = AppConfig()
     configure_logging(app_config.log_level)
-    asyncio.run(run_reconciler())
+    logger.info("starting transcription job reconciler")
+    try:
+        asyncio.run(run_reconciler())
+    finally:
+        logger.info("stopping transcription job reconciler")
