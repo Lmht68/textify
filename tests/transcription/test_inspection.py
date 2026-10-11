@@ -1,5 +1,6 @@
 """Tests for submitted URL classification and source duration validation."""
 
+import json
 import threading
 import time
 from collections.abc import Mapping
@@ -9,6 +10,7 @@ from typing import ClassVar, Self
 import pytest
 from pytest import MonkeyPatch
 
+from textify.logging import LogServiceRole, configure_structured_logging
 from textify.transcription.exceptions import (
     InvalidMediaDurationError,
     InvalidUrlError,
@@ -17,6 +19,7 @@ from textify.transcription.exceptions import (
     UnsupportedPlatformError,
 )
 from textify.transcription.inspection import (
+    PreparedAudio,
     SubmittedSource,
     YtDlpMetadataExtractor,
     _normalize_duration,
@@ -391,6 +394,38 @@ def test_classify_submitted_url_rejects_out_of_policy_urls(
         classify_submitted_url(url)
 
 
+def test_classify_submitted_url_logs_safe_invalid_path_diagnostic(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Emit the stable invalid-path code without retaining the submitted URL."""
+    submitted_url = (
+        "https://www.tiktok.com/@creator?submitted_url=submitted-url-sentinel"
+    )
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
+
+    with pytest.raises(InvalidUrlError):
+        classify_submitted_url(submitted_url)
+
+    rendered_output = capsys.readouterr().err
+    rendered_events = [json.loads(line) for line in rendered_output.splitlines()]
+    assert [
+        {
+            field_name: rendered_event[field_name]
+            for field_name in ("event", "stage", "code")
+        }
+        for rendered_event in rendered_events
+    ] == [
+        {
+            "event": "source_inspection_failed",
+            "stage": "metadata",
+            "code": "unsupported_tiktok_path",
+        }
+    ]
+    assert "submitted-url-sentinel" not in rendered_output
+    assert "Traceback" not in rendered_output
+    assert "Logging error" not in rendered_output
+
+
 @pytest.mark.parametrize("duration", (True, 0, -1, float("inf")))
 def test_normalize_duration_rejects_invalid_media_duration(duration: object) -> None:
     """Metadata duration must be finite, positive, and nonboolean."""
@@ -461,6 +496,75 @@ def test_metadata_extractor_rejects_oversized_selected_media(
             deadline=time.monotonic() + 1.0,
             cancellation_event=threading.Event(),
         )
+
+
+def test_inspection_media_limit_and_cleanup_events_redact_private_details(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Preserve media rejection and cleanup while emitting only registered fields."""
+    submitted_url = (
+        "https://www.tiktok.com/@creator/video/1234567890123456789"
+        "?submitted_url=submitted-url-sentinel"
+        "&provider_detail=provider-detail-sentinel"
+    )
+    _configure_fake_youtube_dl(
+        monkeypatch,
+        {False: {"duration": 12, "filesize": 101}},
+        prepared_path=tmp_path / "audio.webm",
+    )
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
+    extractor = YtDlpMetadataExtractor(1800, 100, tmp_path)
+    submitted = classify_submitted_url(submitted_url)
+
+    with pytest.raises(MediaByteLimitExceeded):
+        extractor.extract(
+            submitted.provider_url,
+            deadline=time.monotonic() + 1.0,
+            cancellation_event=threading.Event(),
+        )
+
+    request_directory = tmp_path / "temporary-path-sentinel"
+    request_directory.mkdir()
+
+    def raise_cleanup_error(_: Path) -> None:
+        raise OSError("provider-detail-sentinel")
+
+    monkeypatch.setattr(
+        "textify.transcription.inspection.shutil.rmtree",
+        raise_cleanup_error,
+    )
+    PreparedAudio(request_directory / "audio.webm", request_directory).cleanup()
+
+    rendered_output = capsys.readouterr().err
+    rendered_events = [json.loads(line) for line in rendered_output.splitlines()]
+    assert [
+        {
+            field_name: rendered_event[field_name]
+            for field_name in ("event", "stage", "code")
+        }
+        for rendered_event in rendered_events
+    ] == [
+        {
+            "event": "source_inspection_failed",
+            "stage": "metadata",
+            "code": "media_size_exceeded",
+        },
+        {
+            "event": "resource_cleanup_failed",
+            "stage": "cleanup",
+            "code": "temporary_media_cleanup_failed",
+        },
+    ]
+    for sentinel in (
+        "submitted-url-sentinel",
+        "provider-detail-sentinel",
+        "temporary-path-sentinel",
+        "Traceback",
+        "Logging error",
+    ):
+        assert sentinel not in rendered_output
 
 
 def test_duration_fallback_enforces_progress_byte_limit_and_cleans(

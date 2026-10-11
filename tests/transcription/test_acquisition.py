@@ -1,6 +1,7 @@
 """Tests for provider adapters and bounded yt-dlp retries."""
 
 import asyncio
+import json
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -12,6 +13,7 @@ import pytest
 from pytest import MonkeyPatch
 from yt_dlp.utils import DownloadCancelled
 
+from textify.logging import LogServiceRole, configure_structured_logging
 from textify.transcription import acquisition
 from textify.transcription.acquisition import (
     FasterWhisperTranscriber,
@@ -21,10 +23,16 @@ from textify.transcription.acquisition import (
 )
 from textify.transcription.config import TranscriptionConfig
 from textify.transcription.exceptions import (
+    AudioDownloadTimeoutError,
     TranscriptionCancellationRequestedError,
     TranscriptionTimeoutError,
 )
-from textify.transcription.types import RawSegment, TimedTranscript, TranscriptMethod
+from textify.transcription.types import (
+    RawSegment,
+    TimedTranscript,
+    Transcript,
+    TranscriptMethod,
+)
 from textify.transcription.util import (
     MediaByteLimitExceeded,
     _TextifyFacebookIE,
@@ -1128,3 +1136,433 @@ def test_yt_dlp_audio_download_enforces_shared_policy(
     assert len(progress_hooks) == 1
     assert callable(progress_hooks[0])
     assert len(FakeYoutubeDL.added_extractors) == 1
+
+
+def _read_structured_events(
+    capsys: pytest.CaptureFixture[str],
+) -> tuple[str, list[dict[str, object]]]:
+    """Return all JSON logging events and their unparsed captured output."""
+    rendered_output = capsys.readouterr().err
+    return rendered_output, [json.loads(line) for line in rendered_output.splitlines()]
+
+
+def test_caption_diagnostics_select_registered_events_and_redact_values(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Keep provider failures, unusable tracks, and captions success distinct."""
+    provider_exception_sentinel = "caption-provider-exception-sentinel"
+    transcript_sentinel = "caption-transcript-sentinel"
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
+
+    with pytest.raises(acquisition._CaptionProviderTimeout):
+        acquire_transcript(
+            FakeCaptionProvider(failure=TimeoutError(provider_exception_sentinel)),
+            "caption-url-sentinel",
+            "en-US",
+            threading.Event(),
+        )
+    with pytest.raises(acquisition._CaptionProviderTimeout):
+        acquire_transcript(
+            FakeCaptionProvider(
+                (
+                    FakeCaptionTrack(
+                        "timed_out",
+                        "en-US",
+                        False,
+                        (),
+                        TimeoutError(provider_exception_sentinel),
+                    ),
+                )
+            ),
+            "caption-url-sentinel",
+            "en-US",
+            threading.Event(),
+        )
+
+    transcript = acquire_transcript(
+        FakeCaptionProvider(
+            (
+                FakeCaptionTrack(
+                    "unavailable",
+                    "en-US",
+                    False,
+                    (),
+                    RuntimeError(provider_exception_sentinel),
+                ),
+                FakeCaptionTrack(
+                    "usable",
+                    "en-US",
+                    False,
+                    ((0.0, 1.0, transcript_sentinel),),
+                ),
+            )
+        ),
+        "caption-url-sentinel",
+        "en-US",
+        threading.Event(),
+    )
+
+    assert transcript is not None
+    assert transcript.text == transcript_sentinel
+    rendered_output, rendered_events = _read_structured_events(capsys)
+    assert {
+        (
+            event["event"],
+            event["stage"],
+            event.get("code"),
+            event.get("method"),
+        )
+        for event in rendered_events
+    } == {
+        ("caption_acquisition_failed", "captions", "track_listing_timeout", None),
+        ("caption_acquisition_failed", "captions", "track_fetch_timeout", None),
+        ("caption_track_unavailable", "captions", "track_fetch_failed", None),
+        ("transcript_acquired", "captions", None, "youtube_captions"),
+    }
+    assert len(rendered_events) == 4
+    for sentinel in (
+        "caption-url-sentinel",
+        provider_exception_sentinel,
+        transcript_sentinel,
+    ):
+        assert sentinel not in rendered_output
+
+
+def test_adapter_diagnostics_select_native_and_audio_events(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Emit fixed diagnostics for native and yt-dlp adapter outcomes."""
+
+    class FailingWhisperModel:
+        """Raise a provider-shaped native inference failure."""
+
+        def transcribe(
+            self,
+            audio: str,
+            *,
+            beam_size: int,
+            vad_filter: bool,
+            temperature: float,
+            condition_on_previous_text: bool,
+            initial_prompt: str,
+        ) -> tuple[Iterable[FakeWhisperSegment], FakeWhisperInfo]:
+            """Raise the configured provider exception without returning a result."""
+            del (
+                audio,
+                beam_size,
+                vad_filter,
+                temperature,
+                condition_on_previous_text,
+                initial_prompt,
+            )
+            raise RuntimeError("native-provider-exception-sentinel")
+
+    destination = tmp_path / "media-path-sentinel"
+    destination.mkdir()
+    audio_path = destination / "native-audio-sentinel.webm"
+    audio_path.touch()
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
+
+    successful_transcriber = FasterWhisperTranscriber(
+        FakeWhisperModel(
+            (FakeWhisperSegment(0.0, 1.0, "native-transcript-sentinel"),),
+            "en",
+        ),
+        isolated_transcription_config(),
+    )
+    transcript = successful_transcriber.transcribe(audio_path)
+    assert transcript.text == "native-transcript-sentinel"
+
+    failing_transcriber = FasterWhisperTranscriber(
+        FailingWhisperModel(),
+        isolated_transcription_config(),
+    )
+    with pytest.raises(acquisition._TranscriptionProviderFailure):
+        failing_transcriber.transcribe(audio_path)
+
+    FakeYoutubeDL.captured_options.clear()
+    FakeYoutubeDL.calls.clear()
+    FakeYoutubeDL.added_extractors.clear()
+    FakeYoutubeDL.progress_status = None
+    FakeYoutubeDL.prepared_path = destination / "audio.webm"
+    monkeypatch.setattr(
+        "textify.transcription.util.yt_dlp.YoutubeDL",
+        FakeYoutubeDL,
+    )
+    downloader = YtDlpAudioDownloader(max_media_bytes=100)
+    source_url = (
+        "https://www.tiktok.com/@creator/video/1234567890123456789"
+        "?provider_payload=audio-provider-payload-sentinel"
+    )
+
+    FakeYoutubeDL.raw_metadata = {"entries": ()}
+    with pytest.raises(acquisition._AudioDownloadProviderFailure):
+        downloader.download(
+            source_url,
+            destination,
+            deadline=time.monotonic() + 1.0,
+            cancellation_event=threading.Event(),
+        )
+    FakeYoutubeDL.raw_metadata = {
+        "filesize": 101,
+        "provider_payload": "audio-provider-payload-sentinel",
+    }
+    with pytest.raises(MediaByteLimitExceeded):
+        downloader.download(
+            source_url,
+            destination,
+            deadline=time.monotonic() + 1.0,
+            cancellation_event=threading.Event(),
+        )
+
+    rendered_output, rendered_events = _read_structured_events(capsys)
+    assert {
+        (
+            event["event"],
+            event["stage"],
+            event.get("code"),
+            event.get("method"),
+        )
+        for event in rendered_events
+    } == {
+        ("transcript_acquired", "transcription", None, "faster_whisper"),
+        ("native_transcription_failed", "transcription", "transcription_failed", None),
+        ("audio_download_failed", "audio_download", "invalid_download_result", None),
+        ("audio_download_failed", "audio_download", "media_size_exceeded", None),
+    }
+    assert len(rendered_events) == 4
+    for sentinel in (
+        "media-path-sentinel",
+        "native-audio-sentinel",
+        "native-transcript-sentinel",
+        "native-provider-exception-sentinel",
+        "audio-provider-payload-sentinel",
+    ):
+        assert sentinel not in rendered_output
+
+
+@pytest.mark.asyncio
+async def test_whisper_acquirer_logs_outer_audio_timeout(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Log the outer audio deadline even when cancelled download work is retained."""
+
+    class BlockingAudioDownloader:
+        """Wait for cancellation before reporting a private provider failure."""
+
+        def download(
+            self,
+            source_url: str,
+            destination: Path,
+            *,
+            deadline: float,
+            cancellation_event: threading.Event,
+        ) -> Path:
+            """Block until cancellation and then stop the provider operation."""
+            del source_url, destination, deadline
+            cancellation_event.wait(timeout=1)
+            raise DownloadCancelled("audio-provider-exception-sentinel")
+
+    settings = isolated_transcription_config().model_copy(
+        update={
+            "audio_download_timeout_seconds": 0.01,
+            "temporary_media_root": tmp_path / "media-path-sentinel",
+        }
+    )
+    acquirer = acquisition.WhisperAcquirer(
+        BlockingAudioDownloader(),
+        FasterWhisperTranscriber(FakeWhisperModel((), "en"), settings),
+        settings,
+    )
+    ownership = acquisition.TranscriptionOwnership(
+        None,
+        threading.Event(),
+        asyncio.Event(),
+    )
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
+
+    with pytest.raises(AudioDownloadTimeoutError):
+        await acquirer.acquire(
+            "https://www.tiktok.com/@creator/video/1234567890123456789"
+            "?url=audio-url-sentinel",
+            ownership,
+            cancellation_requested=asyncio.Event(),
+        )
+
+    rendered_output, rendered_events = _read_structured_events(capsys)
+    assert [
+        {
+            field_name: rendered_event[field_name]
+            for field_name in ("event", "stage", "code")
+        }
+        for rendered_event in rendered_events
+    ] == [
+        {
+            "event": "audio_download_failed",
+            "stage": "audio_download",
+            "code": "audio_download_timeout",
+        }
+    ]
+    for sentinel in (
+        "audio-url-sentinel",
+        "audio-provider-exception-sentinel",
+        "media-path-sentinel",
+    ):
+        assert sentinel not in rendered_output
+
+
+@pytest.mark.asyncio
+async def test_whisper_acquirer_logs_timeout_and_abandoned_inference(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Preserve retained-worker cleanup while identifying an unexpected inference end."""
+
+    class UnexpectedInferenceFailure(BaseException):
+        """Represent a private native failure outside expected provider boundaries."""
+
+    class AudioDownloader:
+        """Write a complete private audio file for native inference."""
+
+        def download(
+            self,
+            source_url: str,
+            destination: Path,
+            *,
+            deadline: float,
+            cancellation_event: threading.Event,
+        ) -> Path:
+            """Create a request-owned audio file without contacting a provider."""
+            del source_url, deadline, cancellation_event
+            audio_path = destination / "media-path-sentinel.webm"
+            audio_path.write_bytes(b"native")
+            return audio_path
+
+    class BlockingTranscriber:
+        """Block native inference until the test releases an unexpected failure."""
+
+        def __init__(self) -> None:
+            """Initialize entry and release signals."""
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def transcribe(
+            self,
+            audio_path: Path,
+            *,
+            include_segments: bool = True,
+        ) -> Transcript:
+            """Raise an unexpected private failure after the outer deadline."""
+            del audio_path, include_segments
+            self.entered.set()
+            self.release.wait(timeout=1)
+            raise UnexpectedInferenceFailure("native-provider-exception-sentinel")
+
+    settings = isolated_transcription_config().model_copy(
+        update={
+            "temporary_media_root": tmp_path / "media-path-sentinel",
+            "transcription_timeout_seconds": 0.01,
+        }
+    )
+    transcriber = BlockingTranscriber()
+    acquirer = acquisition.WhisperAcquirer(AudioDownloader(), transcriber, settings)
+    ownership = acquisition.TranscriptionOwnership(
+        None,
+        threading.Event(),
+        asyncio.Event(),
+    )
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
+
+    try:
+        with pytest.raises(TranscriptionTimeoutError):
+            await acquirer.acquire(
+                "https://www.tiktok.com/@creator/video/1234567890123456789"
+                "?url=native-url-sentinel",
+                ownership,
+                cancellation_requested=asyncio.Event(),
+            )
+        ownership.finish_caller()
+        assert transcriber.entered.wait(timeout=1)
+    finally:
+        transcriber.release.set()
+        await acquirer.shutdown()
+
+    rendered_output, rendered_events = _read_structured_events(capsys)
+    assert {
+        (
+            event["event"],
+            event["stage"],
+            event.get("code"),
+        )
+        for event in rendered_events
+    } == {
+        ("native_transcription_failed", "transcription", "transcription_timeout"),
+        (
+            "native_transcription_failed",
+            "transcription",
+            "abandoned_native_inference_failed",
+        ),
+    }
+    assert len(rendered_events) == 2
+    for sentinel in (
+        "native-url-sentinel",
+        "native-provider-exception-sentinel",
+        "media-path-sentinel",
+    ):
+        assert sentinel not in rendered_output
+
+
+@pytest.mark.asyncio
+async def test_acquisition_cleanup_diagnostics_redact_task_failures(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Emit cleanup codes without exposing cancelled-worker or finalizer failures."""
+
+    async def failed_download() -> Path:
+        raise OSError("download-cleanup-exception-sentinel")
+
+    async def failed_finalizer() -> None:
+        raise OSError("finalizer-exception-sentinel")
+
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
+    download_worker = asyncio.create_task(failed_download())
+    await asyncio.gather(download_worker, return_exceptions=True)
+    await acquisition._finish_cancelled_download(download_worker)
+
+    finalizer = asyncio.create_task(failed_finalizer())
+    await asyncio.gather(finalizer, return_exceptions=True)
+    acquirer = acquisition.WhisperAcquirer(
+        YtDlpAudioDownloader(1024),
+        FasterWhisperTranscriber(
+            FakeWhisperModel((), "en"),
+            isolated_transcription_config(),
+        ),
+        isolated_transcription_config(),
+    )
+    acquirer._native_finalizers.add(finalizer)
+    acquirer._consume_native_finalizer(finalizer)
+
+    rendered_output, rendered_events = _read_structured_events(capsys)
+    assert {
+        (event["event"], event["stage"], event.get("code")) for event in rendered_events
+    } == {
+        (
+            "resource_cleanup_failed",
+            "cleanup",
+            "audio_download_cleanup_failed",
+        ),
+        (
+            "resource_cleanup_failed",
+            "cleanup",
+            "native_inference_finalizer_failed",
+        ),
+    }
+    assert len(rendered_events) == 2
+    for sentinel in (
+        "download-cleanup-exception-sentinel",
+        "finalizer-exception-sentinel",
+    ):
+        assert sentinel not in rendered_output

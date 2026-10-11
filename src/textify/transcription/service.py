@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from requests.exceptions import RequestException, Timeout
 from yt_dlp.utils import YoutubeDLError
 
-from textify.logging import bind_request_log_fields
+from textify.logging import LogEvent, bind_request_log_fields
 from textify.transcription import acquisition, inspection
 from textify.transcription.config import TranscriptionConfig
 from textify.transcription.exceptions import (
@@ -195,6 +195,8 @@ class TranscriptionExecutor:
             inspection._raise_if_selected_media_exceeds_limit(
                 extracted_metadata.metadata,
                 self._settings.max_media_bytes,
+                failure_event=LogEvent.SOURCE_INSPECTION_FAILED,
+                failure_stage="metadata",
             )
             normalized_metadata = inspection.normalize_processed_metadata(
                 extracted_metadata.metadata,

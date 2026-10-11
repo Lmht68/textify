@@ -12,7 +12,7 @@ from decimal import Decimal, InvalidOperation
 from math import ceil, isfinite
 from numbers import Real
 from pathlib import Path
-from typing import Any, Final, Protocol, cast
+from typing import Any, Final, Literal, Protocol, cast
 from urllib.parse import SplitResult, parse_qsl, urlencode, urlsplit, urlunsplit
 
 import av
@@ -20,6 +20,7 @@ from langcodes import Language
 from requests.exceptions import Timeout
 from yt_dlp.utils import DownloadCancelled, DownloadError
 
+from textify.logging import LogEvent, emit_event
 from textify.transcription.exceptions import (
     InvalidMediaDurationError,
     InvalidUrlError,
@@ -170,14 +171,13 @@ _AUDIO_OUTPUT_TEMPLATE: Final[str] = "audio.%(ext)s"
 _INSPECTION_TEMP_PREFIX: Final[str] = "textify-inspection-"
 
 
-def _log_inspection_error(event: str, code: str) -> None:
+def _log_inspection_error(code: str) -> None:
     """Log a safe structured inspection failure code."""
-    logger.debug(
-        event,
-        extra={
-            "stage": "metadata",
-            "code": code,
-        },
+    emit_event(
+        logger,
+        LogEvent.SOURCE_INSPECTION_FAILED,
+        stage="metadata",
+        code=code,
     )
 
 
@@ -188,55 +188,62 @@ def _cleanup_request_directory(request_directory: Path) -> None:
     try:
         shutil.rmtree(request_directory)
     except OSError:
-        logger.error(
-            "temporary media cleanup failed",
-            extra={
-                "stage": "cleanup",
-                "code": "temporary_media_cleanup_failed",
-            },
+        emit_event(
+            logger,
+            LogEvent.RESOURCE_CLEANUP_FAILED,
+            stage="cleanup",
+            code="temporary_media_cleanup_failed",
         )
 
 
 def _metadata_provider_error(code: str) -> MetadataRetrievalFailedError:
     """Log a safe code before returning the stable provider error."""
-    _log_inspection_error("metadata provider error", code)
+    _log_inspection_error(code)
     return MetadataRetrievalFailedError()
 
 
 def _invalid_media_duration_error(code: str) -> InvalidMediaDurationError:
     """Log a safe code before returning the stable duration error."""
-    _log_inspection_error("invalid media duration", code)
+    _log_inspection_error(code)
     return InvalidMediaDurationError()
 
 
 def _unsupported_media_error(code: str) -> UnsupportedMediaError:
     """Log a safe code before returning the stable media error."""
-    _log_inspection_error("unsupported media", code)
+    _log_inspection_error(code)
     return UnsupportedMediaError()
 
 
 def _invalid_source_error(code: str) -> InvalidUrlError:
     """Log a safe code before returning the stable invalid URL error."""
-    _log_inspection_error("invalid URL error", code)
+    _log_inspection_error(code)
     return InvalidUrlError()
 
 
 def _unsupported_platform_error(code: str) -> UnsupportedPlatformError:
     """Log a safe code before returning the stable platform error."""
-    _log_inspection_error("unsupported platform error", code)
+    _log_inspection_error(code)
     return UnsupportedPlatformError()
 
 
 def _raise_if_selected_media_exceeds_limit(
     metadata: Mapping[str, object],
     max_media_bytes: int,
+    *,
+    failure_event: LogEvent,
+    failure_stage: Literal["metadata", "audio_download"],
 ) -> None:
     """Reject selected media whose declared size exceeds the byte limit."""
     selected_size = metadata.get("filesize")
     if not _is_positive_finite_media_size(selected_size):
         selected_size = metadata.get("filesize_approx")
     if _media_size_exceeds_limit(selected_size, max_media_bytes):
-        _log_inspection_error("unsupported media", "media_size_exceeded")
+        emit_event(
+            logger,
+            failure_event,
+            stage=failure_stage,
+            code="media_size_exceeded",
+        )
         raise MediaByteLimitExceeded
 
 
@@ -272,7 +279,7 @@ def _raise_if_completed_media_exceeds_limit(
 ) -> None:
     """Reject a completed media file whose exact size exceeds the byte limit."""
     if media_path.stat().st_size > max_media_bytes:
-        _log_inspection_error("unsupported media", "media_size_exceeded")
+        _log_inspection_error("media_size_exceeded")
         raise MediaByteLimitExceeded
 
 
@@ -387,6 +394,8 @@ class YtDlpMetadataExtractor:
         _raise_if_selected_media_exceeds_limit(
             metadata,
             self._max_media_bytes,
+            failure_event=LogEvent.SOURCE_INSPECTION_FAILED,
+            failure_stage="metadata",
         )
         if metadata.get("duration") is not None:
             return ExtractedMetadata(metadata)
@@ -454,6 +463,8 @@ class YtDlpMetadataExtractor:
                 _raise_if_selected_media_exceeds_limit(
                     raw_metadata,
                     self._max_media_bytes,
+                    failure_event=LogEvent.SOURCE_INSPECTION_FAILED,
+                    failure_stage="metadata",
                 )
                 prepared_path = youtube_dl.prepare_filename(raw_metadata)
 

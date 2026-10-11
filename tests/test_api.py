@@ -1,5 +1,7 @@
 """ASGI proofs for PostgreSQL-only FastAPI lifecycle ownership."""
 
+import asyncio
+import json
 from pathlib import Path
 from uuid import UUID
 
@@ -11,6 +13,7 @@ from sqlalchemy import text
 from textify.config import AppConfig, Environment
 from textify.jobs.config import CacheConfig, JobConfig, JobDispatchConfig
 from textify.jobs.database import create_application_engine
+from textify.logging import LogServiceRole, configure_structured_logging
 from textify.main import create_app
 
 TIKTOK_URL = "https://www.tiktok.com/@creator/video/1234567890123456789"
@@ -87,6 +90,83 @@ def _assert_generated_request_id(response: Response) -> str:
     assert parsed_request_id.version == 4
     assert str(parsed_request_id) == request_id
     return request_id
+
+
+@pytest.mark.asyncio
+async def test_api_logs_completed_unmatched_requests_with_safe_fields(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Emit a correlated completion event without logging an unmatched raw path."""
+    raw_path_sentinel = "raw-path-sentinel"
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
+    application = create_app(_app_config())
+
+    transport = ASGITransport(app=application)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(f"/{raw_path_sentinel}?query=raw-query-sentinel")
+
+    request_id = _assert_generated_request_id(response)
+    assert response.status_code == 404
+    rendered_output = capsys.readouterr().err
+    rendered_events = [json.loads(line) for line in rendered_output.splitlines()]
+    assert len(rendered_events) == 1
+    rendered_event = rendered_events[0]
+    assert {
+        field_name: rendered_event[field_name]
+        for field_name in (
+            "event",
+            "request_id",
+            "http_method",
+            "http_status_code",
+            "stage",
+        )
+    } == {
+        "event": "request_completed",
+        "request_id": request_id,
+        "http_method": "GET",
+        "http_status_code": 404,
+        "stage": "request",
+    }
+    assert rendered_event["elapsed_seconds"] >= 0
+    assert raw_path_sentinel not in rendered_output
+    assert "raw-query-sentinel" not in rendered_output
+
+
+@pytest.mark.asyncio
+async def test_api_logs_pre_response_cancellation_without_exception_data(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Emit an interruption event when a route cancels before response start."""
+    raw_path_sentinel = "pre-response-cancel-sentinel"
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
+    application = create_app(_app_config())
+
+    @application.get(f"/{raw_path_sentinel}")
+    async def cancel_before_response() -> None:
+        raise asyncio.CancelledError
+
+    transport = ASGITransport(app=application)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        with pytest.raises(asyncio.CancelledError):
+            await client.get(f"/{raw_path_sentinel}?query=raw-query-sentinel")
+
+    rendered_output = capsys.readouterr().err
+    rendered_events = [json.loads(line) for line in rendered_output.splitlines()]
+    assert len(rendered_events) == 1
+    rendered_event = rendered_events[0]
+    assert {
+        field_name: rendered_event[field_name]
+        for field_name in ("event", "http_method", "stage")
+    } == {
+        "event": "request_interrupted",
+        "http_method": "GET",
+        "stage": "request",
+    }
+    assert rendered_event["elapsed_seconds"] >= 0
+    assert "http_status_code" not in rendered_event
+    assert raw_path_sentinel not in rendered_output
+    assert "raw-query-sentinel" not in rendered_output
+    assert "Traceback" not in rendered_output
 
 
 def test_app_config_defaults_to_deployment_port(

@@ -40,7 +40,12 @@ from textify.jobs.readiness import (
 from textify.jobs.repository import PostgresTranscriptionJobRepository
 from textify.jobs.router import router as transcription_job_router
 from textify.jobs.service import TranscriptionJobService, utc_now
-from textify.logging import configure_logging, request_log_context
+from textify.logging import (
+    LogEvent,
+    configure_logging,
+    emit_event,
+    request_log_context,
+)
 from textify.ops import router as operations_router
 
 logger = logging.getLogger(__name__)
@@ -75,15 +80,18 @@ class _RequestObservabilityMiddleware:
             return
 
         request_id = str(uuid4())
+        http_method = scope["method"].upper()
         request_started_at = time.monotonic()
         response_started = False
+        response_status_code: int | None = None
 
         async def send_with_request_id(message: Message) -> None:
             """Add the generated correlation ID to an HTTP response start."""
-            nonlocal response_started
+            nonlocal response_started, response_status_code
             if message["type"] == "http.response.start":
                 MutableHeaders(scope=message)["X-Request-ID"] = request_id
                 response_started = True
+                response_status_code = message["status"]
             await send(message)
 
         with request_log_context(request_id):
@@ -91,15 +99,15 @@ class _RequestObservabilityMiddleware:
                 await self._app(scope, receive, send_with_request_id)
             except asyncio.CancelledError:
                 if not response_started:
-                    logger.info(
-                        "request interrupted",
-                        extra={
-                            "stage": "request",
-                            "elapsed_seconds": max(
-                                0.0,
-                                time.monotonic() - request_started_at,
-                            ),
-                        },
+                    emit_event(
+                        logger,
+                        LogEvent.REQUEST_INTERRUPTED,
+                        stage="request",
+                        http_method=http_method,
+                        elapsed_seconds=max(
+                            0.0,
+                            time.monotonic() - request_started_at,
+                        ),
                     )
                 raise
             except Exception as exc:
@@ -111,16 +119,17 @@ class _RequestObservabilityMiddleware:
                 )
                 await response(scope, receive, send_with_request_id)
 
-            if response_started:
-                logger.info(
-                    "request completed",
-                    extra={
-                        "stage": "request",
-                        "elapsed_seconds": max(
-                            0.0,
-                            time.monotonic() - request_started_at,
-                        ),
-                    },
+            if response_started and response_status_code is not None:
+                emit_event(
+                    logger,
+                    LogEvent.REQUEST_COMPLETED,
+                    stage="request",
+                    http_method=http_method,
+                    http_status_code=response_status_code,
+                    elapsed_seconds=max(
+                        0.0,
+                        time.monotonic() - request_started_at,
+                    ),
                 )
 
 

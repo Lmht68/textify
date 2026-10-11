@@ -22,6 +22,8 @@ from textify.logging import (
     request_log_context,
     transcription_job_log_context,
 )
+from textify.transcription.exceptions import InvalidUrlError
+from textify.transcription.inspection import classify_submitted_url
 
 
 def test_configured_logging_renders_only_safe_request_fields(
@@ -103,6 +105,27 @@ def test_configured_logging_renders_only_safe_request_fields(
     assert "dependency-sentinel" not in rendered_output
     for sensitive_value in sensitive_values.values():
         assert sensitive_value not in rendered_output
+
+
+def test_legacy_logging_formats_migrated_inspection_event(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Retain the safe key-value envelope for a registered inspection event."""
+    submitted_url = "https://www.tiktok.com/@creator?submitted_url=legacy-url-sentinel"
+    configure_logging("DEBUG")
+
+    with pytest.raises(InvalidUrlError):
+        classify_submitted_url(submitted_url)
+
+    rendered_output = capsys.readouterr().err
+    rendered_fields = rendered_output.split("] source inspection failed ", maxsplit=1)[
+        1
+    ].split()
+    assert set(rendered_fields) == {
+        "code=unsupported_tiktok_path",
+        "stage=metadata",
+    }
+    assert "legacy-url-sentinel" not in rendered_output
 
 
 def test_celery_setup_preserves_safe_textify_logging() -> None:
