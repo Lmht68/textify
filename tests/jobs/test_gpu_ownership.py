@@ -1,6 +1,7 @@
 """Tests for one worker's physical-GPU ownership lifecycle."""
 
 import asyncio
+import json
 from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
@@ -16,9 +17,82 @@ from textify.jobs.gpu_ownership import GpuModelOwnership, GpuOwnershipConflictEr
 from textify.jobs.repository import PostgresTranscriptionJobRepository
 from textify.jobs.service import utc_now
 from textify.jobs.worker import TranscriptionWorkerRuntime
+from textify.logging import LogServiceRole, configure_structured_logging
 from textify.transcription import acquisition, inspection
 from textify.transcription.config import TranscriptionConfig
 from textify.transcription.service import TranscriptionAdapters
+
+
+class _AdvisoryLockResult:
+    """Return one configured PostgreSQL advisory-lock result."""
+
+    def __init__(self, value: bool) -> None:
+        """Store the scalar result returned by the connection."""
+        self._value = value
+
+    def scalar_one(self) -> bool:
+        """Return the configured scalar result."""
+        return self._value
+
+
+class _OwnershipConnection:
+    """Exercise connection cleanup paths without exposing connection details."""
+
+    def __init__(
+        self,
+        *,
+        unlocks: bool = True,
+        close_error: OSError | None = None,
+        invalidation_error: OSError | None = None,
+    ) -> None:
+        """Initialize fixed advisory-lock and cleanup outcomes."""
+        self._unlocks = unlocks
+        self._close_error = close_error
+        self._invalidation_error = invalidation_error
+        self.closed = False
+        self.execute_calls = 0
+        self.close_calls = 0
+        self.invalidation_calls = 0
+
+    async def execute(
+        self,
+        _statement: object,
+        _parameters: object = None,
+    ) -> _AdvisoryLockResult:
+        """Return acquisition success followed by the configured unlock result."""
+        self.execute_calls += 1
+        return _AdvisoryLockResult(self.execute_calls == 1 or self._unlocks)
+
+    async def commit(self) -> None:
+        """Accept durable advisory-lock state."""
+
+    async def close(self) -> None:
+        """Close the connection or raise the configured private failure."""
+        self.close_calls += 1
+        if self._close_error is not None:
+            raise self._close_error
+        self.closed = True
+
+    async def invalidate(self) -> None:
+        """Invalidate the connection or raise the configured private failure."""
+        self.invalidation_calls += 1
+        if self._invalidation_error is not None:
+            raise self._invalidation_error
+        self.closed = True
+
+
+class _OwnershipEngine:
+    """Return one deterministic connection for a public ownership lifecycle."""
+
+    def __init__(self, connection: _OwnershipConnection) -> None:
+        """Store the connection that acquisition must retain."""
+        self._connection = connection
+        self.connect_calls = 0
+
+    async def connect(self) -> _OwnershipConnection:
+        """Return the configured connection."""
+        self.connect_calls += 1
+        return self._connection
 
 
 @pytest.mark.asyncio
@@ -43,6 +117,112 @@ async def test_symlinked_lock_directory_is_rejected_before_database_access(
         await ownership.acquire()
 
     assert list(target_directory.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_gpu_ownership_logs_safe_connection_close_failure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Release the host lock while hiding a retained-connection close failure."""
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
+    gpu_identity = "gpu-identity-sentinel"
+    lock_directory = tmp_path / "gpu-locks"
+    connection = _OwnershipConnection(
+        close_error=OSError(
+            "postgresql-url-sentinel credential-sentinel close-error-sentinel"
+        )
+    )
+    ownership = GpuModelOwnership(
+        cast(AsyncEngine, _OwnershipEngine(connection)),
+        gpu_identity,
+        lock_directory,
+    )
+
+    await ownership.acquire()
+    await ownership.release()
+
+    replacement = GpuModelOwnership(
+        cast(AsyncEngine, _OwnershipEngine(_OwnershipConnection())),
+        gpu_identity,
+        lock_directory,
+    )
+    try:
+        await replacement.acquire()
+    finally:
+        await replacement.release()
+
+    assert connection.close_calls == 1
+    rendered_event = json.loads(capsys.readouterr().err)
+    assert {
+        field_name: rendered_event[field_name]
+        for field_name in ("event", "stage", "code")
+    } == {
+        "event": "gpu_ownership_failed",
+        "stage": "cleanup",
+        "code": "gpu_ownership_connection_close_failed",
+    }
+    for sensitive_value in (
+        "postgresql-url-sentinel",
+        "credential-sentinel",
+        "gpu-identity-sentinel",
+        "close-error-sentinel",
+    ):
+        assert sensitive_value not in str(rendered_event)
+
+
+@pytest.mark.asyncio
+async def test_gpu_ownership_logs_safe_connection_invalidation_failure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Release the host lock while hiding retained-connection invalidation failure."""
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
+    gpu_identity = "gpu-identity-sentinel"
+    lock_directory = tmp_path / "gpu-locks"
+    connection = _OwnershipConnection(
+        unlocks=False,
+        invalidation_error=OSError(
+            "postgresql-url-sentinel credential-sentinel invalidation-error-sentinel"
+        ),
+    )
+    ownership = GpuModelOwnership(
+        cast(AsyncEngine, _OwnershipEngine(connection)),
+        gpu_identity,
+        lock_directory,
+    )
+
+    await ownership.acquire()
+    await ownership.release()
+
+    replacement = GpuModelOwnership(
+        cast(AsyncEngine, _OwnershipEngine(_OwnershipConnection())),
+        gpu_identity,
+        lock_directory,
+    )
+    try:
+        await replacement.acquire()
+    finally:
+        await replacement.release()
+
+    assert connection.close_calls == 1
+    assert connection.invalidation_calls == 2
+    rendered_event = json.loads(capsys.readouterr().err)
+    assert {
+        field_name: rendered_event[field_name]
+        for field_name in ("event", "stage", "code")
+    } == {
+        "event": "gpu_ownership_failed",
+        "stage": "cleanup",
+        "code": "gpu_ownership_connection_invalidation_failed",
+    }
+    for sensitive_value in (
+        "postgresql-url-sentinel",
+        "credential-sentinel",
+        "gpu-identity-sentinel",
+        "invalidation-error-sentinel",
+    ):
+        assert sensitive_value not in str(rendered_event)
 
 
 @pytest.mark.asyncio

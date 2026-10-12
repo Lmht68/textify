@@ -1,11 +1,12 @@
 """Tests for one claimed Execution Attempt processor."""
 
+import json
 from uuid import uuid4
 
 import pytest
 
 from textify.jobs.types import ClaimedTranscriptionJob, ExecutionClaim, JobDispatch
-from textify.logging import configure_logging
+from textify.logging import LogServiceRole, configure_structured_logging
 from textify.transcription import inspection
 from textify.transcription.exceptions import TranscriptionFailedError
 from textify.transcription.schemas import TranscriptionResponse
@@ -144,7 +145,7 @@ class UnexpectedFailureExecutor:
         """
         del include_segments
         control.cleanup_complete.set()
-        raise RuntimeError("provider-detail-sentinel")
+        raise RuntimeError("provider-message-sentinel")
 
 
 def _dispatch() -> JobDispatch:
@@ -263,9 +264,13 @@ async def test_processor_publishes_projected_success_for_its_claim() -> None:
 
 
 @pytest.mark.asyncio
-async def test_processor_publishes_safe_failure_for_provider_error() -> None:
+async def test_processor_publishes_safe_failure_for_provider_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """Persist only the stable error code and message for expected failures."""
     from textify.jobs.processor import TranscriptionJobProcessor
+
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
 
     dispatch = _dispatch()
     claimed_job = _claimed_job(dispatch)
@@ -288,6 +293,23 @@ async def test_processor_publishes_safe_failure_for_provider_error() -> None:
     ]
     assert repository.cancelled_claims == []
     assert claim_manager.released_claims == [claimed_job.claim]
+    rendered_output = capsys.readouterr().err
+    rendered_event = json.loads(rendered_output)
+    assert {
+        field_name: rendered_event[field_name]
+        for field_name in ("event", "internal_job_id", "code")
+    } == {
+        "event": "transcription_job_processing_failed",
+        "internal_job_id": 1,
+        "code": "transcription_failed",
+    }
+    for sensitive_value in (
+        claimed_job.submitted_url,
+        str(claimed_job.claim.dispatch.execution_attempt_token),
+        "One",
+        "Traceback",
+    ):
+        assert sensitive_value not in rendered_output
 
 
 @pytest.mark.asyncio
@@ -320,7 +342,7 @@ async def test_processor_logs_only_safe_failure_for_unexpected_provider_detail(
     """Render only the stable internal error for an unexpected provider failure."""
     from textify.jobs.processor import TranscriptionJobProcessor
 
-    configure_logging("INFO")
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
     dispatch = _dispatch()
     claimed_job = _claimed_job(dispatch)
     repository = RecordingExecutionRepository()
@@ -332,6 +354,79 @@ async def test_processor_logs_only_safe_failure_for_unexpected_provider_detail(
     )
 
     rendered_output = capsys.readouterr().err
-    assert "transcription job processor failed" in rendered_output
-    assert "code=internal_error" in rendered_output
-    assert "provider-detail-sentinel" not in rendered_output
+    rendered_event = json.loads(rendered_output)
+    assert {
+        field_name: rendered_event[field_name]
+        for field_name in ("event", "internal_job_id", "code")
+    } == {
+        "event": "transcription_job_processing_failed",
+        "internal_job_id": 1,
+        "code": "internal_error",
+    }
+    for sensitive_value in (
+        claimed_job.submitted_url,
+        str(claimed_job.claim.dispatch.execution_attempt_token),
+        "provider-message-sentinel",
+        "Traceback",
+    ):
+        assert sensitive_value not in rendered_output
+
+
+@pytest.mark.asyncio
+async def test_processor_logs_internal_error_for_response_projection_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Keep projection failures safe while publishing an internal job failure."""
+    from textify.jobs import processor
+
+    def raise_projection_failure(
+        _result: TranscriptionResult,
+        _exclusions: frozenset[str],
+    ) -> TranscriptionResponse:
+        """Raise a controlled private projection failure."""
+        raise RuntimeError("projection-failure-sentinel")
+
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
+    dispatch = _dispatch()
+    claimed_job = _claimed_job(dispatch)
+    repository = RecordingExecutionRepository()
+    claim_manager = RecordingClaimManager(claimed_job)
+    monkeypatch.setattr(
+        processor,
+        "build_transcription_response",
+        raise_projection_failure,
+    )
+
+    await processor.TranscriptionJobProcessor(
+        repository,
+        ResultExecutor(),
+        claim_manager,
+    ).process(dispatch)
+
+    assert repository.failures == [
+        (
+            claimed_job.claim,
+            "internal_error",
+            "An unexpected error occurred.",
+        )
+    ]
+    assert claim_manager.released_claims == [claimed_job.claim]
+    rendered_output = capsys.readouterr().err
+    rendered_event = json.loads(rendered_output)
+    assert {
+        field_name: rendered_event[field_name]
+        for field_name in ("event", "internal_job_id", "code")
+    } == {
+        "event": "transcription_job_processing_failed",
+        "internal_job_id": 1,
+        "code": "internal_error",
+    }
+    for sensitive_value in (
+        claimed_job.submitted_url,
+        str(claimed_job.claim.dispatch.execution_attempt_token),
+        "One",
+        "projection-failure-sentinel",
+        "Traceback",
+    ):
+        assert sensitive_value not in rendered_output

@@ -16,6 +16,7 @@ from textify.jobs.types import (
     ExecutionClaim,
     JobDispatch,
 )
+from textify.logging import LogCode, LogEvent, emit_event
 from textify.transcription.service import TranscriptionExecutionControl
 
 logger = logging.getLogger(__name__)
@@ -201,8 +202,12 @@ class ExecutionClaimManager:
                     self._claim_lease_duration,
                 )
             except TranscriptionJobStoreUnavailableError:
-                logger.error(
-                    "transcription job storage is unavailable to claim monitor"
+                emit_event(
+                    logger,
+                    LogEvent.JOB_STORE_UNAVAILABLE,
+                    code=(
+                        LogCode.TRANSCRIPTION_JOB_STORAGE_IS_UNAVAILABLE_TO_CLAIM_MONITOR.value
+                    ),
                 )
                 continue
 

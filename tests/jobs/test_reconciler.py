@@ -1,6 +1,7 @@
 """Tests for PostgreSQL-driven Job Dispatch reconciliation."""
 
 import asyncio
+import json
 import subprocess
 import sys
 import textwrap
@@ -13,8 +14,10 @@ import pytest
 
 from textify.jobs.contracts import TranscriptionJobStoreUnavailableError
 from textify.jobs.dispatch import JobDispatchUnavailableError
+from textify.jobs.readiness import ServiceReadinessUnavailableError
 from textify.jobs.reconciler import ReconcilerPolicy, TranscriptionJobReconciler
 from textify.jobs.types import JobDispatch
+from textify.logging import LogServiceRole, configure_structured_logging
 
 
 class RecordingDispatchRepository:
@@ -156,6 +159,33 @@ class StopOnBrokerFailurePublisher:
         raise JobDispatchUnavailableError()
 
 
+class StoreFailureThenSuccessRepository(RecordingDispatchRepository):
+    """Fail one store operation before a complete reconciler retry."""
+
+    def __init__(self) -> None:
+        """Initialize one scheduled storage interruption."""
+        super().__init__(())
+        self._failure_pending = True
+
+    async def recover_expired_claims(self, limit: int) -> int:
+        """Reject the first recovery pass, then delegate to the recording parent."""
+        if self._failure_pending:
+            self._failure_pending = False
+            raise TranscriptionJobStoreUnavailableError("postgresql-url-sentinel")
+        return await super().recover_expired_claims(limit)
+
+
+class FailingServiceHeartbeat(RecordingServiceHeartbeat):
+    """Fail one successful-cycle readiness refresh without masking shutdown."""
+
+    async def pulse(self) -> None:
+        """Stop the loop and signal an unavailable readiness store."""
+        self.pulse_calls += 1
+        if self._stop_event is not None:
+            self._stop_event.set()
+        raise ServiceReadinessUnavailableError("readiness-error-sentinel")
+
+
 def _dispatch(internal_job_id: int) -> JobDispatch:
     """Build one valid private dispatch.
 
@@ -186,6 +216,11 @@ def test_reconciler_cli_emits_lifecycle_logs() -> None:
         from types import SimpleNamespace
 
         from textify.jobs import reconciler
+        from textify.logging import (
+            LogServiceRole,
+            configure_structured_logging,
+        )
+
 
 
         class Repository:
@@ -227,6 +262,10 @@ def test_reconciler_cli_emits_lifecycle_logs() -> None:
 
         stop_event = asyncio.Event()
         reconciler.AppConfig = lambda: SimpleNamespace(log_level="INFO")
+        reconciler.configure_logging = lambda level: configure_structured_logging(
+            LogServiceRole.RECONCILER,
+            level,
+        )
         reconciler.run_reconciler = run_reconciler
         reconciler.main()
         """
@@ -240,16 +279,12 @@ def test_reconciler_cli_emits_lifecycle_logs() -> None:
     )
 
     assert completed.returncode == 0
-    lifecycle_messages = (
-        "starting transcription job reconciler",
-        "transcription job reconciler is ready",
-        "stopping transcription job reconciler",
-    )
-    for message in lifecycle_messages:
-        assert completed.stderr.count(message) == 1
-    assert [
-        completed.stderr.index(message) for message in lifecycle_messages
-    ] == sorted(completed.stderr.index(message) for message in lifecycle_messages)
+    rendered_events = [json.loads(line) for line in completed.stderr.splitlines()]
+    assert [event["event"] for event in rendered_events] == [
+        "service_starting",
+        "service_ready",
+        "service_stopping",
+    ]
 
 
 @pytest.mark.asyncio
@@ -321,10 +356,11 @@ async def test_reconciler_drains_due_dispatch_batches() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reconciler_releases_unpublished_suffix_when_broker_is_unavailable() -> (
-    None
-):
+async def test_reconciler_releases_unpublished_suffix_when_broker_is_unavailable(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """Release the failed and unattempted lease suffix after a broker failure."""
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
     first_dispatch, second_dispatch, third_dispatch = (
         _dispatch(3),
         _dispatch(8),
@@ -349,6 +385,16 @@ async def test_reconciler_releases_unpublished_suffix_when_broker_is_unavailable
     assert repository.released_dispatches == [
         ((second_dispatch, third_dispatch), repository.lease_requests[0][0])
     ]
+    rendered_event = json.loads(capsys.readouterr().err)
+    assert {
+        field_name: rendered_event[field_name]
+        for field_name in ("event", "internal_job_id", "code")
+    } == {
+        "event": "job_dispatch_unavailable",
+        "internal_job_id": second_dispatch.internal_job_id,
+        "code": "transcription_job_dispatch_broker_is_unavailable",
+    }
+    assert str(second_dispatch.execution_attempt_token) not in str(rendered_event)
 
 
 @pytest.mark.asyncio
@@ -368,6 +414,81 @@ async def test_reconciler_leaves_lease_after_post_publication_store_failure() ->
 
     assert publisher.dispatches == [dispatch]
     assert repository.released_dispatches == []
+
+
+@pytest.mark.asyncio
+async def test_reconciler_logs_store_failure_then_retries_to_readiness(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Retain retries while omitting private store-failure context."""
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
+    stop_event = asyncio.Event()
+    repository = StoreFailureThenSuccessRepository()
+    reporter = RecordingServiceHeartbeat(stop_event)
+    reconciler = TranscriptionJobReconciler(
+        repository,
+        RecordingPublisher(),
+        policy=ReconcilerPolicy(interval=timedelta(milliseconds=1)),
+    )
+
+    await reconciler.run(stop_event, reporter)  # type: ignore[arg-type]
+
+    assert reporter.pulse_calls == 1
+    rendered_events = [
+        json.loads(line) for line in capsys.readouterr().err.splitlines()
+    ]
+    failure_events = [
+        event for event in rendered_events if event["event"] == "job_store_unavailable"
+    ]
+    assert len(failure_events) == 1
+    rendered_event = failure_events[0]
+    assert {
+        field_name: rendered_event[field_name] for field_name in ("event", "code")
+    } == {
+        "event": "job_store_unavailable",
+        "code": "transcription_job_storage_is_unavailable_to_reconciler",
+    }
+    assert "internal_job_id" not in rendered_event
+    assert "postgresql-url-sentinel" not in str(rendered_event)
+
+
+@pytest.mark.asyncio
+async def test_reconciler_logs_readiness_store_failure(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Retain heartbeat shutdown when readiness storage rejects a refresh."""
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
+    stop_event = asyncio.Event()
+    reporter = FailingServiceHeartbeat(stop_event)
+    reconciler = TranscriptionJobReconciler(
+        RecordingDispatchRepository(()),
+        RecordingPublisher(),
+        policy=ReconcilerPolicy(interval=timedelta(milliseconds=1)),
+    )
+
+    await reconciler.run(stop_event, reporter)  # type: ignore[arg-type]
+
+    assert reporter.stop_calls == 1
+    rendered_events = [
+        json.loads(line) for line in capsys.readouterr().err.splitlines()
+    ]
+    failure_events = [
+        event
+        for event in rendered_events
+        if event["event"] == "service_readiness_failed"
+    ]
+    assert len(failure_events) == 1
+    rendered_event = failure_events[0]
+    assert {
+        field_name: rendered_event[field_name]
+        for field_name in ("event", "stage", "code")
+    } == {
+        "event": "service_readiness_failed",
+        "stage": "readiness",
+        "code": "reconciler_service_readiness_storage_is_unavailable",
+    }
+    assert "internal_job_id" not in rendered_event
+    assert "readiness-error-sentinel" not in str(rendered_event)
 
 
 @pytest.mark.asyncio

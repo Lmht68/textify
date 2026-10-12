@@ -1,6 +1,7 @@
 """Tests for the private Celery threads worker runtime."""
 
 import asyncio
+import json
 import subprocess
 import sys
 import textwrap
@@ -16,13 +17,17 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from textify.jobs.celery_app import create_celery_app
 from textify.jobs.config import JobConfig, JobDispatchConfig
-from textify.jobs.contracts import TranscriptionJobExecutionRepository
+from textify.jobs.contracts import (
+    TranscriptionJobExecutionRepository,
+    TranscriptionJobStoreUnavailableError,
+)
 from textify.jobs.types import JobDispatch
 from textify.jobs.worker import (
     _DispatchProcessor,
     _ExecutionResources,
     _ShutdownExecutor,
 )
+from textify.logging import LogServiceRole, configure_structured_logging
 from textify.transcription.config import TranscriptionConfig
 from textify.transcription.service import TranscriptionAdapters
 
@@ -43,38 +48,60 @@ class RecordingProcessor:
         self.dispatches.append(dispatch)
 
 
+class StoreUnavailableProcessor(RecordingProcessor):
+    """Raise a private durable-store failure after receiving one dispatch."""
+
+    async def process(self, dispatch: JobDispatch) -> None:
+        """Record the dispatch and signal an unavailable Transcription Job store."""
+        await super().process(dispatch)
+        raise TranscriptionJobStoreUnavailableError("postgresql-url-sentinel")
+
+
+class UnexpectedFailureProcessor(RecordingProcessor):
+    """Raise a private processor failure after receiving one dispatch."""
+
+    async def process(self, dispatch: JobDispatch) -> None:
+        """Record the dispatch and signal a provider failure."""
+        await super().process(dispatch)
+        raise RuntimeError("provider-detail-sentinel")
+
+
 class ShutdownExecutor:
     """Record worker-owned executor shutdown."""
 
-    def __init__(self, lifecycle_events: list[str] | None = None) -> None:
-        """Initialize shutdown observation state.
-
-        Args:
-            lifecycle_events: Optional ordered lifecycle event sink.
-        """
+    def __init__(
+        self,
+        lifecycle_events: list[str] | None = None,
+        shutdown_error: Exception | None = None,
+    ) -> None:
+        """Initialize shutdown observation and optional cleanup failure."""
         self.shutdown_calls = 0
         self._lifecycle_events = lifecycle_events
+        self._shutdown_error = shutdown_error
 
     async def shutdown(self) -> None:
         """Record one worker lifecycle shutdown."""
         self.shutdown_calls += 1
         if self._lifecycle_events is not None:
             self._lifecycle_events.append("executor_shutdown")
+        if self._shutdown_error is not None:
+            raise self._shutdown_error
 
 
 class RecordingClaimManager:
     """Record claim-manager lifecycle calls on the worker-owned event loop."""
 
-    def __init__(self, lifecycle_events: list[str] | None = None) -> None:
-        """Initialize lifecycle observations.
-
-        Args:
-            lifecycle_events: Optional ordered lifecycle event sink.
-        """
+    def __init__(
+        self,
+        lifecycle_events: list[str] | None = None,
+        shutdown_error: OSError | RuntimeError | None = None,
+    ) -> None:
+        """Initialize lifecycle observations and an optional cleanup failure."""
         self.start_calls = 0
         self.shutdown_calls = 0
         self.admission_closed = threading.Event()
         self._lifecycle_events = lifecycle_events
+        self._shutdown_error = shutdown_error
 
     async def start(self) -> None:
         """Record heartbeat monitor startup."""
@@ -93,40 +120,46 @@ class RecordingClaimManager:
         self.shutdown_calls += 1
         if self._lifecycle_events is not None:
             self._lifecycle_events.append("claim_manager_shutdown")
+        if self._shutdown_error is not None:
+            raise self._shutdown_error
 
 
 class RecordingEngine:
     """Record disposal on the worker-owned event loop."""
 
-    def __init__(self, lifecycle_events: list[str] | None = None) -> None:
-        """Initialize disposal observations.
-
-        Args:
-            lifecycle_events: Optional ordered lifecycle event sink.
-        """
+    def __init__(
+        self,
+        lifecycle_events: list[str] | None = None,
+        dispose_error: Exception | None = None,
+    ) -> None:
+        """Initialize disposal observation and an optional cleanup failure."""
         self.dispose_calls = 0
         self._lifecycle_events = lifecycle_events
+        self._dispose_error = dispose_error
 
     async def dispose(self) -> None:
         """Record one connection-pool disposal."""
         self.dispose_calls += 1
         if self._lifecycle_events is not None:
             self._lifecycle_events.append("engine_dispose")
+        if self._dispose_error is not None:
+            raise self._dispose_error
 
 
 class RecordingGpuOwnership:
     """Record GPU ownership lifecycle calls without taking external locks."""
 
-    def __init__(self, lifecycle_events: list[str] | None = None) -> None:
-        """Initialize unacquired ownership state.
-
-        Args:
-            lifecycle_events: Optional ordered lifecycle event sink.
-        """
+    def __init__(
+        self,
+        lifecycle_events: list[str] | None = None,
+        release_error: Exception | None = None,
+    ) -> None:
+        """Initialize unacquired ownership state and an optional cleanup failure."""
         self.acquire_calls = 0
         self.release_calls = 0
         self._ready = False
         self._lifecycle_events = lifecycle_events
+        self._release_error = release_error
 
     @property
     def is_ready(self) -> bool:
@@ -161,6 +194,8 @@ class RecordingGpuOwnership:
         self._ready = False
         if self._lifecycle_events is not None:
             self._lifecycle_events.append("gpu_release")
+        if self._release_error is not None:
+            raise self._release_error
 
 
 class RecordingServiceHeartbeat:
@@ -170,10 +205,12 @@ class RecordingServiceHeartbeat:
         self,
         lifecycle_events: list[str] | None = None,
         start_error: RuntimeError | None = None,
+        stop_error: OSError | RuntimeError | None = None,
     ) -> None:
-        """Initialize optional lifecycle logging and startup failure."""
+        """Initialize lifecycle logging and optional startup or cleanup failures."""
         self._lifecycle_events = lifecycle_events
         self._start_error = start_error
+        self._stop_error = stop_error
         self.start_calls = 0
         self.stop_calls = 0
         self.stopped = threading.Event()
@@ -196,6 +233,8 @@ class RecordingServiceHeartbeat:
         self.stopped.set()
         if self._lifecycle_events is not None:
             self._lifecycle_events.append("heartbeat_stop")
+        if self._stop_error is not None:
+            raise self._stop_error
 
 
 def _execution_resources(
@@ -237,6 +276,11 @@ def test_worker_cli_emits_safe_lifecycle_logs() -> None:
         from textify.jobs import worker
         from textify.jobs.celery_app import TRANSCRIPTION_TASK
         from textify.jobs.types import JobDispatch
+        from textify.logging import (
+            LogServiceRole,
+            configure_structured_logging,
+        )
+
 
 
         class ClaimManager:
@@ -324,6 +368,10 @@ def test_worker_cli_emits_safe_lifecycle_logs() -> None:
 
 
         worker.AppConfig = lambda: SimpleNamespace(log_level="INFO")
+        worker.configure_logging = lambda level: configure_structured_logging(
+            LogServiceRole.GPU_WORKER,
+            level,
+        )
         worker.JobConfig = lambda: SimpleNamespace(
             database_url="postgresql+asyncpg://test:test@localhost/test",
         )
@@ -349,20 +397,24 @@ def test_worker_cli_emits_safe_lifecycle_logs() -> None:
     )
 
     assert completed.returncode == 0
-    for message in (
-        "starting transcription worker",
-        "transcription worker is ready",
-        "processing transcription job dispatch",
-        "finished processing transcription job dispatch",
-        "stopping transcription worker",
-    ):
-        assert message in completed.stderr
+    rendered_events = [json.loads(line) for line in completed.stderr.splitlines()]
+    assert [event["event"] for event in rendered_events] == [
+        "service_starting",
+        "service_ready",
+        "service_stopping",
+    ]
+    assert "processing transcription job dispatch" not in completed.stderr
+    assert "finished processing transcription job dispatch" not in completed.stderr
     assert "00000000-0000-4000-8000-000000000001" not in completed.stderr
 
 
-def test_worker_runtime_processes_only_valid_payloads_on_one_loop() -> None:
+def test_worker_runtime_processes_only_valid_payloads_on_one_loop(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """Reject malformed delivery without provider work and reuse one loop for valid work."""
     from textify.jobs.worker import TranscriptionWorkerRuntime
+
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
 
     processor = RecordingProcessor()
     executor = ShutdownExecutor()
@@ -381,7 +433,11 @@ def test_worker_runtime_processes_only_valid_payloads_on_one_loop() -> None:
     runtime.start()
     try:
         runtime.process_payload(
-            {"internal_job_id": True, "execution_attempt_token": "x"}
+            {
+                "internal_job_id": True,
+                "execution_attempt_token": "execution-attempt-token-sentinel",
+                "payload": "payload-sentinel",
+            }
         )
         runtime.process_payload(first_dispatch.to_payload())
         runtime.process_payload(second_dispatch.to_payload())
@@ -393,6 +449,100 @@ def test_worker_runtime_processes_only_valid_payloads_on_one_loop() -> None:
     assert claim_manager.shutdown_calls == 1
     assert executor.shutdown_calls == 1
     assert engine.dispose_calls == 1
+    rendered_output = capsys.readouterr().err
+    rendered_event = json.loads(rendered_output)
+    assert {
+        field_name: rendered_event[field_name] for field_name in ("event", "code")
+    } == {
+        "event": "malformed_job_dispatch_rejected",
+        "code": "rejected_malformed_transcription_job_dispatch",
+    }
+    for sensitive_value in (
+        "execution-attempt-token-sentinel",
+        "payload-sentinel",
+    ):
+        assert sensitive_value not in rendered_output
+
+
+def test_worker_runtime_logs_safe_store_failure(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Map one valid dispatch's store failure without exposing its token or URL."""
+    from textify.jobs.worker import TranscriptionWorkerRuntime
+
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
+    dispatch = JobDispatch(41, uuid4())
+    processor = StoreUnavailableProcessor()
+    runtime = TranscriptionWorkerRuntime(
+        lambda: _execution_resources(processor, ShutdownExecutor()),
+        RecordingClaimManager(),
+        RecordingGpuOwnership(),
+        RecordingEngine(),
+    )
+
+    runtime.start()
+    try:
+        runtime.process_payload(dispatch.to_payload())
+    finally:
+        runtime.shutdown()
+
+    assert processor.dispatches == [dispatch]
+    rendered_output = capsys.readouterr().err
+    rendered_event = json.loads(rendered_output)
+    assert {
+        field_name: rendered_event[field_name]
+        for field_name in ("event", "internal_job_id", "code")
+    } == {
+        "event": "job_store_unavailable",
+        "internal_job_id": 41,
+        "code": "transcription_job_storage_is_unavailable_to_worker",
+    }
+    for sensitive_value in (
+        str(dispatch.execution_attempt_token),
+        "postgresql-url-sentinel",
+    ):
+        assert sensitive_value not in rendered_output
+
+
+def test_worker_runtime_logs_safe_unexpected_processor_failure(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Map one valid dispatch's private processor failure to an internal error."""
+    from textify.jobs.worker import TranscriptionWorkerRuntime
+
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
+    dispatch = JobDispatch(43, uuid4())
+    processor = UnexpectedFailureProcessor()
+    runtime = TranscriptionWorkerRuntime(
+        lambda: _execution_resources(processor, ShutdownExecutor()),
+        RecordingClaimManager(),
+        RecordingGpuOwnership(),
+        RecordingEngine(),
+    )
+
+    runtime.start()
+    try:
+        runtime.process_payload(dispatch.to_payload())
+    finally:
+        runtime.shutdown()
+
+    assert processor.dispatches == [dispatch]
+    rendered_output = capsys.readouterr().err
+    rendered_event = json.loads(rendered_output)
+    assert {
+        field_name: rendered_event[field_name]
+        for field_name in ("event", "internal_job_id", "code")
+    } == {
+        "event": "transcription_job_processing_failed",
+        "internal_job_id": 43,
+        "code": "internal_error",
+    }
+    for sensitive_value in (
+        str(dispatch.execution_attempt_token),
+        "provider-detail-sentinel",
+        "Traceback",
+    ):
+        assert sensitive_value not in rendered_output
 
 
 def test_worker_runtime_starts_and_stops_resources_in_gpu_safe_order(
@@ -649,6 +799,101 @@ def test_worker_runtime_rolls_back_claims_and_heartbeat_start_failure() -> None:
     ]
 
 
+def test_worker_runtime_logs_safe_failures_during_startup_rollback(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Preserve the startup error while reporting each rollback cleanup failure."""
+    from textify.jobs.worker import TranscriptionWorkerRuntime
+
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
+    lifecycle_events: list[str] = []
+    heartbeat = RecordingServiceHeartbeat(
+        lifecycle_events,
+        start_error=RuntimeError("startup-error-sentinel"),
+        stop_error=OSError("heartbeat-cleanup-sentinel"),
+    )
+    runtime = TranscriptionWorkerRuntime(
+        lambda: _execution_resources(
+            RecordingProcessor(),
+            ShutdownExecutor(
+                lifecycle_events,
+                shutdown_error=RuntimeError("executor-cleanup-sentinel"),
+            ),
+            heartbeat,
+        ),
+        RecordingClaimManager(
+            lifecycle_events,
+            shutdown_error=RuntimeError("claim-manager-cleanup-sentinel"),
+        ),
+        RecordingGpuOwnership(
+            lifecycle_events,
+            release_error=RuntimeError("gpu-cleanup-sentinel"),
+        ),
+        RecordingEngine(
+            lifecycle_events,
+            dispose_error=RuntimeError("engine-cleanup-sentinel"),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match=r"^startup-error-sentinel$"):
+        runtime.start()
+
+    assert lifecycle_events == [
+        "gpu_acquire",
+        "gpu_model_ready",
+        "claim_manager_start",
+        "heartbeat_start",
+        "heartbeat_stop",
+        "gpu_model_not_ready",
+        "claim_manager_stop_accepting",
+        "claim_manager_shutdown",
+        "executor_shutdown",
+        "gpu_release",
+        "engine_dispose",
+    ]
+    rendered_output = capsys.readouterr().err
+    rendered_events = [json.loads(line) for line in rendered_output.splitlines()]
+    assert [
+        (event["event"], event["stage"], event["code"]) for event in rendered_events
+    ] == [
+        (
+            "service_readiness_failed",
+            "cleanup",
+            "worker_service_heartbeat_startup_cleanup_failed",
+        ),
+        (
+            "resource_cleanup_failed",
+            "cleanup",
+            "worker_claim_manager_startup_cleanup_failed",
+        ),
+        (
+            "resource_cleanup_failed",
+            "cleanup",
+            "transcription_executor_startup_cleanup_failed",
+        ),
+        (
+            "gpu_ownership_failed",
+            "cleanup",
+            "gpu_ownership_startup_cleanup_failed",
+        ),
+        (
+            "resource_cleanup_failed",
+            "cleanup",
+            "worker_engine_startup_cleanup_failed",
+        ),
+    ]
+    for sensitive_value in (
+        "startup-error-sentinel",
+        "heartbeat-cleanup-sentinel",
+        "claim-manager-cleanup-sentinel",
+        "executor-cleanup-sentinel",
+        "gpu-cleanup-sentinel",
+        "engine-cleanup-sentinel",
+        "Traceback",
+    ):
+        assert sensitive_value not in rendered_output
+
+
 def test_worker_runtime_rolls_back_ownership_when_resource_construction_fails() -> None:
     """Release startup ownership without opening claim admission after a model failure."""
     from textify.jobs.worker import TranscriptionWorkerRuntime
@@ -683,11 +928,13 @@ def test_worker_runtime_rolls_back_ownership_when_resource_construction_fails() 
     ]
 
 
-def test_worker_runtime_rejects_payloads_before_runtime_or_ownership_readiness() -> (
-    None
-):
+def test_worker_runtime_rejects_payloads_before_runtime_or_ownership_readiness(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """Do not schedule valid private payloads until both readiness gates are true."""
     from textify.jobs.worker import TranscriptionWorkerRuntime
+
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
 
     processor = RecordingProcessor()
     gpu_ownership = RecordingGpuOwnership()
@@ -697,7 +944,8 @@ def test_worker_runtime_rejects_payloads_before_runtime_or_ownership_readiness()
         gpu_ownership,
         RecordingEngine(),
     )
-    payload = JobDispatch(1, uuid4()).to_payload()
+    dispatch = JobDispatch(1, uuid4())
+    payload = dispatch.to_payload()
 
     runtime.process_payload(payload)
     runtime.start()
@@ -708,6 +956,24 @@ def test_worker_runtime_rejects_payloads_before_runtime_or_ownership_readiness()
         runtime.shutdown()
 
     assert processor.dispatches == []
+    rendered_output = capsys.readouterr().err
+    rendered_events = [json.loads(line) for line in rendered_output.splitlines()]
+    assert [
+        (event["event"], event["internal_job_id"], event["code"])
+        for event in rendered_events
+    ] == [
+        (
+            "worker_runtime_unavailable",
+            1,
+            "transcription_worker_runtime_is_unavailable",
+        ),
+        (
+            "worker_runtime_unavailable",
+            1,
+            "transcription_worker_runtime_is_unavailable",
+        ),
+    ]
+    assert str(dispatch.execution_attempt_token) not in rendered_output
 
 
 def test_registered_task_is_unbound_and_forwards_one_json_payload() -> None:

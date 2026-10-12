@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import timedelta
 from typing import cast
@@ -14,7 +15,8 @@ from redis.exceptions import RedisError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from textify.jobs.readiness import ServiceRole
+from textify.jobs.readiness import ServiceReadinessUnavailableError, ServiceRole
+from textify.logging import LogServiceRole, configure_structured_logging
 
 
 class RecordingHeartbeatRepository:
@@ -27,8 +29,18 @@ class RecordingHeartbeatRepository:
         self.first_recorded = asyncio.Event()
         self.periodic_recorded = asyncio.Event()
 
+        self.record_error: ServiceReadinessUnavailableError | None = None
+        self.delete_error: ServiceReadinessUnavailableError | None = None
+        self.refresh_attempted = asyncio.Event()
+
     async def record_ready(self, role: ServiceRole, instance_id: UUID) -> None:
-        """Record one ready heartbeat."""
+        """Record one ready heartbeat or raise a controlled storage failure."""
+        if self.recorded:
+            self.refresh_attempted.set()
+        if self.record_error is not None:
+            record_error = self.record_error
+            self.record_error = None
+            raise record_error
         self.recorded.append((role, instance_id))
         if len(self.recorded) == 1:
             self.first_recorded.set()
@@ -36,8 +48,12 @@ class RecordingHeartbeatRepository:
             self.periodic_recorded.set()
 
     async def delete(self, role: ServiceRole, instance_id: UUID) -> None:
-        """Record removal of one ready heartbeat."""
+        """Record one removal or raise a controlled storage failure."""
         self.deleted.append((role, instance_id))
+        if self.delete_error is not None:
+            delete_error = self.delete_error
+            self.delete_error = None
+            raise delete_error
 
     async def fresh_roles(self, freshness: timedelta) -> frozenset[ServiceRole]:
         """Return no roles because this fake is only used by reporter tests."""
@@ -213,11 +229,13 @@ async def test_postgres_heartbeat_repository_uses_database_time_for_freshness(
     )
 
 
-async def test_heartbeat_reporter_writes_periodically_and_removes_its_exact_instance() -> (
-    None
-):
+async def test_heartbeat_reporter_writes_periodically_and_removes_its_exact_instance(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """Report one ready process until its readiness probe becomes false."""
     from textify.jobs.readiness import ServiceHeartbeatReporter, ServiceRole
+
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
 
     repository = RecordingHeartbeatRepository()
     probe_ready = True
@@ -250,6 +268,55 @@ async def test_heartbeat_reporter_writes_periodically_and_removes_its_exact_inst
     role, instance_id = repository.deleted[0]
     assert role is ServiceRole.GPU_WORKER
     assert instance_id.version == 4
+    assert capsys.readouterr().err == ""
+
+
+async def test_heartbeat_reporter_logs_safe_refresh_and_cleanup_failures(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Emit only fixed readiness diagnostics for heartbeat storage failures."""
+    from textify.jobs.readiness import ServiceHeartbeatReporter
+
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
+    repository = RecordingHeartbeatRepository()
+
+    async def readiness_probe() -> bool:
+        """Keep periodic readiness prerequisites available."""
+        return True
+
+    reporter = ServiceHeartbeatReporter(
+        repository,
+        ServiceRole.GPU_WORKER,
+        refresh_interval=timedelta(milliseconds=1),
+        readiness_probe=readiness_probe,
+    )
+    await reporter.start()
+    repository.record_error = ServiceReadinessUnavailableError("refresh-error-sentinel")
+    await asyncio.wait_for(repository.refresh_attempted.wait(), timeout=1)
+    repository.delete_error = ServiceReadinessUnavailableError(
+        "deletion-error-sentinel"
+    )
+    await reporter.stop()
+
+    rendered_events = [
+        json.loads(line) for line in capsys.readouterr().err.splitlines()
+    ]
+    assert [
+        (event["event"], event["stage"], event["code"]) for event in rendered_events
+    ] == [
+        (
+            "service_readiness_failed",
+            "readiness",
+            "service_readiness_heartbeat_refresh_failed",
+        ),
+        (
+            "service_readiness_failed",
+            "cleanup",
+            "service_readiness_heartbeat_deletion_failed",
+        ),
+    ]
+    for sensitive_value in ("refresh-error-sentinel", "deletion-error-sentinel"):
+        assert sensitive_value not in str(rendered_events)
 
 
 async def test_heartbeat_reporter_rejects_unready_initial_prerequisites() -> None:
@@ -305,10 +372,13 @@ def test_heartbeat_reporter_requires_a_positive_matched_periodic_policy(
 
 async def test_redis_broker_readiness_uses_one_broker_client_and_hides_failures(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Probe only the configured Celery broker with PING and close it once."""
     from textify.jobs import readiness
     from textify.jobs.config import JobDispatchConfig
+
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
 
     client = RecordingRedisClient()
     broker_url = "redis://broker.example:6379/15"
@@ -321,12 +391,23 @@ async def test_redis_broker_readiness_uses_one_broker_client_and_hides_failures(
     )
 
     assert await broker.is_ready() is True
-    client.ping_error = RedisError("connection refused")
+    client.ping_error = RedisError("broker-error-sentinel")
     assert await broker.is_ready() is False
     await broker.aclose()
 
     assert client.ping_calls == 2
     assert client.close_calls == 1
+    rendered_event = json.loads(capsys.readouterr().err)
+    assert {
+        field_name: rendered_event[field_name]
+        for field_name in ("event", "stage", "code")
+    } == {
+        "event": "service_readiness_failed",
+        "stage": "readiness",
+        "code": "broker_readiness_probe_failed",
+    }
+    assert broker_url not in str(rendered_event)
+    assert "broker-error-sentinel" not in str(rendered_event)
 
 
 @pytest.mark.parametrize(

@@ -12,6 +12,7 @@ from uuid import UUID
 import pytest
 
 from textify.logging import (
+    LogCode,
     LogEvent,
     LogServiceRole,
     StructuredLogFields,
@@ -128,6 +129,30 @@ def test_legacy_logging_formats_migrated_inspection_event(
     assert "legacy-url-sentinel" not in rendered_output
 
 
+def test_legacy_logging_formats_migrated_job_diagnostic(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Retain the safe key-value envelope for a registered job diagnostic."""
+    configure_logging("INFO")
+
+    emit_event(
+        logging.getLogger("textify.test_logging"),
+        LogEvent.JOB_STORE_UNAVAILABLE,
+        internal_job_id=73,
+        code=LogCode.TRANSCRIPTION_JOB_STORAGE_IS_UNAVAILABLE_TO_WORKER.value,
+    )
+
+    rendered_output = capsys.readouterr().err
+    rendered_fields = rendered_output.split(
+        "] transcription job storage is unavailable ", maxsplit=1
+    )[1].split()
+    assert set(rendered_fields) == {
+        "code=transcription_job_storage_is_unavailable_to_worker",
+        "internal_job_id=73",
+    }
+    assert "execution-attempt-token-sentinel" not in rendered_output
+
+
 def test_celery_setup_preserves_safe_textify_logging() -> None:
     """Keep Celery records and private execution tokens out of rendered output."""
     child_program = textwrap.dedent(
@@ -136,9 +161,14 @@ def test_celery_setup_preserves_safe_textify_logging() -> None:
 
         from textify.jobs.celery_app import create_celery_app
         from textify.jobs.config import JobDispatchConfig
-        from textify.logging import configure_logging
+        from textify.logging import (
+            LogEvent,
+            LogServiceRole,
+            configure_structured_logging,
+            emit_event,
+        )
 
-        configure_logging("INFO")
+        configure_structured_logging(LogServiceRole.GPU_WORKER, "INFO")
         celery_app = create_celery_app(
             JobDispatchConfig(
                 broker_url="redis://127.0.0.1:6379/15",
@@ -150,7 +180,7 @@ def test_celery_setup_preserves_safe_textify_logging() -> None:
             "celery-message-sentinel execution-attempt-token-sentinel",
             extra={"execution_attempt_token": "execution-attempt-token-sentinel"},
         )
-        logging.getLogger("textify.test").info("textify-message-sentinel")
+        emit_event(logging.getLogger("textify.test"), LogEvent.SERVICE_READY)
         """
     )
 
@@ -162,7 +192,9 @@ def test_celery_setup_preserves_safe_textify_logging() -> None:
     )
 
     assert completed.returncode == 0
-    assert "textify-message-sentinel" in completed.stderr
+    rendered_events = [json.loads(line) for line in completed.stderr.splitlines()]
+    assert [event["event"] for event in rendered_events] == ["service_ready"]
+    assert rendered_events[0]["service_role"] == "gpu_worker"
     assert "celery-message-sentinel" not in completed.stderr
     assert "execution-attempt-token-sentinel" not in completed.stderr
 

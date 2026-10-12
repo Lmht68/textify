@@ -36,7 +36,7 @@ from textify.jobs.readiness import (
 )
 from textify.jobs.repository import PostgresTranscriptionJobRepository
 from textify.jobs.service import utc_now
-from textify.logging import configure_logging
+from textify.logging import LogCode, LogEvent, configure_logging, emit_event
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +116,14 @@ class TranscriptionJobReconciler:
                 try:
                     await self._publisher.publish(dispatch)
                 except JobDispatchUnavailableError:
-                    logger.error("transcription job dispatch broker is unavailable")
+                    emit_event(
+                        logger,
+                        LogEvent.JOB_DISPATCH_UNAVAILABLE,
+                        internal_job_id=dispatch.internal_job_id,
+                        code=(
+                            LogCode.TRANSCRIPTION_JOB_DISPATCH_BROKER_IS_UNAVAILABLE.value
+                        ),
+                    )
                     await self._repository.release_dispatch_leases(
                         dispatches[index:],
                         self._lease_owner,
@@ -162,7 +169,7 @@ class TranscriptionJobReconciler:
             heartbeat: Reconciler service-readiness lifecycle.
         """
         await heartbeat.start()
-        logger.info("transcription job reconciler is ready")
+        emit_event(logger, LogEvent.SERVICE_READY)
         next_cleanup_at = time.monotonic()
         try:
             while not stop_event.is_set():
@@ -177,11 +184,22 @@ class TranscriptionJobReconciler:
                     if reconciliation_succeeded:
                         await heartbeat.pulse()
                 except TranscriptionJobStoreUnavailableError:
-                    logger.error(
-                        "transcription job storage is unavailable to reconciler"
+                    emit_event(
+                        logger,
+                        LogEvent.JOB_STORE_UNAVAILABLE,
+                        code=(
+                            LogCode.TRANSCRIPTION_JOB_STORAGE_IS_UNAVAILABLE_TO_RECONCILER.value
+                        ),
                     )
                 except ServiceReadinessUnavailableError:
-                    logger.error("reconciler service readiness storage is unavailable")
+                    emit_event(
+                        logger,
+                        LogEvent.SERVICE_READINESS_FAILED,
+                        stage="readiness",
+                        code=(
+                            LogCode.RECONCILER_SERVICE_READINESS_STORAGE_IS_UNAVAILABLE.value
+                        ),
+                    )
                 try:
                     async with asyncio.timeout(self._policy.interval.total_seconds()):
                         await stop_event.wait()
@@ -243,8 +261,8 @@ def main() -> None:
     """Start the dedicated Transcription Job reconciler process."""
     app_config = AppConfig()
     configure_logging(app_config.log_level)
-    logger.info("starting transcription job reconciler")
+    emit_event(logger, LogEvent.SERVICE_STARTING)
     try:
         asyncio.run(run_reconciler())
     finally:
-        logger.info("stopping transcription job reconciler")
+        emit_event(logger, LogEvent.SERVICE_STOPPING)

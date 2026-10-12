@@ -46,7 +46,7 @@ from textify.jobs.readiness import (
 from textify.jobs.repository import PostgresTranscriptionJobRepository
 from textify.jobs.service import utc_now
 from textify.jobs.types import JobDispatch
-from textify.logging import configure_logging
+from textify.logging import LogCode, LogEvent, configure_logging, emit_event
 from textify.transcription.config import TranscriptionConfig
 from textify.transcription.service import (
     TranscriptionAdaptersFactory,
@@ -319,15 +319,23 @@ class TranscriptionWorkerRuntime:
         """
         dispatch = JobDispatch.from_payload(payload)
         if dispatch is None:
-            logger.warning("rejected malformed transcription job dispatch")
+            emit_event(
+                logger,
+                LogEvent.MALFORMED_JOB_DISPATCH_REJECTED,
+                code=LogCode.REJECTED_MALFORMED_TRANSCRIPTION_JOB_DISPATCH.value,
+            )
             return
         with self._state_lock:
             loop = self._loop if self._started and self._runtime_ready else None
             processor = self._processor
         if loop is None or processor is None or not self._gpu_ownership.is_ready:
-            logger.error("transcription worker runtime is unavailable")
+            emit_event(
+                logger,
+                LogEvent.WORKER_RUNTIME_UNAVAILABLE,
+                internal_job_id=dispatch.internal_job_id,
+                code=LogCode.TRANSCRIPTION_WORKER_RUNTIME_IS_UNAVAILABLE.value,
+            )
             return
-        logger.info("processing transcription job dispatch")
         try:
             future = asyncio.run_coroutine_threadsafe(
                 processor.process(dispatch),
@@ -335,14 +343,19 @@ class TranscriptionWorkerRuntime:
             )
             future.result()
         except TranscriptionJobStoreUnavailableError:
-            logger.error("transcription job storage is unavailable to worker")
-        except Exception:  # noqa: BLE001
-            logger.error(
-                "transcription job task failed",
-                extra={"code": InternalError.code},
+            emit_event(
+                logger,
+                LogEvent.JOB_STORE_UNAVAILABLE,
+                internal_job_id=dispatch.internal_job_id,
+                code=(LogCode.TRANSCRIPTION_JOB_STORAGE_IS_UNAVAILABLE_TO_WORKER.value),
             )
-        else:
-            logger.info("finished processing transcription job dispatch")
+        except Exception:  # noqa: BLE001
+            emit_event(
+                logger,
+                LogEvent.TRANSCRIPTION_JOB_PROCESSING_FAILED,
+                internal_job_id=dispatch.internal_job_id,
+                code=InternalError.code,
+            )
 
     def stop_claiming(self) -> None:
         """Close worker admission and remove readiness from any Celery thread."""
@@ -402,14 +415,24 @@ class TranscriptionWorkerRuntime:
         try:
             await self._stop_service_heartbeat()
         except (OSError, RuntimeError):
-            logger.error("worker service heartbeat startup cleanup failed")
+            emit_event(
+                logger,
+                LogEvent.SERVICE_READINESS_FAILED,
+                stage="cleanup",
+                code=LogCode.WORKER_SERVICE_HEARTBEAT_STARTUP_CLEANUP_FAILED.value,
+            )
         self._gpu_ownership.mark_model_not_ready()
         if self._claim_monitoring_started:
             self._claim_manager.stop_accepting()
             try:
                 await self._claim_manager.shutdown()
             except (OSError, RuntimeError):
-                logger.error("worker claim manager startup cleanup failed")
+                emit_event(
+                    logger,
+                    LogEvent.RESOURCE_CLEANUP_FAILED,
+                    stage="cleanup",
+                    code=LogCode.WORKER_CLAIM_MANAGER_STARTUP_CLEANUP_FAILED.value,
+                )
             self._claim_monitoring_started = False
         executor = self._executor
         self._processor = None
@@ -419,15 +442,30 @@ class TranscriptionWorkerRuntime:
             try:
                 await executor.shutdown()
             except Exception:  # noqa: BLE001
-                logger.error("transcription executor startup cleanup failed")
+                emit_event(
+                    logger,
+                    LogEvent.RESOURCE_CLEANUP_FAILED,
+                    stage="cleanup",
+                    code=LogCode.TRANSCRIPTION_EXECUTOR_STARTUP_CLEANUP_FAILED.value,
+                )
         try:
             await self._gpu_ownership.release()
         except Exception:  # noqa: BLE001
-            logger.error("GPU ownership startup cleanup failed")
+            emit_event(
+                logger,
+                LogEvent.GPU_OWNERSHIP_FAILED,
+                stage="cleanup",
+                code=LogCode.GPU_OWNERSHIP_STARTUP_CLEANUP_FAILED.value,
+            )
         try:
             await self._engine.dispose()
         except Exception:  # noqa: BLE001
-            logger.error("worker engine startup cleanup failed")
+            emit_event(
+                logger,
+                LogEvent.RESOURCE_CLEANUP_FAILED,
+                stage="cleanup",
+                code=LogCode.WORKER_ENGINE_STARTUP_CLEANUP_FAILED.value,
+            )
 
     async def _shutdown_resources(self) -> None:
         """Drain owned resources on the same loop that used them."""
@@ -679,7 +717,7 @@ def main() -> None:
     """Start one dedicated threads-pool Transcription Job worker process."""
     app_config = AppConfig()
     configure_logging(app_config.log_level)
-    logger.info("starting transcription worker")
+    emit_event(logger, LogEvent.SERVICE_STARTING)
     job_config = JobConfig()  # type: ignore[call-arg]
     dispatch_config = JobDispatchConfig()  # type: ignore[call-arg]
     cache_config = CacheConfig()
@@ -698,7 +736,7 @@ def main() -> None:
             )
         )
         runtime.start()
-        logger.info("transcription worker is ready")
+        emit_event(logger, LogEvent.SERVICE_READY)
         shutdown_receiver = _connect_worker_shutdown_signal(runtime)
         celery_app = create_celery_app(dispatch_config)
         register_transcription_task(celery_app, runtime)
@@ -712,7 +750,7 @@ def main() -> None:
             ]
         )
     finally:
-        logger.info("stopping transcription worker")
+        emit_event(logger, LogEvent.SERVICE_STOPPING)
         if shutdown_receiver is not None:
             _disconnect_worker_shutdown_signal(shutdown_receiver)
         if runtime is None:

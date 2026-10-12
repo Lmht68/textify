@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import timedelta
 from uuid import UUID, uuid4
 
@@ -16,6 +17,7 @@ from textify.jobs.types import (
     ExecutionClaim,
     JobDispatch,
 )
+from textify.logging import LogServiceRole, configure_structured_logging
 from textify.transcription.service import TranscriptionExecutionControl
 
 
@@ -192,11 +194,12 @@ async def test_claim_manager_propagates_durable_cancellation_to_both_controls() 
 
 
 @pytest.mark.asyncio
-async def test_claim_manager_retries_storage_interruption_without_guessing_state() -> (
-    None
-):
-    """Retry the next scheduled batch when PostgreSQL heartbeat storage is unavailable."""
+async def test_claim_manager_retries_storage_interruption_without_guessing_state(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Retry a failed heartbeat without logging claim-private state."""
     repository = ClaimManagerRepository()
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
     repository.heartbeat_failures_remaining = 1
     manager = _manager(repository, max_active_claims=1)
     control = TranscriptionExecutionControl()
@@ -214,6 +217,17 @@ async def test_claim_manager_retries_storage_interruption_without_guessing_state
     assert claimed_job is not None
     assert not control.cancellation_requested.is_set()
     assert all(batch == (claimed_job.claim,) for batch in repository.heartbeat_batches)
+    rendered_event = json.loads(capsys.readouterr().err)
+    assert rendered_event["event"] == "job_store_unavailable"
+    assert (
+        rendered_event["code"]
+        == "transcription_job_storage_is_unavailable_to_claim_monitor"
+    )
+    assert "internal_job_id" not in rendered_event
+    assert str(claimed_job.claim.worker_owner) not in str(rendered_event)
+    assert str(claimed_job.claim.dispatch.execution_attempt_token) not in str(
+        rendered_event
+    )
 
 
 @pytest.mark.asyncio

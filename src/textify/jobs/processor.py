@@ -7,6 +7,7 @@ from typing import Protocol
 
 from textify.errors import InternalError
 from textify.jobs.types import ClaimedTranscriptionJob, ExecutionClaim, JobDispatch
+from textify.logging import LogEvent, emit_event
 from textify.transcription import inspection
 from textify.transcription.exceptions import (
     TranscriptionCancellationRequestedError,
@@ -125,8 +126,11 @@ class TranscriptionJobProcessor:
             if control.cancellation_requested.is_set():
                 await self._publish_cancelled_after_cleanup(claimed_job, control)
                 return
-            logger.error(
-                "transcription job processor failed", extra={"code": error.code}
+            emit_event(
+                logger,
+                LogEvent.TRANSCRIPTION_JOB_PROCESSING_FAILED,
+                internal_job_id=claimed_job.claim.dispatch.internal_job_id,
+                code=error.code,
             )
             await self._publish_failure_or_cancelled(
                 claimed_job,
@@ -138,9 +142,11 @@ class TranscriptionJobProcessor:
             if control.cancellation_requested.is_set():
                 await self._publish_cancelled_after_cleanup(claimed_job, control)
                 return
-            logger.error(
-                "transcription job processor failed",
-                extra={"code": InternalError.code},
+            emit_event(
+                logger,
+                LogEvent.TRANSCRIPTION_JOB_PROCESSING_FAILED,
+                internal_job_id=claimed_job.claim.dispatch.internal_job_id,
+                code=InternalError.code,
             )
             await self._publish_failure_or_cancelled(
                 claimed_job,
@@ -161,9 +167,11 @@ class TranscriptionJobProcessor:
                 if control.cancellation_requested.is_set():
                     await self._publish_cancelled_after_cleanup(claimed_job, control)
                     return
-                logger.error(
-                    "transcription job processor failed",
-                    extra={"code": InternalError.code},
+                emit_event(
+                    logger,
+                    LogEvent.TRANSCRIPTION_JOB_PROCESSING_FAILED,
+                    internal_job_id=claimed_job.claim.dispatch.internal_job_id,
+                    code=InternalError.code,
                 )
                 await self._publish_failure_or_cancelled(
                     claimed_job,

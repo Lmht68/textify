@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from textify.jobs.config import JobDispatchConfig
 from textify.jobs.database import verify_application_database
 from textify.jobs.repository import metadata
+from textify.logging import LogCode, LogEvent, emit_event
 
 logger = logging.getLogger(__name__)
 
@@ -309,7 +310,12 @@ class ServiceHeartbeatReporter:
                 if not await self._pulse_once():
                     return
             except (OSError, RuntimeError, ServiceReadinessUnavailableError):
-                logger.error("service readiness heartbeat refresh failed")
+                emit_event(
+                    logger,
+                    LogEvent.SERVICE_READINESS_FAILED,
+                    stage="readiness",
+                    code=LogCode.SERVICE_READINESS_HEARTBEAT_REFRESH_FAILED.value,
+                )
 
     async def _pulse_once(self) -> bool:
         """Write once when prerequisites pass and remove the row otherwise."""
@@ -328,7 +334,12 @@ class ServiceHeartbeatReporter:
             await self._repository.delete(self._role, self._instance_id)
         except ServiceReadinessUnavailableError:
             if log_failures:
-                logger.error("service readiness heartbeat deletion failed")
+                emit_event(
+                    logger,
+                    LogEvent.SERVICE_READINESS_FAILED,
+                    stage="cleanup",
+                    code=LogCode.SERVICE_READINESS_HEARTBEAT_DELETION_FAILED.value,
+                )
             return
         self._row_may_exist = False
 
@@ -380,7 +391,12 @@ class RedisBrokerReadiness:
             async with asyncio.timeout(1):
                 return bool(await self._client.ping())
         except (TimeoutError, OSError, RedisError):
-            logger.error("broker readiness probe failed")
+            emit_event(
+                logger,
+                LogEvent.SERVICE_READINESS_FAILED,
+                stage="readiness",
+                code=LogCode.BROKER_READINESS_PROBE_FAILED.value,
+            )
             return False
 
     async def aclose(self) -> None:

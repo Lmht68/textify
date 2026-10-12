@@ -277,6 +277,54 @@ class LogEvent(StrEnum):
     SERVICE_READINESS_FAILED = "service_readiness_failed"
 
 
+class LogCode(StrEnum):
+    """Identify a fixed safe code for job-infrastructure diagnostics."""
+
+    TRANSCRIPTION_JOB_STORAGE_IS_UNAVAILABLE_TO_CLAIM_MONITOR = (
+        "transcription_job_storage_is_unavailable_to_claim_monitor"
+    )
+    TRANSCRIPTION_JOB_DISPATCH_BROKER_IS_UNAVAILABLE = (
+        "transcription_job_dispatch_broker_is_unavailable"
+    )
+    TRANSCRIPTION_JOB_STORAGE_IS_UNAVAILABLE_TO_RECONCILER = (
+        "transcription_job_storage_is_unavailable_to_reconciler"
+    )
+    RECONCILER_SERVICE_READINESS_STORAGE_IS_UNAVAILABLE = (
+        "reconciler_service_readiness_storage_is_unavailable"
+    )
+    REJECTED_MALFORMED_TRANSCRIPTION_JOB_DISPATCH = (
+        "rejected_malformed_transcription_job_dispatch"
+    )
+    TRANSCRIPTION_WORKER_RUNTIME_IS_UNAVAILABLE = (
+        "transcription_worker_runtime_is_unavailable"
+    )
+    TRANSCRIPTION_JOB_STORAGE_IS_UNAVAILABLE_TO_WORKER = (
+        "transcription_job_storage_is_unavailable_to_worker"
+    )
+    GPU_OWNERSHIP_CONNECTION_CLOSE_FAILED = "gpu_ownership_connection_close_failed"
+    GPU_OWNERSHIP_CONNECTION_INVALIDATION_FAILED = (
+        "gpu_ownership_connection_invalidation_failed"
+    )
+    SERVICE_READINESS_HEARTBEAT_REFRESH_FAILED = (
+        "service_readiness_heartbeat_refresh_failed"
+    )
+    SERVICE_READINESS_HEARTBEAT_DELETION_FAILED = (
+        "service_readiness_heartbeat_deletion_failed"
+    )
+    BROKER_READINESS_PROBE_FAILED = "broker_readiness_probe_failed"
+    WORKER_SERVICE_HEARTBEAT_STARTUP_CLEANUP_FAILED = (
+        "worker_service_heartbeat_startup_cleanup_failed"
+    )
+    WORKER_CLAIM_MANAGER_STARTUP_CLEANUP_FAILED = (
+        "worker_claim_manager_startup_cleanup_failed"
+    )
+    TRANSCRIPTION_EXECUTOR_STARTUP_CLEANUP_FAILED = (
+        "transcription_executor_startup_cleanup_failed"
+    )
+    GPU_OWNERSHIP_STARTUP_CLEANUP_FAILED = "gpu_ownership_startup_cleanup_failed"
+    WORKER_ENGINE_STARTUP_CLEANUP_FAILED = "worker_engine_startup_cleanup_failed"
+
+
 class StructuredLogFields(TypedDict, total=False):
     """Contain the optional fields allowed on a registered event."""
 

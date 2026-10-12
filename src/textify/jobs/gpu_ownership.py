@@ -14,6 +14,8 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from textify.logging import LogCode, LogEvent, emit_event
+
 logger = logging.getLogger(__name__)
 
 _LOCK_NAMESPACE = b"textify:gpu-ownership:v1:"
@@ -199,7 +201,12 @@ class GpuModelOwnership:
                     try:
                         await connection.close()
                     except (OSError, SQLAlchemyError):
-                        logger.error("GPU ownership connection close failed")
+                        emit_event(
+                            logger,
+                            LogEvent.GPU_OWNERSHIP_FAILED,
+                            stage="cleanup",
+                            code=LogCode.GPU_OWNERSHIP_CONNECTION_CLOSE_FAILED.value,
+                        )
             self._release_host_lock()
 
     def _create_host_lock_path(self) -> Path:
@@ -230,14 +237,24 @@ class GpuModelOwnership:
         try:
             await connection.close()
         except (OSError, SQLAlchemyError):
-            logger.error("GPU ownership connection close failed")
+            emit_event(
+                logger,
+                LogEvent.GPU_OWNERSHIP_FAILED,
+                stage="cleanup",
+                code=LogCode.GPU_OWNERSHIP_CONNECTION_CLOSE_FAILED.value,
+            )
 
     async def _invalidate_connection(self, connection: AsyncConnection) -> None:
         """Invalidate a failed retained database session without exposing its URL."""
         try:
             await connection.invalidate()
         except (OSError, SQLAlchemyError):
-            logger.error("GPU ownership connection invalidation failed")
+            emit_event(
+                logger,
+                LogEvent.GPU_OWNERSHIP_FAILED,
+                stage="cleanup",
+                code=LogCode.GPU_OWNERSHIP_CONNECTION_INVALIDATION_FAILED.value,
+            )
 
     def _release_host_lock(self) -> None:
         """Unlock and close the retained descriptor without removing its pathname."""
