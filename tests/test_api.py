@@ -470,7 +470,6 @@ def test_api_main_bootstraps_json_logging_before_configured_debug_level() -> Non
     assert [event["event"] for event in rendered_events] == [
         "service_starting",
         "source_inspection_failed",
-        "service_stopping",
     ]
     assert rendered_events[1]["level"] == "DEBUG"
     assert {event["service_role"] for event in rendered_events} == {"api"}
