@@ -336,7 +336,7 @@ class StructuredLogFields(TypedDict, total=False):
     method: str
     duration_seconds: int
     elapsed_seconds: int | float
-    code: str
+    code: str | None
     job_status: str
     job_outcome: str
     http_status_code: int

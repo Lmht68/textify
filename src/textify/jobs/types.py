@@ -155,6 +155,22 @@ class CancelledTranscriptionJob:
 
 
 @dataclass(frozen=True, slots=True)
+class TranscriptionJobCancellationResult:
+    """Hold one committed Cancellation result for application orchestration.
+
+    Attributes:
+        internal_job_id: Private authoritative identifier of the Transcription Job.
+        job: Safe Processing or cancelled Transcription Job projection after commit.
+        first_accepted: Whether this transaction committed the first Cancellation
+            transition instead of observing one already accepted.
+    """
+
+    internal_job_id: int
+    job: ProcessingTranscriptionJob | CancelledTranscriptionJob
+    first_accepted: bool
+
+
+@dataclass(frozen=True, slots=True)
 class SucceededTranscriptionJob:
     """Hold the safe persisted projection of a successful finished job."""
 

@@ -7,15 +7,14 @@ from typing import Protocol
 from uuid import UUID
 
 from textify.jobs.types import (
-    CancelledTranscriptionJob,
     ClaimedTranscriptionJob,
     ClaimHeartbeat,
     ExecutionClaim,
     JobDispatch,
     NewQueuedTranscriptionJob,
-    ProcessingTranscriptionJob,
     QueuedTranscriptionJob,
     TranscriptionJob,
+    TranscriptionJobCancellationResult,
 )
 from textify.transcription.schemas import TranscriptionResponse
 
@@ -70,14 +69,16 @@ class TranscriptionJobApiRepository(Protocol):
     async def request_cancellation(
         self,
         public_id: UUID,
-    ) -> ProcessingTranscriptionJob | CancelledTranscriptionJob | None:
+    ) -> TranscriptionJobCancellationResult | None:
         """Durably request cancellation of one Transcription Job.
 
         Args:
             public_id: Canonical UUIDv4 public capability.
 
         Returns:
-            Processing or cancelled snapshot, or ``None`` when no visible job exists.
+            Committed Cancellation result, or ``None`` when no visible job exists.
+            ``first_accepted`` is true only when this transaction committed the first
+            Cancellation transition rather than observing an existing one.
 
         Raises:
             TranscriptionJobAlreadyFinishedError: If the job has another terminal

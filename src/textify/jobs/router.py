@@ -298,7 +298,7 @@ async def cancel_transcription_job(
         Current processing or cancelled terminal representation for the capability.
     """
     await _require_empty_request_body(request)
-    job = await service.cancel(job_id)
+    job = (await service.cancel(job_id)).job
     if isinstance(job, ProcessingTranscriptionJob):
         response.status_code = status.HTTP_202_ACCEPTED
         response.headers["Retry-After"] = "2"

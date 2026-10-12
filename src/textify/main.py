@@ -16,6 +16,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from textify.config import AppConfig
 from textify.errors import (
+    InternalError,
     TextifyError,
     request_validation_error_handler,
     textify_error_handler,
@@ -42,13 +43,21 @@ from textify.jobs.router import router as transcription_job_router
 from textify.jobs.service import TranscriptionJobService, utc_now
 from textify.logging import (
     LogEvent,
-    configure_logging,
+    LogServiceRole,
+    StructuredLogFields,
+    configure_structured_logging,
     emit_event,
     request_log_context,
 )
 from textify.ops import router as operations_router
 
 logger = logging.getLogger(__name__)
+
+
+def _matched_http_route(scope: Scope) -> str | None:
+    """Return the router-provided template without deriving a raw request path."""
+    path_format = getattr(scope.get("route"), "path_format", None)
+    return path_format if isinstance(path_format, str) and path_format else None
 
 
 class _RequestObservabilityMiddleware:
@@ -94,24 +103,32 @@ class _RequestObservabilityMiddleware:
                 response_status_code = message["status"]
             await send(message)
 
+        def emit_terminal_event(event: LogEvent, *, code: str | None = None) -> None:
+            """Emit one safe terminal event from the observed ASGI response state."""
+            fields: StructuredLogFields = {
+                "stage": "request",
+                "http_method": http_method,
+                "elapsed_seconds": max(0.0, time.monotonic() - request_started_at),
+            }
+            if response_started and response_status_code is not None:
+                fields["http_status_code"] = response_status_code
+            http_route = _matched_http_route(scope)
+            if http_route is not None:
+                fields["http_route"] = http_route
+            fields["code"] = code
+            emit_event(logger, event, **fields)
+
         with request_log_context(request_id):
             try:
                 await self._app(scope, receive, send_with_request_id)
             except asyncio.CancelledError:
-                if not response_started:
-                    emit_event(
-                        logger,
-                        LogEvent.REQUEST_INTERRUPTED,
-                        stage="request",
-                        http_method=http_method,
-                        elapsed_seconds=max(
-                            0.0,
-                            time.monotonic() - request_started_at,
-                        ),
-                    )
+                emit_terminal_event(LogEvent.REQUEST_INTERRUPTED)
                 raise
             except Exception as exc:
                 if response_started:
+                    emit_terminal_event(
+                        LogEvent.REQUEST_FAILED, code=InternalError.code
+                    )
                     raise
                 response = await unhandled_error_handler(
                     Request(scope, receive=receive),
@@ -119,18 +136,8 @@ class _RequestObservabilityMiddleware:
                 )
                 await response(scope, receive, send_with_request_id)
 
-            if response_started and response_status_code is not None:
-                emit_event(
-                    logger,
-                    LogEvent.REQUEST_COMPLETED,
-                    stage="request",
-                    http_method=http_method,
-                    http_status_code=response_status_code,
-                    elapsed_seconds=max(
-                        0.0,
-                        time.monotonic() - request_started_at,
-                    ),
-                )
+            if response_started:
+                emit_terminal_event(LogEvent.REQUEST_COMPLETED)
 
 
 def create_app(
@@ -160,22 +167,37 @@ def create_app(
         """Create durable admission and aggregate readiness state before traffic."""
         application.state.ready = False
         application.state.readiness = None
-        resolved_app_config = app_config if app_config is not None else AppConfig()
-        resolved_job_config = (
-            job_config if job_config is not None else JobConfig()  # type: ignore[call-arg]
-        )
-        resolved_dispatch_config = (
-            dispatch_config if dispatch_config is not None else JobDispatchConfig()  # type: ignore[call-arg]
-        )
-        resolved_cache_config = (
-            cache_config if cache_config is not None else CacheConfig()
-        )
-        validate_redis_role_isolation(resolved_dispatch_config, resolved_cache_config)
-
-        configure_logging(resolved_app_config.log_level)
-        engine = create_application_engine(str(resolved_job_config.database_url))
+        application.state.observability_stage = "startup"
+        application.state.observability_failure_stage = None
         broker_readiness: RedisBrokerReadiness | None = None
+        engine = None
+
+        async def close_resources() -> None:
+            """Close readiness resources and the application database engine."""
+            application.state.ready = False
+            application.state.readiness = None
+            if broker_readiness is not None:
+                await broker_readiness.aclose()
+            if engine is not None:
+                await engine.dispose()
+
         try:
+            if app_config is None:
+                AppConfig()
+            resolved_job_config = (
+                job_config if job_config is not None else JobConfig()  # type: ignore[call-arg]
+            )
+            resolved_dispatch_config = (
+                dispatch_config if dispatch_config is not None else JobDispatchConfig()  # type: ignore[call-arg]
+            )
+            resolved_cache_config = (
+                cache_config if cache_config is not None else CacheConfig()
+            )
+            validate_redis_role_isolation(
+                resolved_dispatch_config, resolved_cache_config
+            )
+
+            engine = create_application_engine(str(resolved_job_config.database_url))
             await verify_application_database(engine)
             repository = PostgresTranscriptionJobRepository(
                 engine=engine,
@@ -207,16 +229,33 @@ def create_app(
                     seconds=resolved_dispatch_config.service_heartbeat_ttl_seconds
                 ),
             )
-            application.state.ready = True
+        except Exception:
+            application.state.observability_failure_stage = (
+                application.state.observability_stage
+            )
+            await close_resources()
+            raise
+
+        application.state.ready = True
+        emit_event(logger, LogEvent.SERVICE_READY)
+        application.state.observability_stage = "runtime"
+        try:
             try:
                 yield
+            except Exception:
+                application.state.observability_failure_stage = (
+                    application.state.observability_stage
+                )
+                raise
             finally:
-                application.state.ready = False
-        finally:
-            application.state.readiness = None
-            if broker_readiness is not None:
-                await broker_readiness.aclose()
-            await engine.dispose()
+                application.state.observability_stage = "shutdown"
+                await close_resources()
+        except Exception:
+            if application.state.observability_failure_stage is None:
+                application.state.observability_failure_stage = (
+                    application.state.observability_stage
+                )
+            raise
 
     application = FastAPI(
         title="Textify",
@@ -246,6 +285,8 @@ def create_app(
     )
     application.state.ready = False
     application.state.readiness = None
+    application.state.observability_stage = "startup"
+    application.state.observability_failure_stage = None
     application.add_middleware(_RequestObservabilityMiddleware)
     application.add_middleware(TranscriptionJobHeadersMiddleware)
     application.add_exception_handler(TextifyError, textify_error_handler)
@@ -260,13 +301,52 @@ def create_app(
 app = create_app()
 
 
+def _service_failure_stage(fallback: str) -> str:
+    """Return the recorded API failure stage or a safe lifecycle fallback."""
+    failure_stage = getattr(app.state, "observability_failure_stage", None)
+    if isinstance(failure_stage, str) and failure_stage in {
+        "startup",
+        "runtime",
+        "shutdown",
+    }:
+        return failure_stage
+    return fallback
+
+
+def _raise_service_failed(stage: str) -> None:
+    """Emit one safe API process failure event and terminate unsuccessfully."""
+    emit_event(
+        logger,
+        LogEvent.SERVICE_FAILED,
+        stage=stage,
+        code=InternalError.code,
+    )
+    raise SystemExit(1) from None
+
+
 def main() -> None:
     """Start one Textify Uvicorn worker using environment configuration."""
-    config = AppConfig()
-    uvicorn.run(
-        "textify.main:app",
-        host=config.host,
-        port=config.port,
-        workers=1,
-        access_log=False,
-    )
+    configure_structured_logging(LogServiceRole.API)
+    emit_event(logger, LogEvent.SERVICE_STARTING)
+    try:
+        config = AppConfig()
+        configure_structured_logging(LogServiceRole.API, config.log_level)
+        uvicorn.run(
+            app,
+            host=config.host,
+            port=config.port,
+            workers=1,
+            log_config=None,
+            access_log=False,
+        )
+    except SystemExit as exc:
+        if exc.code in {None, 0}:
+            raise
+        _raise_service_failed(_service_failure_stage("startup"))
+    except Exception:  # noqa: BLE001
+        _raise_service_failed(_service_failure_stage("startup"))
+
+    failure_stage = _service_failure_stage("")
+    if failure_stage:
+        _raise_service_failed(failure_stage)
+    emit_event(logger, LogEvent.SERVICE_STOPPING)

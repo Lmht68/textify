@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -18,6 +19,7 @@ from textify.jobs.database import create_application_engine
 from textify.jobs.dispatch import CeleryJobDispatchPublisher
 from textify.jobs.reconciler import TranscriptionJobReconciler
 from textify.jobs.repository import PostgresTranscriptionJobRepository
+from textify.logging import LogServiceRole, configure_structured_logging
 from textify.main import create_app
 from textify.transcription.schemas import TranscriptionResponse
 from textify.transcription.types import Platform, TranscriptMethod
@@ -178,6 +180,69 @@ async def test_api_cancels_queued_job_without_worker_dependencies(
     assert cancellation.json()["status"] == "finished"
     assert cancellation.json()["outcome"] == "cancelled"
     assert status.json()["outcome"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_api_emits_correlated_committed_job_lifecycle_events(
+    capsys: pytest.CaptureFixture[str],
+    migrated_postgresql_database_url: str,
+) -> None:
+    """Emit admission and first Cancellation lifecycle events without bearer data."""
+    submitted_url = f"{_TIKTOK_URL}?submitted-url-sentinel"
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
+
+    async with _client_for(migrated_postgresql_database_url) as client:
+        capsys.readouterr()
+        submission = await client.post(
+            "/api/transcription-jobs",
+            json={"url": submitted_url},
+        )
+        cancellation = await client.put(
+            f"{submission.headers['Location']}/cancellation",
+        )
+        repeated_cancellation = await client.put(
+            f"{submission.headers['Location']}/cancellation",
+        )
+
+    assert submission.status_code == 202
+    assert cancellation.status_code == 200
+    assert cancellation.json()["status"] == "finished"
+    assert cancellation.json()["outcome"] == "cancelled"
+    assert repeated_cancellation.status_code == 200
+    assert repeated_cancellation.json() == cancellation.json()
+
+    rendered_output = capsys.readouterr().err
+    rendered_events = [json.loads(line) for line in rendered_output.splitlines()]
+    lifecycle_events = [
+        event
+        for event in rendered_events
+        if event["event"].startswith("transcription_job_")
+    ]
+    assert [event["event"] for event in lifecycle_events] == [
+        "transcription_job_admitted",
+        "transcription_job_cancellation_accepted",
+        "transcription_job_finished",
+    ]
+    assert lifecycle_events[0]["request_id"] == submission.headers["X-Request-ID"]
+    assert lifecycle_events[1]["request_id"] == cancellation.headers["X-Request-ID"]
+    assert lifecycle_events[2]["request_id"] == cancellation.headers["X-Request-ID"]
+    assert lifecycle_events[0]["job_status"] == "queued"
+    assert lifecycle_events[1]["job_status"] == "finished"
+    assert lifecycle_events[1]["job_outcome"] == "cancelled"
+    assert lifecycle_events[2]["job_status"] == "finished"
+    assert lifecycle_events[2]["job_outcome"] == "cancelled"
+    assert type(lifecycle_events[0]["internal_job_id"]) is int
+    assert lifecycle_events[0]["internal_job_id"] > 0
+    assert (
+        lifecycle_events[1]["internal_job_id"] == lifecycle_events[0]["internal_job_id"]
+    )
+    assert (
+        lifecycle_events[2]["internal_job_id"] == lifecycle_events[0]["internal_job_id"]
+    )
+    assert submitted_url not in rendered_output
+    assert submission.headers["Location"] not in rendered_output
+    assert submission.json()["id"] not in rendered_output
+    assert f"{submission.headers['Location']}/cancellation" not in rendered_output
 
 
 @pytest.mark.asyncio

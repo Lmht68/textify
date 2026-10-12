@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
 from uuid import UUID
@@ -22,13 +23,15 @@ from textify.jobs.exceptions import (
 from textify.jobs.types import (
     CancelledTranscriptionJob,
     NewQueuedTranscriptionJob,
-    ProcessingTranscriptionJob,
     QueuedTranscriptionJob,
     TranscriptionJob,
+    TranscriptionJobCancellationResult,
 )
-from textify.logging import bind_request_log_fields
+from textify.logging import LogEvent, bind_request_log_fields, emit_event
 from textify.transcription import inspection
 from textify.transcription.types import ResponseFieldPath
+
+logger = logging.getLogger(__name__)
 
 
 def utc_now() -> datetime:
@@ -102,6 +105,12 @@ class TranscriptionJobService:
         except TranscriptionJobStoreUnavailableError as exc:
             await self._mark_store_unavailable()
             raise JobStoreUnavailableError() from exc
+        emit_event(
+            logger,
+            LogEvent.TRANSCRIPTION_JOB_ADMITTED,
+            internal_job_id=queued_job.internal_id,
+            job_status=queued_job.status.value,
+        )
         return queued_job
 
     async def get_status(self, capability: str) -> TranscriptionJob:
@@ -132,15 +141,15 @@ class TranscriptionJobService:
     async def cancel(
         self,
         capability: str,
-    ) -> ProcessingTranscriptionJob | CancelledTranscriptionJob:
+    ) -> TranscriptionJobCancellationResult:
         """Accept cancellation through one canonical Transcription Job capability.
 
         Args:
             capability: Opaque client-supplied bearer capability path value.
 
         Returns:
-            Current processing snapshot after durable acceptance, or the stable
-            cancelled terminal snapshot.
+            Committed Cancellation result whose ``first_accepted`` field identifies
+            whether this transaction made the first Cancellation transition.
 
         Raises:
             JobNotFoundError: If the capability is malformed, noncanonical, or unknown.
@@ -159,6 +168,30 @@ class TranscriptionJobService:
             raise JobStoreUnavailableError() from exc
         if cancellation is None:
             raise JobNotFoundError()
+        if cancellation.first_accepted:
+            job = cancellation.job
+            if isinstance(job, CancelledTranscriptionJob):
+                emit_event(
+                    logger,
+                    LogEvent.TRANSCRIPTION_JOB_CANCELLATION_ACCEPTED,
+                    internal_job_id=cancellation.internal_job_id,
+                    job_status=job.status.value,
+                    job_outcome=job.outcome.value,
+                )
+                emit_event(
+                    logger,
+                    LogEvent.TRANSCRIPTION_JOB_FINISHED,
+                    internal_job_id=cancellation.internal_job_id,
+                    job_status=job.status.value,
+                    job_outcome=job.outcome.value,
+                )
+            else:
+                emit_event(
+                    logger,
+                    LogEvent.TRANSCRIPTION_JOB_CANCELLATION_ACCEPTED,
+                    internal_job_id=cancellation.internal_job_id,
+                    job_status=job.status.value,
+                )
         return cancellation
 
 

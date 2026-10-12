@@ -62,6 +62,7 @@ from textify.jobs.types import (
     QueuedTranscriptionJob,
     SucceededTranscriptionJob,
     TranscriptionJob,
+    TranscriptionJobCancellationResult,
 )
 from textify.transcription.schemas import TranscriptionResponse
 from textify.transcription.types import ResponseFieldPath
@@ -1199,15 +1200,16 @@ class PostgresTranscriptionJobRepository:
     async def request_cancellation(
         self,
         public_id: UUID,
-    ) -> ProcessingTranscriptionJob | CancelledTranscriptionJob | None:
+    ) -> TranscriptionJobCancellationResult | None:
         """Durably accept one cancellation through its public capability.
 
         Args:
             public_id: Canonical UUIDv4 capability supplied by the coordinator.
 
         Returns:
-            Processing or cancelled snapshot, or ``None`` when the capability is
-            unknown.
+            Committed Cancellation result, or ``None`` when the capability is
+            unknown. ``first_accepted`` is true only when this transaction committed
+            the first Cancellation transition rather than observing an existing one.
 
         Raises:
             TranscriptionJobAlreadyFinishedError: If the job has a non-cancelled
@@ -1235,9 +1237,9 @@ class PostgresTranscriptionJobRepository:
                 if _terminal_job_is_expired(job_row, cutoff):
                     return None
 
+                internal_id = _internal_id_from_row(job_row)
                 status = job_row["status"]
                 if status == "queued":
-                    internal_id = _internal_id_from_row(job_row)
                     transition = await connection.execute(
                         update(transcription_job)
                         .where(
@@ -1267,11 +1269,14 @@ class PostgresTranscriptionJobRepository:
                     )
                     if cancelled_row is None:
                         raise TranscriptionJobStoreUnavailableError()
-                    return _cancelled_job_from_row(cancelled_row)
+                    return TranscriptionJobCancellationResult(
+                        internal_job_id=internal_id,
+                        job=_cancelled_job_from_row(cancelled_row),
+                        first_accepted=True,
+                    )
 
                 if status == "processing":
-                    internal_id = _internal_id_from_row(job_row)
-                    await connection.execute(
+                    transition = await connection.execute(
                         update(transcription_job)
                         .where(
                             transcription_job.c.id == internal_id,
@@ -1280,6 +1285,8 @@ class PostgresTranscriptionJobRepository:
                         )
                         .values(cancellation_requested=True)
                     )
+                    if transition.rowcount not in {0, 1}:
+                        raise TranscriptionJobStoreUnavailableError()
                     processing_row = (
                         (
                             await connection.execute(
@@ -1293,12 +1300,20 @@ class PostgresTranscriptionJobRepository:
                     )
                     if processing_row is None:
                         raise TranscriptionJobStoreUnavailableError()
-                    return _processing_job_from_row(processing_row)
+                    return TranscriptionJobCancellationResult(
+                        internal_job_id=internal_id,
+                        job=_processing_job_from_row(processing_row),
+                        first_accepted=transition.rowcount == 1,
+                    )
 
                 if status != "finished":
                     raise TranscriptionJobStoreUnavailableError()
                 if job_row["outcome"] == "cancelled":
-                    return _cancelled_job_from_row(job_row)
+                    return TranscriptionJobCancellationResult(
+                        internal_job_id=internal_id,
+                        job=_cancelled_job_from_row(job_row),
+                        first_accepted=False,
+                    )
                 if job_row["outcome"] in {"succeeded", "failed"}:
                     raise TranscriptionJobAlreadyFinishedError()
                 raise TranscriptionJobStoreUnavailableError()

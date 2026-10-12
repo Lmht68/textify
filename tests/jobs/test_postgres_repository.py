@@ -378,7 +378,8 @@ async def test_postgres_cancellation_and_timeout_unblock_the_next_fifo_dispatch(
     finally:
         await engine.dispose()
 
-    assert isinstance(cancelled, CancelledTranscriptionJob)
+    assert cancelled is not None
+    assert isinstance(cancelled.job, CancelledTranscriptionJob)
     assert cancellation_successor_claim is not None
     assert cancellation_dispatches[1].internal_job_id == (
         cancellation_successor.internal_id
@@ -387,6 +388,61 @@ async def test_postgres_cancellation_and_timeout_unblock_the_next_fifo_dispatch(
     assert timeout_successor_dispatch.internal_job_id == timeout_successor.internal_id
     assert timeout_claim is None
     assert timeout_successor_claim is not None
+
+
+async def test_postgres_cancellation_result_reports_committed_first_acceptance(
+    migrated_postgresql_database_url: str,
+) -> None:
+    """Return the authoritative identifier, projection, and first acceptance state."""
+    clock = [_INITIAL]
+    repository, engine = _repository(
+        migrated_postgresql_database_url,
+        maximum_outstanding_jobs=2,
+        clock=clock,
+    )
+    try:
+        queued_job = await repository.create_queued(_queued_job("queued-cancelled"))
+        queued_cancellation = await repository.request_cancellation(
+            queued_job.public_id
+        )
+
+        processing_job = await repository.create_queued(
+            _queued_job("processing-cancelled")
+        )
+        processing_dispatch = (await _lease_due_dispatches(repository))[0]
+        processing_claim = await _claim_dispatch(repository, processing_dispatch)
+        assert processing_claim is not None
+        first_processing_cancellation = await repository.request_cancellation(
+            processing_job.public_id
+        )
+        repeated_processing_cancellation = await repository.request_cancellation(
+            processing_job.public_id
+        )
+        assert await repository.publish_cancelled(processing_claim.claim)
+        terminal_cancellation = await repository.request_cancellation(
+            processing_job.public_id
+        )
+    finally:
+        await engine.dispose()
+
+    assert queued_cancellation is not None
+    assert queued_cancellation.internal_job_id == queued_job.internal_id
+    assert queued_cancellation.first_accepted is True
+    assert isinstance(queued_cancellation.job, CancelledTranscriptionJob)
+    assert first_processing_cancellation is not None
+    assert first_processing_cancellation.internal_job_id == processing_job.internal_id
+    assert first_processing_cancellation.first_accepted is True
+    assert isinstance(first_processing_cancellation.job, ProcessingTranscriptionJob)
+    assert repeated_processing_cancellation is not None
+    assert (
+        repeated_processing_cancellation.internal_job_id == processing_job.internal_id
+    )
+    assert repeated_processing_cancellation.first_accepted is False
+    assert isinstance(repeated_processing_cancellation.job, ProcessingTranscriptionJob)
+    assert terminal_cancellation is not None
+    assert terminal_cancellation.internal_job_id == processing_job.internal_id
+    assert terminal_cancellation.first_accepted is False
+    assert isinstance(terminal_cancellation.job, CancelledTranscriptionJob)
 
 
 async def test_postgres_leases_due_dispatches_and_recovers_after_redispatch(
@@ -489,10 +545,9 @@ async def test_postgres_lifecycle_transitions_prevent_future_dispatch_leases(
         cancelled_job = await repository.create_queued(_queued_job("cancelled"))
         cancelled_dispatch = (await _lease_due_dispatches(repository))[0]
         assert cancelled_dispatch.internal_job_id == cancelled_job.internal_id
-        assert isinstance(
-            await repository.request_cancellation(cancelled_job.public_id),
-            CancelledTranscriptionJob,
-        )
+        cancellation = await repository.request_cancellation(cancelled_job.public_id)
+        assert cancellation is not None
+        assert isinstance(cancellation.job, CancelledTranscriptionJob)
         cancelled_leases = await _lease_due_dispatches(repository)
 
         timeout_job = await repository.create_queued(_queued_job("timeout"))
@@ -758,7 +813,8 @@ async def test_postgres_terminal_publication_requires_claim_token(
         )
         assert cancellation_claim is not None
         cancellation = await repository.request_cancellation(cancellation_job.public_id)
-        assert isinstance(cancellation, ProcessingTranscriptionJob)
+        assert cancellation is not None
+        assert isinstance(cancellation.job, ProcessingTranscriptionJob)
         wrong_cancellation_dispatch = JobDispatch(
             internal_job_id=cancellation_dispatch.internal_job_id,
             execution_attempt_token=uuid4(),
@@ -819,7 +875,8 @@ async def test_postgres_heartbeats_exact_worker_claims_and_polls_cancellation(
         )
 
         cancellation = await repository.request_cancellation(second_job.public_id)
-        assert isinstance(cancellation, ProcessingTranscriptionJob)
+        assert cancellation is not None
+        assert isinstance(cancellation.job, ProcessingTranscriptionJob)
         clock[0] += timedelta(seconds=1)
         heartbeats = await repository.heartbeat_claims(
             (first_claim.claim, second_claim.claim),
@@ -863,7 +920,8 @@ async def test_postgres_expired_claims_reject_terminal_writes_and_recover_once(
         assert interrupted_claim is not None
         assert cancelled_claim is not None
         cancellation = await repository.request_cancellation(cancelled_job.public_id)
-        assert isinstance(cancellation, ProcessingTranscriptionJob)
+        assert cancellation is not None
+        assert isinstance(cancellation.job, ProcessingTranscriptionJob)
 
         clock[0] += lease_duration
         assert (
@@ -943,8 +1001,9 @@ async def test_postgres_cancellation_blocks_competing_success_publication(
         cancellation = await cancellation_repository.request_cancellation(
             queued_job.public_id
         )
-        assert isinstance(cancellation, ProcessingTranscriptionJob)
-        assert cancellation.public_id == queued_job.public_id
+        assert cancellation is not None
+        assert isinstance(cancellation.job, ProcessingTranscriptionJob)
+        assert cancellation.job.public_id == queued_job.public_id
 
         success_published, cancellation_published = await asyncio.gather(
             execution_repository.publish_success(
@@ -988,7 +1047,8 @@ async def test_postgres_cancellation_blocks_competing_failure_publication(
         cancellation = await cancellation_repository.request_cancellation(
             queued_job.public_id
         )
-        assert isinstance(cancellation, ProcessingTranscriptionJob)
+        assert cancellation is not None
+        assert isinstance(cancellation.job, ProcessingTranscriptionJob)
 
         failure_published, cancellation_published = await asyncio.gather(
             execution_repository.publish_failure(
