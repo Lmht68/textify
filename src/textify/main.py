@@ -250,6 +250,7 @@ def create_app(
             finally:
                 application.state.observability_stage = "shutdown"
                 await close_resources()
+                emit_event(logger, LogEvent.SERVICE_STOPPING)
         except Exception:
             if application.state.observability_failure_stage is None:
                 application.state.observability_failure_stage = (
@@ -338,6 +339,7 @@ def main() -> None:
             workers=1,
             log_config=None,
             access_log=False,
+            timeout_graceful_shutdown=30,
         )
     except SystemExit as exc:
         if exc.code in {None, 0}:
@@ -349,4 +351,3 @@ def main() -> None:
     failure_stage = _service_failure_stage("")
     if failure_stage:
         _raise_service_failed(failure_stage)
-    emit_event(logger, LogEvent.SERVICE_STOPPING)

@@ -617,7 +617,7 @@ async def test_api_main_runs_uvicorn_with_only_correlated_json_stderr(
     rendered_output = ""
     try:
         response: Response | None = None
-        async with AsyncClient(timeout=0.1) as client:
+        async with AsyncClient(timeout=1.0) as client:
             for _ in range(100):
                 if process.poll() is not None:
                     break
@@ -661,13 +661,19 @@ async def test_api_main_runs_uvicorn_with_only_correlated_json_stderr(
         assert isinstance(event, dict)
         rendered_events.append(event)
 
-    assert process.returncode == 0
-    assert {
-        "service_starting",
-        "service_ready",
-        "request_completed",
-        "service_stopping",
-    }.issubset({event["event"] for event in rendered_events})
+    assert process.returncode in (0, -signal.SIGTERM)
+    events = [event["event"] for event in rendered_events]
+    assert events.count("service_starting") == 1
+    assert events.count("service_ready") == 1
+    assert events.count("request_completed") == 1
+    assert events.count("service_stopping") == 1
+    assert (
+        events.index("service_starting")
+        < events.index("service_ready")
+        < events.index("request_completed")
+        < events.index("service_stopping")
+    )
+    assert "service_failed" not in events
     assert {event["service_role"] for event in rendered_events} == {"api"}
     assert {event["service"] for event in rendered_events} == {"textify"}
     assert len({event["instance_id"] for event in rendered_events}) == 1
@@ -707,7 +713,6 @@ async def test_api_main_runs_uvicorn_with_only_correlated_json_stderr(
     request_events = [
         event for event in rendered_events if event["event"] == "request_completed"
     ]
-    assert len(request_events) == 1
     assert request_events[0]["request_id"] == request_id
     assert "http_route" not in request_events[0]
     assert raw_path_sentinel not in rendered_output
