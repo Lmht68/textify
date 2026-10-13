@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import logging
+import os
 import subprocess
 import sys
 import textwrap
@@ -9,7 +11,7 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from celery.signals import worker_shutting_down
@@ -27,7 +29,13 @@ from textify.jobs.worker import (
     _ExecutionResources,
     _ShutdownExecutor,
 )
-from textify.logging import LogServiceRole, configure_structured_logging
+from textify.logging import (
+    LogEvent,
+    LogServiceRole,
+    configure_structured_logging,
+    emit_event,
+    request_log_context,
+)
 from textify.transcription.config import TranscriptionConfig
 from textify.transcription.service import TranscriptionAdapters
 
@@ -64,6 +72,45 @@ class UnexpectedFailureProcessor(RecordingProcessor):
         """Record the dispatch and signal a provider failure."""
         await super().process(dispatch)
         raise RuntimeError("provider-detail-sentinel")
+
+
+class CorrelatedDiagnosticsProcessor(RecordingProcessor):
+    """Emit nested registered diagnostics while processing one Job Dispatch."""
+
+    async def process(self, dispatch: JobDispatch) -> None:
+        """Emit diagnostics from direct, child-task, and thread-offload work.
+
+        Args:
+            dispatch: Validated private execution notification.
+        """
+        await super().process(dispatch)
+        emit_event(
+            logging.getLogger("textify.test_worker"),
+            LogEvent.SOURCE_INSPECTION_FAILED,
+            stage="metadata",
+            code="inspection-error-sentinel",
+        )
+        acquisition_task = asyncio.create_task(self._emit_acquisition_failure())
+        await acquisition_task
+        await asyncio.to_thread(self._emit_cleanup_failure)
+
+    async def _emit_acquisition_failure(self) -> None:
+        """Emit one child-task acquisition diagnostic."""
+        emit_event(
+            logging.getLogger("textify.test_worker"),
+            LogEvent.CAPTION_ACQUISITION_FAILED,
+            stage="captions",
+            code="acquisition-error-sentinel",
+        )
+
+    def _emit_cleanup_failure(self) -> None:
+        """Emit one thread-offloaded cleanup diagnostic."""
+        emit_event(
+            logging.getLogger("textify.test_worker"),
+            LogEvent.RESOURCE_CLEANUP_FAILED,
+            stage="cleanup",
+            code="cleanup-error-sentinel",
+        )
 
 
 class ShutdownExecutor:
@@ -266,21 +313,14 @@ class CapturingRuntime:
         self.payloads.append(payload)
 
 
-def test_worker_cli_emits_safe_lifecycle_logs() -> None:
-    """Report worker startup, dispatch handling, and shutdown without private data."""
+def test_worker_main_bootstraps_json_logging_before_configured_debug_level() -> None:
+    """Emit lifecycle records before applying the configured debug level."""
     child_program = textwrap.dedent(
         """
         from types import SimpleNamespace
-        from uuid import UUID
 
         from textify.jobs import worker
         from textify.jobs.celery_app import TRANSCRIPTION_TASK
-        from textify.jobs.types import JobDispatch
-        from textify.logging import (
-            LogServiceRole,
-            configure_structured_logging,
-        )
-
 
 
         class ClaimManager:
@@ -345,11 +385,12 @@ def test_worker_cli_emits_safe_lifecycle_logs() -> None:
                 return register
 
             def worker_main(self, arguments):
-                self.tasks[TRANSCRIPTION_TASK](
-                    JobDispatch(
-                        1,
-                        UUID("00000000-0000-4000-8000-000000000001"),
-                    ).to_payload()
+                assert TRANSCRIPTION_TASK in self.tasks
+                worker.emit_event(
+                    worker.logger,
+                    worker.LogEvent.SOURCE_INSPECTION_FAILED,
+                    stage="metadata",
+                    code="configured-debug-event",
                 )
 
 
@@ -367,11 +408,7 @@ def test_worker_cli_emits_safe_lifecycle_logs() -> None:
             )
 
 
-        worker.AppConfig = lambda: SimpleNamespace(log_level="INFO")
-        worker.configure_logging = lambda level: configure_structured_logging(
-            LogServiceRole.GPU_WORKER,
-            level,
-        )
+        worker.AppConfig = lambda: SimpleNamespace(log_level="DEBUG")
         worker.JobConfig = lambda: SimpleNamespace(
             database_url="postgresql+asyncpg://test:test@localhost/test",
         )
@@ -401,11 +438,148 @@ def test_worker_cli_emits_safe_lifecycle_logs() -> None:
     assert [event["event"] for event in rendered_events] == [
         "service_starting",
         "service_ready",
+        "source_inspection_failed",
         "service_stopping",
     ]
-    assert "processing transcription job dispatch" not in completed.stderr
-    assert "finished processing transcription job dispatch" not in completed.stderr
-    assert "00000000-0000-4000-8000-000000000001" not in completed.stderr
+    assert rendered_events[2]["level"] == "DEBUG"
+    assert {event["service_role"] for event in rendered_events} == {"gpu_worker"}
+    instance_ids = {event["instance_id"] for event in rendered_events}
+    assert len(instance_ids) == 1
+    instance_id = instance_ids.pop()
+    assert UUID(instance_id).version == 4
+    assert str(UUID(instance_id)) == instance_id
+
+
+def test_worker_main_reports_startup_failure_without_exception_output() -> None:
+    """Report invalid startup configuration as one safe process failure."""
+    completed = subprocess.run(
+        [sys.executable, "-c", "from textify.jobs.worker import main; main()"],
+        capture_output=True,
+        check=False,
+        env={**os.environ, "TEXTIFY_LOG_LEVEL": "invalid-log-level-sentinel"},
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    rendered_events = [json.loads(line) for line in completed.stderr.splitlines()]
+    assert [event["event"] for event in rendered_events] == [
+        "service_starting",
+        "service_failed",
+    ]
+    failure_events = [
+        event for event in rendered_events if event["event"] == "service_failed"
+    ]
+    assert len(failure_events) == 1
+    assert {
+        field_name: failure_events[0][field_name] for field_name in ("stage", "code")
+    } == {
+        "stage": "startup",
+        "code": "internal_error",
+    }
+    assert "service_stopping" not in {event["event"] for event in rendered_events}
+    for unsafe_text in (
+        "invalid-log-level-sentinel",
+        "TEXTIFY_LOG_LEVEL",
+        "ValidationError",
+        "ValueError",
+        "Traceback",
+    ):
+        assert unsafe_text not in completed.stderr
+
+
+@pytest.mark.parametrize("failure_stage", ("runtime", "shutdown"))
+def test_worker_main_reports_post_ready_failure_without_exception_output(
+    failure_stage: str,
+) -> None:
+    """Report worker runtime and cleanup failures without exception output."""
+    child_program = textwrap.dedent(
+        f"""
+        from types import SimpleNamespace
+
+        from textify.jobs import worker
+
+        failure_stage = {failure_stage!r}
+
+
+        class Runtime:
+            def start(self):
+                pass
+
+            def stop_claiming(self):
+                pass
+
+            def shutdown(self):
+                if failure_stage == "shutdown":
+                    raise RuntimeError("shutdown-error-sentinel")
+
+
+        class Engine:
+            async def dispose(self):
+                pass
+
+
+        class CeleryApp:
+            tasks = {{}}
+
+            def worker_main(self, arguments):
+                if failure_stage == "runtime":
+                    raise RuntimeError("runtime-error-sentinel")
+
+
+        async def create_worker_runtime(*_arguments):
+            return Runtime()
+
+
+        worker.AppConfig = lambda: SimpleNamespace(log_level="INFO")
+        worker.JobConfig = lambda: SimpleNamespace(
+            database_url="postgresql+asyncpg://test:test@localhost/test",
+        )
+        worker.JobDispatchConfig = lambda: SimpleNamespace(
+            broker_url="memory://",
+            worker_concurrency=1,
+        )
+        worker.CacheConfig = lambda: SimpleNamespace()
+        worker.TranscriptionConfig = lambda: SimpleNamespace()
+        worker.validate_redis_role_isolation = lambda *_arguments: None
+        worker.create_application_engine = lambda _database_url: Engine()
+        worker._create_worker_runtime = create_worker_runtime
+        worker.create_celery_app = lambda _config: CeleryApp()
+        worker.register_transcription_task = lambda *_arguments: None
+        worker.main()
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", child_program],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    rendered_events = [json.loads(line) for line in completed.stderr.splitlines()]
+    assert [event["event"] for event in rendered_events] == [
+        "service_starting",
+        "service_ready",
+        "service_failed",
+    ]
+    failure_events = [
+        event for event in rendered_events if event["event"] == "service_failed"
+    ]
+    assert len(failure_events) == 1
+    assert {
+        field_name: failure_events[0][field_name] for field_name in ("stage", "code")
+    } == {
+        "stage": failure_stage,
+        "code": "internal_error",
+    }
+    assert "service_stopping" not in {event["event"] for event in rendered_events}
+    for unsafe_text in (
+        f"{failure_stage}-error-sentinel",
+        "RuntimeError",
+        "Traceback",
+    ):
+        assert unsafe_text not in completed.stderr
 
 
 def test_worker_runtime_processes_only_valid_payloads_on_one_loop(
@@ -432,15 +606,16 @@ def test_worker_runtime_processes_only_valid_payloads_on_one_loop(
 
     runtime.start()
     try:
-        runtime.process_payload(
-            {
-                "internal_job_id": True,
-                "execution_attempt_token": "execution-attempt-token-sentinel",
-                "payload": "payload-sentinel",
-            }
-        )
-        runtime.process_payload(first_dispatch.to_payload())
-        runtime.process_payload(second_dispatch.to_payload())
+        with request_log_context("f8b2d0be-09be-4de9-bb79-f8c26dcbd568"):
+            runtime.process_payload(
+                {
+                    "internal_job_id": True,
+                    "execution_attempt_token": "execution-attempt-token-sentinel",
+                    "payload": "payload-sentinel",
+                }
+            )
+            runtime.process_payload(first_dispatch.to_payload())
+            runtime.process_payload(second_dispatch.to_payload())
     finally:
         runtime.shutdown()
 
@@ -457,9 +632,65 @@ def test_worker_runtime_processes_only_valid_payloads_on_one_loop(
         "event": "malformed_job_dispatch_rejected",
         "code": "rejected_malformed_transcription_job_dispatch",
     }
+    assert "internal_job_id" not in rendered_event
+    assert "request_id" not in rendered_event
     for sensitive_value in (
         "execution-attempt-token-sentinel",
         "payload-sentinel",
+    ):
+        assert sensitive_value not in rendered_output
+
+
+def test_worker_runtime_propagates_dispatch_correlation_to_nested_diagnostics(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Bind one Job Dispatch across worker task and thread-offload diagnostics.
+
+    Args:
+        capsys: Captures structured worker output.
+    """
+    from textify.jobs.worker import TranscriptionWorkerRuntime
+
+    request_identifier = "f8b2d0be-09be-4de9-bb79-f8c26dcbd568"
+    dispatch = JobDispatch(41, uuid4())
+    processor = CorrelatedDiagnosticsProcessor()
+    runtime = TranscriptionWorkerRuntime(
+        lambda: _execution_resources(processor, ShutdownExecutor()),
+        RecordingClaimManager(),
+        RecordingGpuOwnership(),
+        RecordingEngine(),
+    )
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
+
+    runtime.start()
+    try:
+        with request_log_context(request_identifier):
+            runtime.process_payload(dispatch.to_payload())
+            emit_event(
+                logging.getLogger("textify.test_worker"),
+                LogEvent.REQUEST_COMPLETED,
+                http_status_code=200,
+                http_method="GET",
+                elapsed_seconds=0.25,
+            )
+    finally:
+        runtime.shutdown()
+
+    assert processor.dispatches == [dispatch]
+    rendered_output = capsys.readouterr().err
+    rendered_events = [json.loads(line) for line in rendered_output.splitlines()]
+    diagnostic_events = rendered_events[:3]
+    assert [event["event"] for event in diagnostic_events] == [
+        "source_inspection_failed",
+        "caption_acquisition_failed",
+        "resource_cleanup_failed",
+    ]
+    assert {event["internal_job_id"] for event in diagnostic_events} == {41}
+    assert all("request_id" not in event for event in diagnostic_events)
+    assert rendered_events[3]["request_id"] == request_identifier
+    for sensitive_value in (
+        str(dispatch.execution_attempt_token),
+        "claim-owner-sentinel",
     ):
         assert sensitive_value not in rendered_output
 

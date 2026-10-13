@@ -95,6 +95,20 @@ def request_log_context(request_id: str) -> Iterator[None]:
 
 
 @contextmanager
+def worker_log_context() -> Iterator[None]:
+    """Isolate worker records from an inherited HTTP request context.
+
+    Yields:
+        None: The active worker scope.
+    """
+    token = _request_log_context.set(None)
+    try:
+        yield
+    finally:
+        _request_log_context.reset(token)
+
+
+@contextmanager
 def transcription_job_log_context(internal_job_id: int) -> Iterator[None]:
     """Bind one Transcription Job identifier to the current execution scope.
 

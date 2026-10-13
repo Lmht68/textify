@@ -22,6 +22,7 @@ from textify.logging import (
     emit_event,
     request_log_context,
     transcription_job_log_context,
+    worker_log_context,
 )
 from textify.transcription.exceptions import InvalidUrlError
 from textify.transcription.inspection import classify_submitted_url
@@ -306,6 +307,37 @@ def test_structured_logging_restores_nested_transcription_job_correlation(
         json.loads(line) for line in capsys.readouterr().err.splitlines()
     ]
     assert [event["internal_job_id"] for event in rendered_events] == [47, 53, 59, 47]
+
+
+def test_worker_log_context_isolates_request_correlation_and_restores_outer_context(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Keep worker events isolated from a surrounding HTTP request context.
+
+    Args:
+        capsys: Captures formatted standard-error log output.
+    """
+    request_identifier = "f8b2d0be-09be-4de9-bb79-f8c26dcbd568"
+    configure_structured_logging(LogServiceRole.API)
+    logger = logging.getLogger("textify.test_logging")
+
+    with request_log_context(request_identifier):
+        with worker_log_context(), transcription_job_log_context(41):
+            emit_event(logger, LogEvent.JOB_DISPATCH_PUBLISHED)
+        emit_event(
+            logger,
+            LogEvent.REQUEST_COMPLETED,
+            http_status_code=200,
+            http_method="GET",
+            elapsed_seconds=0.25,
+        )
+
+    rendered_events = [
+        json.loads(line) for line in capsys.readouterr().err.splitlines()
+    ]
+    assert rendered_events[0]["internal_job_id"] == 41
+    assert "request_id" not in rendered_events[0]
+    assert rendered_events[1]["request_id"] == request_identifier
 
 
 @pytest.mark.parametrize(

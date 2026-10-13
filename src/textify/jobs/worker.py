@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 
 from celery import Celery, Task
 from celery.signals import worker_shutting_down
@@ -46,7 +46,15 @@ from textify.jobs.readiness import (
 from textify.jobs.repository import PostgresTranscriptionJobRepository
 from textify.jobs.service import utc_now
 from textify.jobs.types import JobDispatch
-from textify.logging import LogCode, LogEvent, configure_logging, emit_event
+from textify.logging import (
+    LogCode,
+    LogEvent,
+    LogServiceRole,
+    configure_structured_logging,
+    emit_event,
+    transcription_job_log_context,
+    worker_log_context,
+)
 from textify.transcription.config import TranscriptionConfig
 from textify.transcription.service import (
     TranscriptionAdaptersFactory,
@@ -55,6 +63,22 @@ from textify.transcription.service import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+_WorkerFailureStage = Literal["startup", "runtime", "shutdown"]
+
+
+class _WorkerProcessError(Exception):
+    """Carry the safe lifecycle stage for an unexpected process failure."""
+
+    def __init__(self, stage: _WorkerFailureStage) -> None:
+        """Record the stage without retaining unsafe failure details.
+
+        Args:
+            stage: Worker lifecycle stage active when the failure occurred.
+        """
+        super().__init__()
+        self.stage: _WorkerFailureStage = stage
 
 
 class _DispatchProcessor(Protocol):
@@ -317,45 +341,50 @@ class TranscriptionWorkerRuntime:
         Args:
             payload: Deserialized task message expected to contain one Job Dispatch.
         """
-        dispatch = JobDispatch.from_payload(payload)
-        if dispatch is None:
-            emit_event(
-                logger,
-                LogEvent.MALFORMED_JOB_DISPATCH_REJECTED,
-                code=LogCode.REJECTED_MALFORMED_TRANSCRIPTION_JOB_DISPATCH.value,
-            )
-            return
-        with self._state_lock:
-            loop = self._loop if self._started and self._runtime_ready else None
-            processor = self._processor
-        if loop is None or processor is None or not self._gpu_ownership.is_ready:
-            emit_event(
-                logger,
-                LogEvent.WORKER_RUNTIME_UNAVAILABLE,
-                internal_job_id=dispatch.internal_job_id,
-                code=LogCode.TRANSCRIPTION_WORKER_RUNTIME_IS_UNAVAILABLE.value,
-            )
-            return
-        try:
-            future = asyncio.run_coroutine_threadsafe(
-                processor.process(dispatch),
-                loop,
-            )
-            future.result()
-        except TranscriptionJobStoreUnavailableError:
-            emit_event(
-                logger,
-                LogEvent.JOB_STORE_UNAVAILABLE,
-                internal_job_id=dispatch.internal_job_id,
-                code=(LogCode.TRANSCRIPTION_JOB_STORAGE_IS_UNAVAILABLE_TO_WORKER.value),
-            )
-        except Exception:  # noqa: BLE001
-            emit_event(
-                logger,
-                LogEvent.TRANSCRIPTION_JOB_PROCESSING_FAILED,
-                internal_job_id=dispatch.internal_job_id,
-                code=InternalError.code,
-            )
+        with worker_log_context():
+            dispatch = JobDispatch.from_payload(payload)
+            if dispatch is None:
+                emit_event(
+                    logger,
+                    LogEvent.MALFORMED_JOB_DISPATCH_REJECTED,
+                    code=LogCode.REJECTED_MALFORMED_TRANSCRIPTION_JOB_DISPATCH.value,
+                )
+                return
+            with transcription_job_log_context(dispatch.internal_job_id):
+                with self._state_lock:
+                    loop = self._loop if self._started and self._runtime_ready else None
+                    processor = self._processor
+                if (
+                    loop is None
+                    or processor is None
+                    or not self._gpu_ownership.is_ready
+                ):
+                    emit_event(
+                        logger,
+                        LogEvent.WORKER_RUNTIME_UNAVAILABLE,
+                        code=LogCode.TRANSCRIPTION_WORKER_RUNTIME_IS_UNAVAILABLE.value,
+                    )
+                    return
+                try:
+                    future = asyncio.run_coroutine_threadsafe(
+                        processor.process(dispatch),
+                        loop,
+                    )
+                    future.result()
+                except TranscriptionJobStoreUnavailableError:
+                    emit_event(
+                        logger,
+                        LogEvent.JOB_STORE_UNAVAILABLE,
+                        code=(
+                            LogCode.TRANSCRIPTION_JOB_STORAGE_IS_UNAVAILABLE_TO_WORKER.value
+                        ),
+                    )
+                except Exception:  # noqa: BLE001
+                    emit_event(
+                        logger,
+                        LogEvent.TRANSCRIPTION_JOB_PROCESSING_FAILED,
+                        code=InternalError.code,
+                    )
 
     def stop_claiming(self) -> None:
         """Close worker admission and remove readiness from any Celery thread."""
@@ -713,47 +742,87 @@ def _disconnect_worker_shutdown_signal(receiver: Callable[..., None]) -> None:
     worker_shutting_down.disconnect(receiver)
 
 
+def _raise_service_failed(stage: _WorkerFailureStage) -> None:
+    """Emit one safe process failure event and terminate unsuccessfully.
+
+    Args:
+        stage: Worker lifecycle stage active when the failure occurred.
+    """
+    emit_event(
+        logger,
+        LogEvent.SERVICE_FAILED,
+        stage=stage,
+        code=InternalError.code,
+    )
+    raise SystemExit(1) from None
+
+
 def main() -> None:
     """Start one dedicated threads-pool Transcription Job worker process."""
-    app_config = AppConfig()
-    configure_logging(app_config.log_level)
-    emit_event(logger, LogEvent.SERVICE_STARTING)
-    job_config = JobConfig()  # type: ignore[call-arg]
-    dispatch_config = JobDispatchConfig()  # type: ignore[call-arg]
-    cache_config = CacheConfig()
-    validate_redis_role_isolation(dispatch_config, cache_config)
-    transcription_config = TranscriptionConfig()  # type: ignore[call-arg]
-    engine = create_application_engine(str(job_config.database_url))
-    runtime: TranscriptionWorkerRuntime | None = None
-    shutdown_receiver: Callable[..., None] | None = None
-    try:
-        runtime = asyncio.run(
-            _create_worker_runtime(
-                engine,
-                job_config,
-                dispatch_config,
-                transcription_config,
+    with worker_log_context():
+        configure_structured_logging(LogServiceRole.GPU_WORKER)
+        emit_event(logger, LogEvent.SERVICE_STARTING)
+
+        engine: AsyncEngine | None = None
+        runtime: TranscriptionWorkerRuntime | None = None
+        shutdown_receiver: Callable[..., None] | None = None
+        active_stage: _WorkerFailureStage = "startup"
+        process_failure: _WorkerProcessError | None = None
+        try:
+            app_config = AppConfig()
+            configure_structured_logging(
+                LogServiceRole.GPU_WORKER,
+                app_config.log_level,
             )
-        )
-        runtime.start()
-        emit_event(logger, LogEvent.SERVICE_READY)
-        shutdown_receiver = _connect_worker_shutdown_signal(runtime)
-        celery_app = create_celery_app(dispatch_config)
-        register_transcription_task(celery_app, runtime)
-        celery_app.worker_main(
-            [
-                "worker",
-                "--pool=threads",
-                f"--concurrency={dispatch_config.worker_concurrency}",
-                f"--queues={TRANSCRIPTION_QUEUE}",
-                "--loglevel=INFO",
-            ]
-        )
-    finally:
+            job_config = JobConfig()  # type: ignore[call-arg]
+            dispatch_config = JobDispatchConfig()  # type: ignore[call-arg]
+            cache_config = CacheConfig()
+            validate_redis_role_isolation(dispatch_config, cache_config)
+            transcription_config = TranscriptionConfig()  # type: ignore[call-arg]
+            engine = create_application_engine(str(job_config.database_url))
+            runtime = asyncio.run(
+                _create_worker_runtime(
+                    engine,
+                    job_config,
+                    dispatch_config,
+                    transcription_config,
+                )
+            )
+            runtime.start()
+            emit_event(logger, LogEvent.SERVICE_READY)
+            active_stage = "runtime"
+            shutdown_receiver = _connect_worker_shutdown_signal(runtime)
+            celery_app = create_celery_app(dispatch_config)
+            register_transcription_task(celery_app, runtime)
+            celery_app.worker_main(
+                [
+                    "worker",
+                    "--pool=threads",
+                    f"--concurrency={dispatch_config.worker_concurrency}",
+                    f"--queues={TRANSCRIPTION_QUEUE}",
+                    "--loglevel=INFO",
+                ]
+            )
+        except KeyboardInterrupt:
+            pass
+        except SystemExit as exc:
+            if exc.code not in (None, 0):
+                process_failure = _WorkerProcessError(active_stage)
+        except Exception:  # noqa: BLE001
+            process_failure = _WorkerProcessError(active_stage)
+        finally:
+            try:
+                if shutdown_receiver is not None:
+                    _disconnect_worker_shutdown_signal(shutdown_receiver)
+                if runtime is None:
+                    if engine is not None:
+                        asyncio.run(engine.dispose())
+                else:
+                    runtime.shutdown()
+            except Exception:  # noqa: BLE001
+                if process_failure is None:
+                    process_failure = _WorkerProcessError("shutdown")
+
+        if process_failure is not None:
+            _raise_service_failed(process_failure.stage)
         emit_event(logger, LogEvent.SERVICE_STOPPING)
-        if shutdown_receiver is not None:
-            _disconnect_worker_shutdown_signal(shutdown_receiver)
-        if runtime is None:
-            asyncio.run(engine.dispose())
-        else:
-            runtime.shutdown()

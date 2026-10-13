@@ -134,9 +134,12 @@ async def _wait_for_heartbeat_count(
 
 
 @pytest.mark.asyncio
-async def test_claim_manager_heartbeats_one_bounded_active_batch() -> None:
+async def test_claim_manager_heartbeats_one_bounded_active_batch(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """Renew at most the configured active Execution Claim count in one operation."""
     repository = ClaimManagerRepository()
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
     manager = _manager(repository, max_active_claims=2)
     first_control = TranscriptionExecutionControl()
     second_control = TranscriptionExecutionControl()
@@ -168,12 +171,67 @@ async def test_claim_manager_heartbeats_one_bounded_active_batch() -> None:
         first_claim.claim,
         second_claim.claim,
     )
+    rendered_events = [
+        json.loads(line) for line in capsys.readouterr().err.splitlines()
+    ]
+    claimed_events = [
+        event
+        for event in rendered_events
+        if event["event"] == "execution_attempt_claimed"
+    ]
+    assert [event["internal_job_id"] for event in claimed_events] == [1, 2]
 
 
 @pytest.mark.asyncio
-async def test_claim_manager_propagates_durable_cancellation_to_both_controls() -> None:
+async def test_claim_manager_emits_committed_claim_lifecycle_event(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Emit a safe claim event only after durable claim admission returns."""
+    repository = ClaimManagerRepository()
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
+    manager = _manager(repository, max_active_claims=1)
+    dispatch = _dispatch(41)
+    claimed_job: ClaimedTranscriptionJob | None = None
+    try:
+        await manager.start()
+        claimed_job = await manager.claim(dispatch, TranscriptionExecutionControl())
+    finally:
+        if claimed_job is not None:
+            manager.release(claimed_job.claim)
+        await manager.shutdown()
+
+    assert claimed_job is not None
+    rendered_events = [
+        json.loads(line) for line in capsys.readouterr().err.splitlines()
+    ]
+    assert [
+        {
+            field_name: rendered_events[0][field_name]
+            for field_name in ("event", "internal_job_id", "job_status")
+        }
+    ] == [
+        {
+            "event": "execution_attempt_claimed",
+            "internal_job_id": 41,
+            "job_status": "processing",
+        }
+    ]
+    assert "request_id" not in rendered_events[0]
+    for sensitive_value in (
+        str(dispatch.execution_attempt_token),
+        str(claimed_job.claim.worker_owner),
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    ):
+        assert sensitive_value not in str(rendered_events[0])
+
+
+@pytest.mark.asyncio
+async def test_claim_manager_propagates_durable_cancellation_to_both_controls(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """Bridge a heartbeat Cancellation response to asyncio and provider events."""
     repository = ClaimManagerRepository()
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
     manager = _manager(repository, max_active_claims=1)
     control = TranscriptionExecutionControl()
     claimed_job: ClaimedTranscriptionJob | None = None
@@ -191,6 +249,12 @@ async def test_claim_manager_propagates_durable_cancellation_to_both_controls() 
         await manager.shutdown()
 
     assert control.provider_cancellation.is_set()
+    rendered_events = [
+        json.loads(line) for line in capsys.readouterr().err.splitlines()
+    ]
+    assert [event["event"] for event in rendered_events] == [
+        "execution_attempt_claimed"
+    ]
 
 
 @pytest.mark.asyncio
@@ -217,25 +281,36 @@ async def test_claim_manager_retries_storage_interruption_without_guessing_state
     assert claimed_job is not None
     assert not control.cancellation_requested.is_set()
     assert all(batch == (claimed_job.claim,) for batch in repository.heartbeat_batches)
-    rendered_event = json.loads(capsys.readouterr().err)
-    assert rendered_event["event"] == "job_store_unavailable"
+    rendered_events = [
+        json.loads(line) for line in capsys.readouterr().err.splitlines()
+    ]
+    assert [event["event"] for event in rendered_events] == [
+        "execution_attempt_claimed",
+        "job_store_unavailable",
+    ]
+    rendered_event = rendered_events[1]
     assert (
         rendered_event["code"]
         == "transcription_job_storage_is_unavailable_to_claim_monitor"
     )
     assert "internal_job_id" not in rendered_event
-    assert str(claimed_job.claim.worker_owner) not in str(rendered_event)
+    assert "request_id" not in rendered_event
+    assert "execution_attempt_ownership_lost" not in {
+        event["event"] for event in rendered_events
+    }
+    assert str(claimed_job.claim.worker_owner) not in str(rendered_events)
     assert str(claimed_job.claim.dispatch.execution_attempt_token) not in str(
-        rendered_event
+        rendered_events
     )
 
 
 @pytest.mark.asyncio
-async def test_claim_manager_marks_omitted_claim_lost_without_renewing_it_again() -> (
-    None
-):
+async def test_claim_manager_marks_omitted_claim_lost_without_renewing_it_again(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """Stop cooperative work permanently when PostgreSQL omits one requested claim."""
     repository = ClaimManagerRepository()
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
     manager = _manager(repository, max_active_claims=2)
     lost_control = TranscriptionExecutionControl()
     retained_control = TranscriptionExecutionControl()
@@ -266,6 +341,21 @@ async def test_claim_manager_marks_omitted_claim_lost_without_renewing_it_again(
         lost_job.claim not in heartbeat_batch
         for heartbeat_batch in repository.heartbeat_batches[1:]
     )
+    rendered_events = [
+        json.loads(line) for line in capsys.readouterr().err.splitlines()
+    ]
+    assert [event["event"] for event in rendered_events] == [
+        "execution_attempt_claimed",
+        "execution_attempt_claimed",
+        "execution_attempt_ownership_lost",
+    ]
+    ownership_loss_event = rendered_events[-1]
+    assert ownership_loss_event["internal_job_id"] == 1
+    assert "request_id" not in ownership_loss_event
+    assert str(lost_job.claim.worker_owner) not in str(ownership_loss_event)
+    assert str(lost_job.claim.dispatch.execution_attempt_token) not in str(
+        ownership_loss_event
+    )
 
 
 @pytest.mark.asyncio
@@ -286,9 +376,12 @@ async def test_claim_manager_rejects_admission_after_shutdown_starts() -> None:
 
 
 @pytest.mark.asyncio
-async def test_claim_manager_recovers_drain_state_after_claim_storage_failure() -> None:
+async def test_claim_manager_recovers_drain_state_after_claim_storage_failure(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """Allow shutdown after an unavailable claim write releases pending capacity."""
     repository = ClaimManagerRepository()
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
     repository.claim_failures_remaining = 1
     manager = _manager(repository, max_active_claims=1)
     await manager.start()
@@ -300,6 +393,8 @@ async def test_claim_manager_recovers_drain_state_after_claim_storage_failure() 
             await manager.shutdown()
     finally:
         await manager.shutdown()
+
+    assert capsys.readouterr().err == ""
 
 
 @pytest.mark.asyncio

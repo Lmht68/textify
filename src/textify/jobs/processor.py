@@ -6,7 +6,13 @@ import logging
 from typing import Protocol
 
 from textify.errors import InternalError
-from textify.jobs.types import ClaimedTranscriptionJob, ExecutionClaim, JobDispatch
+from textify.jobs.types import (
+    ClaimedTranscriptionJob,
+    ExecutionClaim,
+    JobDispatch,
+    JobOutcome,
+    JobStatus,
+)
 from textify.logging import LogEvent, emit_event
 from textify.transcription import inspection
 from textify.transcription.exceptions import (
@@ -21,6 +27,40 @@ from textify.transcription.service import TranscriptionExecutionControl
 from textify.transcription.types import TranscriptionResult
 
 logger = logging.getLogger(__name__)
+
+
+def _emit_finished(
+    claim: ExecutionClaim,
+    outcome: JobOutcome,
+    *,
+    code: str | None = None,
+) -> None:
+    """Emit one terminal event after PostgreSQL commits its outcome.
+
+    Args:
+        claim: Execution Attempt whose terminal outcome was committed.
+        outcome: Committed terminal disposition.
+        code: Stable failure code when the committed outcome is failed.
+    """
+    if outcome is JobOutcome.FAILED:
+        if code is None:
+            return
+        emit_event(
+            logger,
+            LogEvent.TRANSCRIPTION_JOB_FINISHED,
+            internal_job_id=claim.dispatch.internal_job_id,
+            job_status=JobStatus.FINISHED.value,
+            job_outcome=outcome.value,
+            code=code,
+        )
+        return
+    emit_event(
+        logger,
+        LogEvent.TRANSCRIPTION_JOB_FINISHED,
+        internal_job_id=claim.dispatch.internal_job_id,
+        job_status=JobStatus.FINISHED.value,
+        job_outcome=outcome.value,
+    )
 
 
 class _ExecutionRepository(Protocol):
@@ -184,7 +224,9 @@ class TranscriptionJobProcessor:
                 claimed_job.claim,
                 projected_result,
             )
-            if not published:
+            if published:
+                _emit_finished(claimed_job.claim, JobOutcome.SUCCEEDED)
+            else:
                 await self._publish_cancelled_after_cleanup(claimed_job, control)
         finally:
             self._claim_manager.release(claimed_job.claim)
@@ -212,7 +254,13 @@ class TranscriptionJobProcessor:
             error_code,
             error_message,
         )
-        if not published:
+        if published:
+            _emit_finished(
+                claimed_job.claim,
+                JobOutcome.FAILED,
+                code=error_code,
+            )
+        else:
             await self._publish_cancelled_after_cleanup(claimed_job, control)
 
     async def _publish_cancelled_after_cleanup(
@@ -227,4 +275,6 @@ class TranscriptionJobProcessor:
             control: Provider cancellation and cleanup ownership for this execution.
         """
         await control.cleanup_complete.wait()
-        await self._repository.publish_cancelled(claimed_job.claim)
+        published = await self._repository.publish_cancelled(claimed_job.claim)
+        if published:
+            _emit_finished(claimed_job.claim, JobOutcome.CANCELLED)

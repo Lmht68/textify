@@ -8,7 +8,10 @@ import pytest
 from textify.jobs.types import ClaimedTranscriptionJob, ExecutionClaim, JobDispatch
 from textify.logging import LogServiceRole, configure_structured_logging
 from textify.transcription import inspection
-from textify.transcription.exceptions import TranscriptionFailedError
+from textify.transcription.exceptions import (
+    TranscriptionCancellationRequestedError,
+    TranscriptionFailedError,
+)
 from textify.transcription.schemas import TranscriptionResponse
 from textify.transcription.service import TranscriptionExecutionControl
 from textify.transcription.types import (
@@ -31,6 +34,7 @@ class RecordingExecutionRepository:
         self.cancelled_claims: list[ExecutionClaim] = []
         self.success_published = True
         self.failure_published = True
+        self.cancelled_published = True
 
     async def publish_success(
         self,
@@ -54,7 +58,7 @@ class RecordingExecutionRepository:
     async def publish_cancelled(self, claim: ExecutionClaim) -> bool:
         """Record cancellation publication after provider cleanup."""
         self.cancelled_claims.append(claim)
-        return True
+        return self.cancelled_published
 
 
 class RecordingClaimManager:
@@ -122,6 +126,30 @@ class FailingExecutor:
         self.calls += 1
         control.cleanup_complete.set()
         raise TranscriptionFailedError()
+
+
+class CancelledExecutor:
+    """Request Cancellation after releasing executor cleanup ownership."""
+
+    async def execute(
+        self,
+        _submitted: inspection.SubmittedSource,
+        *,
+        control: TranscriptionExecutionControl,
+        include_segments: bool = True,
+    ) -> TranscriptionResult:
+        """Release cleanup and signal accepted Cancellation.
+
+        Args:
+            control: Execution state whose cleanup release is recorded.
+            include_segments: Whether the result should include segments, unused.
+
+        Raises:
+            TranscriptionCancellationRequestedError: Always after cleanup.
+        """
+        del include_segments
+        control.cleanup_complete.set()
+        raise TranscriptionCancellationRequestedError()
 
 
 class UnexpectedFailureExecutor:
@@ -221,10 +249,13 @@ async def test_processor_ignores_stale_dispatch_before_provider_execution() -> N
 
 
 @pytest.mark.asyncio
-async def test_processor_publishes_projected_success_for_its_claim() -> None:
+async def test_processor_publishes_projected_success_for_its_claim(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """Project immutable exclusions and publish success with the claimed token."""
     from textify.jobs.processor import TranscriptionJobProcessor
 
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
     dispatch = _dispatch()
     claimed_job = _claimed_job(dispatch)
     repository = RecordingExecutionRepository()
@@ -261,6 +292,22 @@ async def test_processor_publishes_projected_success_for_its_claim() -> None:
     assert repository.failures == []
     assert repository.cancelled_claims == []
     assert claim_manager.released_claims == [claimed_job.claim]
+    rendered_events = [
+        json.loads(line) for line in capsys.readouterr().err.splitlines()
+    ]
+    assert [
+        {
+            field_name: rendered_events[0][field_name]
+            for field_name in ("event", "internal_job_id", "job_status", "job_outcome")
+        }
+    ] == [
+        {
+            "event": "transcription_job_finished",
+            "internal_job_id": 1,
+            "job_status": "finished",
+            "job_outcome": "succeeded",
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -294,13 +341,26 @@ async def test_processor_publishes_safe_failure_for_provider_error(
     assert repository.cancelled_claims == []
     assert claim_manager.released_claims == [claimed_job.claim]
     rendered_output = capsys.readouterr().err
-    rendered_event = json.loads(rendered_output)
+    rendered_events = [json.loads(line) for line in rendered_output.splitlines()]
+    assert [event["event"] for event in rendered_events] == [
+        "transcription_job_processing_failed",
+        "transcription_job_finished",
+    ]
     assert {
-        field_name: rendered_event[field_name]
+        field_name: rendered_events[0][field_name]
         for field_name in ("event", "internal_job_id", "code")
     } == {
         "event": "transcription_job_processing_failed",
         "internal_job_id": 1,
+        "code": "transcription_failed",
+    }
+    assert {
+        field_name: rendered_events[1][field_name]
+        for field_name in ("internal_job_id", "job_status", "job_outcome", "code")
+    } == {
+        "internal_job_id": 1,
+        "job_status": "finished",
+        "job_outcome": "failed",
         "code": "transcription_failed",
     }
     for sensitive_value in (
@@ -313,12 +373,13 @@ async def test_processor_publishes_safe_failure_for_provider_error(
 
 
 @pytest.mark.asyncio
-async def test_processor_publishes_cancellation_when_terminal_write_loses_race() -> (
-    None
-):
+async def test_processor_publishes_cancellation_when_terminal_write_loses_race(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """Wait for executor cleanup before finalizing a concurrent cancellation."""
     from textify.jobs.processor import TranscriptionJobProcessor
 
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
     dispatch = _dispatch()
     claimed_job = _claimed_job(dispatch)
     repository = RecordingExecutionRepository()
@@ -333,6 +394,114 @@ async def test_processor_publishes_cancellation_when_terminal_write_loses_race()
     assert repository.successes[0][0] == claimed_job.claim
     assert repository.cancelled_claims == [claimed_job.claim]
     assert claim_manager.released_claims == [claimed_job.claim]
+    rendered_events = [
+        json.loads(line) for line in capsys.readouterr().err.splitlines()
+    ]
+    assert [
+        {
+            field_name: rendered_events[0][field_name]
+            for field_name in ("internal_job_id", "job_status", "job_outcome")
+        }
+    ] == [
+        {
+            "internal_job_id": 1,
+            "job_status": "finished",
+            "job_outcome": "cancelled",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_processor_publishes_cancellation_after_lost_failure(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Emit only committed Cancellation when failure loses the terminal write."""
+    from textify.jobs.processor import TranscriptionJobProcessor
+
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
+    dispatch = _dispatch()
+    claimed_job = _claimed_job(dispatch)
+    repository = RecordingExecutionRepository()
+    repository.failure_published = False
+    claim_manager = RecordingClaimManager(claimed_job)
+
+    await TranscriptionJobProcessor(
+        repository,
+        FailingExecutor(),
+        claim_manager,
+    ).process(dispatch)
+
+    assert repository.cancelled_claims == [claimed_job.claim]
+    rendered_events = [
+        json.loads(line) for line in capsys.readouterr().err.splitlines()
+    ]
+    assert [event["event"] for event in rendered_events] == [
+        "transcription_job_processing_failed",
+        "transcription_job_finished",
+    ]
+    assert rendered_events[-1]["job_outcome"] == "cancelled"
+    assert "code" not in rendered_events[-1]
+
+
+@pytest.mark.asyncio
+async def test_processor_publishes_committed_cancellation(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Emit a terminal event when Cancellation commits after cleanup."""
+    from textify.jobs.processor import TranscriptionJobProcessor
+
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
+    dispatch = _dispatch()
+    claimed_job = _claimed_job(dispatch)
+    repository = RecordingExecutionRepository()
+    claim_manager = RecordingClaimManager(claimed_job)
+
+    await TranscriptionJobProcessor(
+        repository,
+        CancelledExecutor(),
+        claim_manager,
+    ).process(dispatch)
+
+    assert repository.cancelled_claims == [claimed_job.claim]
+    rendered_events = [
+        json.loads(line) for line in capsys.readouterr().err.splitlines()
+    ]
+    assert [
+        {
+            field_name: rendered_events[0][field_name]
+            for field_name in ("internal_job_id", "job_status", "job_outcome")
+        }
+    ] == [
+        {
+            "internal_job_id": 1,
+            "job_status": "finished",
+            "job_outcome": "cancelled",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_processor_does_not_emit_terminal_event_when_cancellation_loses(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Leave terminal observability absent when Cancellation does not commit."""
+    from textify.jobs.processor import TranscriptionJobProcessor
+
+    configure_structured_logging(LogServiceRole.API, "DEBUG")
+    dispatch = _dispatch()
+    claimed_job = _claimed_job(dispatch)
+    repository = RecordingExecutionRepository()
+    repository.cancelled_published = False
+    claim_manager = RecordingClaimManager(claimed_job)
+
+    await TranscriptionJobProcessor(
+        repository,
+        CancelledExecutor(),
+        claim_manager,
+    ).process(dispatch)
+
+    assert repository.cancelled_claims == [claimed_job.claim]
+    assert capsys.readouterr().err == ""
 
 
 @pytest.mark.asyncio
@@ -354,15 +523,21 @@ async def test_processor_logs_only_safe_failure_for_unexpected_provider_detail(
     )
 
     rendered_output = capsys.readouterr().err
-    rendered_event = json.loads(rendered_output)
+    rendered_events = [json.loads(line) for line in rendered_output.splitlines()]
+    assert [event["event"] for event in rendered_events] == [
+        "transcription_job_processing_failed",
+        "transcription_job_finished",
+    ]
     assert {
-        field_name: rendered_event[field_name]
+        field_name: rendered_events[0][field_name]
         for field_name in ("event", "internal_job_id", "code")
     } == {
         "event": "transcription_job_processing_failed",
         "internal_job_id": 1,
         "code": "internal_error",
     }
+    assert rendered_events[1]["job_outcome"] == "failed"
+    assert rendered_events[1]["code"] == "internal_error"
     for sensitive_value in (
         claimed_job.submitted_url,
         str(claimed_job.claim.dispatch.execution_attempt_token),
@@ -413,15 +588,21 @@ async def test_processor_logs_internal_error_for_response_projection_failure(
     ]
     assert claim_manager.released_claims == [claimed_job.claim]
     rendered_output = capsys.readouterr().err
-    rendered_event = json.loads(rendered_output)
+    rendered_events = [json.loads(line) for line in rendered_output.splitlines()]
+    assert [event["event"] for event in rendered_events] == [
+        "transcription_job_processing_failed",
+        "transcription_job_finished",
+    ]
     assert {
-        field_name: rendered_event[field_name]
+        field_name: rendered_events[0][field_name]
         for field_name in ("event", "internal_job_id", "code")
     } == {
         "event": "transcription_job_processing_failed",
         "internal_job_id": 1,
         "code": "internal_error",
     }
+    assert rendered_events[1]["job_outcome"] == "failed"
+    assert rendered_events[1]["code"] == "internal_error"
     for sensitive_value in (
         claimed_job.submitted_url,
         str(claimed_job.claim.dispatch.execution_attempt_token),

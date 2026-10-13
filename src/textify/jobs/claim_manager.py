@@ -15,6 +15,7 @@ from textify.jobs.types import (
     ClaimHeartbeat,
     ExecutionClaim,
     JobDispatch,
+    JobStatus,
 )
 from textify.logging import LogCode, LogEvent, emit_event
 from textify.transcription.service import TranscriptionExecutionControl
@@ -155,6 +156,12 @@ class ExecutionClaimManager:
             ):
                 raise TranscriptionJobStoreUnavailableError()
             self._claims[claimed_job.claim] = control
+            emit_event(
+                logger,
+                LogEvent.EXECUTION_ATTEMPT_CLAIMED,
+                internal_job_id=claimed_job.claim.dispatch.internal_job_id,
+                job_status=JobStatus.PROCESSING.value,
+            )
         self._update_drained_state()
         return claimed_job
 
@@ -221,6 +228,11 @@ class ExecutionClaimManager:
                 heartbeat = heartbeat_by_claim.get(claim)
                 if heartbeat is None:
                     self._ownership_lost.add(claim)
+                    emit_event(
+                        logger,
+                        LogEvent.EXECUTION_ATTEMPT_OWNERSHIP_LOST,
+                        internal_job_id=claim.dispatch.internal_job_id,
+                    )
                     control.request_cancellation()
                     continue
                 if heartbeat.cancellation_requested:
