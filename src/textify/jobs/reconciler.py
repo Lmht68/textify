@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import signal
 import time
 from dataclasses import dataclass
 from datetime import timedelta
+from typing import Literal
 from uuid import uuid4
 
 from textify.config import AppConfig
+from textify.errors import InternalError
 from textify.jobs.celery_app import create_celery_app
 from textify.jobs.config import (
     CacheConfig,
@@ -36,9 +39,28 @@ from textify.jobs.readiness import (
 )
 from textify.jobs.repository import PostgresTranscriptionJobRepository
 from textify.jobs.service import utc_now
-from textify.logging import LogCode, LogEvent, configure_logging, emit_event
+from textify.logging import (
+    LogCode,
+    LogEvent,
+    LogServiceRole,
+    configure_structured_logging,
+    emit_event,
+)
 
 logger = logging.getLogger(__name__)
+
+_ReconcilerFailureStage = Literal["startup", "runtime", "shutdown"]
+
+
+class _ReconcilerProcessError(Exception):
+    """Carry the safe lifecycle stage for an unexpected process failure."""
+
+    stage: _ReconcilerFailureStage
+
+    def __init__(self, stage: _ReconcilerFailureStage) -> None:
+        """Initialize one stage-specific reconciler process failure."""
+        super().__init__()
+        self.stage = stage
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,7 +190,10 @@ class TranscriptionJobReconciler:
             stop_event: Event set by the process owner to stop scans cleanly.
             heartbeat: Reconciler service-readiness lifecycle.
         """
-        await heartbeat.start()
+        try:
+            await heartbeat.start()
+        except Exception as exc:
+            raise _ReconcilerProcessError("startup") from exc
         emit_event(logger, LogEvent.SERVICE_READY)
         next_cleanup_at = time.monotonic()
         try:
@@ -205,50 +230,71 @@ class TranscriptionJobReconciler:
                         await stop_event.wait()
                 except TimeoutError:
                     continue
+        except Exception as exc:
+            raise _ReconcilerProcessError("runtime") from exc
         finally:
-            await heartbeat.stop()
+            try:
+                await heartbeat.stop()
+            except Exception as exc:
+                raise _ReconcilerProcessError("shutdown") from exc
 
 
 async def run_reconciler() -> None:
     """Run the configured reconciler until the process is interrupted.
 
     Raises:
-        RuntimeError: If PostgreSQL startup validation fails.
+        _ReconcilerProcessError: If application-engine disposal fails.
     """
-    job_config = JobConfig()  # type: ignore[call-arg]
-    dispatch_config = JobDispatchConfig()  # type: ignore[call-arg]
-    cache_config = CacheConfig()
-    validate_redis_role_isolation(dispatch_config, cache_config)
-    engine = create_application_engine(str(job_config.database_url))
+    stop_event = asyncio.Event()
+    running_loop = asyncio.get_running_loop()
+    registered_stop_signals: list[signal.Signals] = []
     try:
-        await verify_application_database(engine)
-        repository = PostgresTranscriptionJobRepository(
-            engine=engine,
-            maximum_outstanding_jobs=job_config.max_outstanding_jobs,
-            queue_timeout=timedelta(seconds=job_config.job_queue_timeout_seconds),
-            terminal_retention=timedelta(seconds=job_config.job_retention_seconds),
-            clock=utc_now,
-        )
-        publisher = CeleryJobDispatchPublisher(create_celery_app(dispatch_config))
-        broker_readiness = RedisBrokerReadiness(dispatch_config)
+        for stop_signal in (signal.SIGINT, signal.SIGTERM):
+            running_loop.add_signal_handler(stop_signal, stop_event.set)
+            registered_stop_signals.append(stop_signal)
+
+        job_config = JobConfig()  # type: ignore[call-arg]
+        dispatch_config = JobDispatchConfig()  # type: ignore[call-arg]
+        cache_config = CacheConfig()
+        validate_redis_role_isolation(dispatch_config, cache_config)
+        engine = create_application_engine(str(job_config.database_url))
         try:
-            await publisher.initialize(broker_readiness)
+            await verify_application_database(engine)
+            repository = PostgresTranscriptionJobRepository(
+                engine=engine,
+                maximum_outstanding_jobs=job_config.max_outstanding_jobs,
+                queue_timeout=timedelta(seconds=job_config.job_queue_timeout_seconds),
+                terminal_retention=timedelta(seconds=job_config.job_retention_seconds),
+                clock=utc_now,
+            )
+            publisher = CeleryJobDispatchPublisher(create_celery_app(dispatch_config))
+            broker_readiness = RedisBrokerReadiness(dispatch_config)
+            try:
+                await publisher.initialize(broker_readiness)
+            finally:
+                await broker_readiness.aclose()
+            heartbeat = ServiceHeartbeatReporter(
+                PostgresServiceHeartbeatRepository(engine),
+                ServiceRole.RECONCILER,
+            )
+            reconciler = TranscriptionJobReconciler(
+                repository,
+                publisher,
+                policy=ReconcilerPolicy(
+                    interval=timedelta(
+                        seconds=dispatch_config.reconciler_interval_seconds
+                    )
+                ),
+            )
+            await reconciler.run(stop_event, heartbeat)
         finally:
-            await broker_readiness.aclose()
-        heartbeat = ServiceHeartbeatReporter(
-            PostgresServiceHeartbeatRepository(engine),
-            ServiceRole.RECONCILER,
-        )
-        reconciler = TranscriptionJobReconciler(
-            repository,
-            publisher,
-            policy=ReconcilerPolicy(
-                interval=timedelta(seconds=dispatch_config.reconciler_interval_seconds)
-            ),
-        )
-        await reconciler.run(asyncio.Event(), heartbeat)
+            try:
+                await engine.dispose()
+            except Exception as exc:
+                raise _ReconcilerProcessError("shutdown") from exc
     finally:
-        await engine.dispose()
+        for stop_signal in registered_stop_signals:
+            running_loop.remove_signal_handler(stop_signal)
 
 
 def _require_positive_duration(value: timedelta, name: str) -> None:
@@ -257,12 +303,29 @@ def _require_positive_duration(value: timedelta, name: str) -> None:
         raise ValueError(f"{name} must be a positive timedelta.")
 
 
+def _raise_service_failed(stage: _ReconcilerFailureStage) -> None:
+    """Emit one safe process failure event and terminate unsuccessfully."""
+    emit_event(
+        logger,
+        LogEvent.SERVICE_FAILED,
+        stage=stage,
+        code=InternalError.code,
+    )
+    raise SystemExit(1) from None
+
+
 def main() -> None:
     """Start the dedicated Transcription Job reconciler process."""
-    app_config = AppConfig()
-    configure_logging(app_config.log_level)
+    configure_structured_logging(LogServiceRole.RECONCILER)
     emit_event(logger, LogEvent.SERVICE_STARTING)
     try:
+        app_config = AppConfig()
+        configure_structured_logging(LogServiceRole.RECONCILER, app_config.log_level)
         asyncio.run(run_reconciler())
-    finally:
-        emit_event(logger, LogEvent.SERVICE_STOPPING)
+    except KeyboardInterrupt:
+        pass
+    except _ReconcilerProcessError as exc:
+        _raise_service_failed(exc.stage)
+    except Exception:  # noqa: BLE001
+        _raise_service_failed("startup")
+    emit_event(logger, LogEvent.SERVICE_STOPPING)
