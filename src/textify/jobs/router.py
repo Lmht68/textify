@@ -2,9 +2,10 @@
 
 from typing import Annotated, cast
 
-from fastapi import APIRouter, Depends, Path, Request, Response, status
+from fastapi import APIRouter, Depends, Header, Path, Request, Response, status
 
 from textify.errors import ErrorDetail, ErrorResponse, InvalidRequestError
+from textify.identifiers import parse_canonical_uuid4
 from textify.jobs.schemas import (
     ActiveTranscriptionJobLinks,
     CancelledTranscriptionJobResponse,
@@ -26,7 +27,7 @@ from textify.jobs.types import (
 )
 from textify.transcription.schemas import TranscriptRequest
 
-router = APIRouter(prefix="/api/transcription-jobs")
+router = APIRouter(prefix="/api/v1/transcription-jobs")
 
 
 async def get_transcription_job_service(
@@ -85,6 +86,13 @@ _ACTIVE_JOB_RESPONSE_HEADERS = {
     **_JOB_RESPONSE_HEADERS,
     "Retry-After": _RETRY_AFTER_HEADER,
 }
+_CAPACITY_RESPONSE_HEADERS = {
+    **_JOB_RESPONSE_HEADERS,
+    "Retry-After": {
+        "description": "Retry after two seconds when global admission is full.",
+        "schema": {"type": "integer", "example": 2},
+    },
+}
 
 
 async def _require_empty_request_body(request: Request) -> None:
@@ -134,13 +142,18 @@ async def _require_empty_request_body(request: Request) -> None:
             "description": "Possible code: `invalid_request`.",
             "headers": _JOB_RESPONSE_HEADERS,
         },
+        status.HTTP_409_CONFLICT: {
+            "model": ErrorResponse,
+            "description": "Possible code: `idempotency_conflict`.",
+            "headers": _JOB_RESPONSE_HEADERS,
+        },
         status.HTTP_503_SERVICE_UNAVAILABLE: {
             "model": ErrorResponse,
             "description": (
                 "Possible codes: `transcription_capacity_exceeded`, "
-                "`job_store_unavailable`."
+                "`job_store_unavailable`. Capacity responses include `Retry-After: 2`."
             ),
-            "headers": _JOB_RESPONSE_HEADERS,
+            "headers": _CAPACITY_RESPONSE_HEADERS,
         },
         status.HTTP_500_INTERNAL_SERVER_ERROR: {
             "model": ErrorResponse,
@@ -153,6 +166,18 @@ async def create_transcription_job(
     request: TranscriptRequest,
     response: Response,
     service: TranscriptionJobServiceDependency,
+    idempotency_key: Annotated[
+        str,
+        Header(
+            alias="Idempotency-Key",
+            min_length=36,
+            max_length=36,
+            description=(
+                "Canonical lowercase UUIDv4 identifying one intentional submission. "
+                "Reuse only for retries of the identical request."
+            ),
+        ),
+    ],
 ) -> QueuedTranscriptionJobResponse:
     """Accept one valid Supported Platform URL as a durable queued job.
 
@@ -160,11 +185,23 @@ async def create_transcription_job(
         request: Strict submission payload with immutable response exclusions.
         response: Outgoing response used to publish acceptance headers.
         service: Lifespan-owned durable job service.
+        idempotency_key: Required canonical UUIDv4 submission identity.
 
     Returns:
         Committed queued-job capability representation.
+
+    Raises:
+        InvalidRequestError: If the key is malformed or noncanonical.
     """
-    queued_job = await service.submit(request.url, frozenset(request.exclude))
+    try:
+        parsed_idempotency_key = parse_canonical_uuid4(idempotency_key)
+    except ValueError as exc:
+        raise InvalidRequestError() from exc
+    queued_job = await service.submit(
+        request.url,
+        frozenset(request.exclude),
+        parsed_idempotency_key,
+    )
     queued_response = _queued_response(queued_job)
     response.headers["Location"] = queued_response.links.self
     response.headers["Retry-After"] = "2"
@@ -410,4 +447,4 @@ def _cancelled_response(
 
 def _self_link(public_id: object) -> str:
     """Build one relative bearer-capability status URL."""
-    return f"/api/transcription-jobs/{public_id}"
+    return f"/api/v1/transcription-jobs/{public_id}"

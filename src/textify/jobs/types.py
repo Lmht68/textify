@@ -8,6 +8,7 @@ from enum import StrEnum
 from uuid import UUID
 
 from textify.errors import PublicErrorCode
+from textify.identifiers import parse_canonical_uuid4
 from textify.transcription.schemas import TranscriptionResponse
 from textify.transcription.types import ResponseFieldPath
 
@@ -73,13 +74,8 @@ class JobDispatch:
             return None
 
         try:
-            execution_attempt_token = UUID(serialized_token)
+            execution_attempt_token = parse_canonical_uuid4(serialized_token)
         except ValueError:
-            return None
-        if (
-            str(execution_attempt_token) != serialized_token
-            or execution_attempt_token.version != 4
-        ):
             return None
         return cls(
             internal_job_id=internal_job_id,
@@ -104,11 +100,19 @@ class ClaimHeartbeat:
 
 
 @dataclass(frozen=True, slots=True)
-class NewQueuedTranscriptionJob:
-    """Hold private data required to persist one newly admitted job."""
+class TranscriptionJobRequestIdentity:
+    """Identify the exact request represented by one idempotency key."""
 
     submitted_url: str
     exclusions: tuple[ResponseFieldPath, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class NewQueuedTranscriptionJob:
+    """Hold private data required to persist one newly admitted job."""
+
+    request_identity: TranscriptionJobRequestIdentity
+    idempotency_key: UUID
 
 
 @dataclass(frozen=True, slots=True)

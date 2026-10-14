@@ -9,7 +9,7 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient, HTTPError, Response
@@ -740,8 +740,9 @@ async def test_api_admits_jobs_during_broker_readiness_degradation(
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             health_response = await client.get("/health")
             submission_response = await client.post(
-                "/api/transcription-jobs",
+                "/api/v1/transcription-jobs",
                 json={"url": TIKTOK_URL},
+                headers={"Idempotency-Key": str(uuid4())},
             )
             status_response = await client.get(submission_response.headers["Location"])
 
@@ -858,12 +859,15 @@ async def test_api_adds_fresh_request_ids_to_job_route_outcomes(
                 headers={"X-Request-ID": inbound_request_id},
             )
             submission_response = await client.post(
-                "/api/transcription-jobs",
+                "/api/v1/transcription-jobs",
                 json={"url": TIKTOK_URL},
-                headers={"X-Request-ID": inbound_request_id},
+                headers={
+                    "X-Request-ID": inbound_request_id,
+                    "Idempotency-Key": str(uuid4()),
+                },
             )
             validation_response = await client.post(
-                "/api/transcription-jobs",
+                "/api/v1/transcription-jobs",
                 json={"url": TIKTOK_URL, "unknown": "value"},
                 headers={"X-Request-ID": inbound_request_id},
             )

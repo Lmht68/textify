@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from celery.contrib.testing.worker import start_worker
@@ -302,8 +302,9 @@ async def test_api_submission_reconciles_and_retrieves_celery_caption_result(
                     base_url="http://test",
                 ) as client:
                     submission = await client.post(
-                        "/api/transcription-jobs",
+                        "/api/v1/transcription-jobs",
                         json={"url": _YOUTUBE_URL},
+                        headers={"Idempotency-Key": str(uuid4())},
                     )
                     assert submission.status_code == 202
                     location = submission.headers["Location"]

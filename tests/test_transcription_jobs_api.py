@@ -27,6 +27,11 @@ from textify.transcription.types import Platform, TranscriptMethod
 _TIKTOK_URL = "https://www.tiktok.com/@creator/video/1234567890123456789"
 
 
+def _idempotency_headers() -> dict[str, str]:
+    """Return a fresh canonical UUIDv4 header for one intentional submission."""
+    return {"Idempotency-Key": str(uuid4())}
+
+
 def _app_config() -> AppConfig:
     """Build isolated FastAPI configuration.
 
@@ -145,8 +150,9 @@ async def test_api_admits_queued_job_with_bearer_capability_headers(
     """Commit queued work before returning its relative bearer capability."""
     async with _client_for(migrated_postgresql_database_url) as client:
         response = await client.post(
-            "/api/transcription-jobs",
+            "/api/v1/transcription-jobs",
             json={"url": _TIKTOK_URL},
+            headers=_idempotency_headers(),
         )
         body = response.json()
         status = await client.get(response.headers["Location"])
@@ -162,14 +168,91 @@ async def test_api_admits_queued_job_with_bearer_capability_headers(
 
 
 @pytest.mark.asyncio
+async def test_api_replays_conflicts_and_validates_idempotency_header(
+    migrated_postgresql_database_url: str,
+) -> None:
+    """Replay one accepted request, reject conflicts, and normalize bad keys."""
+    idempotency_key = str(uuid4())
+    request = {
+        "url": _TIKTOK_URL,
+        "exclude": ["source.title", "transcript.text"],
+    }
+    async with _client_for(migrated_postgresql_database_url) as client:
+        first = await client.post(
+            "/api/v1/transcription-jobs",
+            json=request,
+            headers={"Idempotency-Key": idempotency_key},
+        )
+        replay = await client.post(
+            "/api/v1/transcription-jobs",
+            json={
+                "exclude": ["transcript.text", "source.title"],
+                "url": _TIKTOK_URL,
+            },
+            headers={"Idempotency-Key": idempotency_key},
+        )
+        conflict = await client.post(
+            "/api/v1/transcription-jobs",
+            json={"url": _TIKTOK_URL, "exclude": ["source.title"]},
+            headers={"Idempotency-Key": idempotency_key},
+        )
+        missing = await client.post(
+            "/api/v1/transcription-jobs",
+            json={"url": _TIKTOK_URL},
+        )
+        noncanonical = await client.post(
+            "/api/v1/transcription-jobs",
+            json={"url": _TIKTOK_URL},
+            headers={"Idempotency-Key": idempotency_key.upper()},
+        )
+
+    assert first.status_code == 202
+    assert replay.status_code == 202
+    assert replay.json() == first.json()
+    assert replay.headers["Location"] == first.headers["Location"]
+    assert _error_code(conflict) == "idempotency_conflict"
+    assert conflict.status_code == 409
+    assert missing.status_code == 422
+    assert _error_code(missing) == "invalid_request"
+    assert noncanonical.status_code == 422
+    assert _error_code(noncanonical) == "invalid_request"
+
+
+@pytest.mark.asyncio
+async def test_api_capacity_retry_header_is_two_seconds(
+    migrated_postgresql_database_url: str,
+) -> None:
+    """Expose the global capacity retry interval on a rejected submission."""
+    async with _client_for(
+        migrated_postgresql_database_url,
+        maximum_outstanding_jobs=1,
+    ) as client:
+        accepted = await client.post(
+            "/api/v1/transcription-jobs",
+            json={"url": _TIKTOK_URL},
+            headers=_idempotency_headers(),
+        )
+        rejected = await client.post(
+            "/api/v1/transcription-jobs",
+            json={"url": f"{_TIKTOK_URL}?capacity=rejected"},
+            headers=_idempotency_headers(),
+        )
+
+    assert accepted.status_code == 202
+    assert rejected.status_code == 503
+    assert rejected.headers["Retry-After"] == "2"
+    assert _error_code(rejected) == "transcription_capacity_exceeded"
+
+
 async def test_api_cancels_queued_job_without_worker_dependencies(
     migrated_postgresql_database_url: str,
 ) -> None:
     """Persist queued cancellation directly through the API's PostgreSQL boundary."""
     async with _client_for(migrated_postgresql_database_url) as client:
         submission = await client.post(
-            "/api/transcription-jobs",
+            "/api/v1/transcription-jobs",
             json={"url": _TIKTOK_URL},
+            headers=_idempotency_headers(),
         )
         cancellation = await client.put(
             f"{submission.headers['Location']}/cancellation",
@@ -194,8 +277,9 @@ async def test_api_emits_correlated_committed_job_lifecycle_events(
     async with _client_for(migrated_postgresql_database_url) as client:
         capsys.readouterr()
         submission = await client.post(
-            "/api/transcription-jobs",
+            "/api/v1/transcription-jobs",
             json={"url": submitted_url},
+            headers=_idempotency_headers(),
         )
         cancellation = await client.put(
             f"{submission.headers['Location']}/cancellation",
@@ -251,11 +335,12 @@ async def test_api_rejects_invalid_capabilities_and_nonempty_cancellation(
 ) -> None:
     """Preserve capability opacity and cancellation's empty-body contract."""
     async with _client_for(migrated_postgresql_database_url) as client:
-        malformed = await client.get("/api/transcription-jobs/not-a-capability")
-        unknown = await client.get(f"/api/transcription-jobs/{uuid4()}")
+        malformed = await client.get("/api/v1/transcription-jobs/not-a-capability")
+        unknown = await client.get(f"/api/v1/transcription-jobs/{uuid4()}")
         submission = await client.post(
-            "/api/transcription-jobs",
+            "/api/v1/transcription-jobs",
             json={"url": _TIKTOK_URL},
+            headers=_idempotency_headers(),
         )
         nonempty_cancellation = await client.put(
             f"{submission.headers['Location']}/cancellation",
@@ -280,16 +365,18 @@ async def test_api_rejects_invalid_requests_and_durable_capacity(
         maximum_outstanding_jobs=1,
     ) as client:
         invalid_request = await client.post(
-            "/api/transcription-jobs",
+            "/api/v1/transcription-jobs",
             json={"url": _TIKTOK_URL, "unknown": "value"},
         )
         first_submission = await client.post(
-            "/api/transcription-jobs",
+            "/api/v1/transcription-jobs",
             json={"url": _TIKTOK_URL},
+            headers=_idempotency_headers(),
         )
         capacity_rejected = await client.post(
-            "/api/transcription-jobs",
+            "/api/v1/transcription-jobs",
             json={"url": _TIKTOK_URL},
+            headers=_idempotency_headers(),
         )
 
     assert invalid_request.status_code == 422
@@ -355,8 +442,9 @@ async def test_api_retention_hides_expired_terminal_job_and_preserves_active_job
             ) as client,
         ):
             terminal_submission = await client.post(
-                "/api/transcription-jobs",
+                "/api/v1/transcription-jobs",
                 json={"url": _TIKTOK_URL},
+                headers=_idempotency_headers(),
             )
             terminal_location = terminal_submission.headers["Location"]
             assert terminal_submission.status_code == 202
@@ -415,8 +503,9 @@ async def test_api_retention_hides_expired_terminal_job_and_preserves_active_job
 
             clock[0] = initial_clock + retention - timedelta(microseconds=1)
             processing_submission = await client.post(
-                "/api/transcription-jobs",
+                "/api/v1/transcription-jobs",
                 json={"url": f"{_TIKTOK_URL}?job=processing"},
+                headers=_idempotency_headers(),
             )
             processing_location = processing_submission.headers["Location"]
             assert processing_submission.status_code == 202
@@ -442,8 +531,9 @@ async def test_api_retention_hides_expired_terminal_job_and_preserves_active_job
             assert processing_claim is not None
 
             queued_submission = await client.post(
-                "/api/transcription-jobs",
+                "/api/v1/transcription-jobs",
                 json={"url": f"{_TIKTOK_URL}?job=queued"},
+                headers=_idempotency_headers(),
             )
             queued_location = queued_submission.headers["Location"]
             assert queued_submission.status_code == 202

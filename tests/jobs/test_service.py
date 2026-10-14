@@ -122,9 +122,9 @@ async def test_service_latches_store_failure_and_closes_subsequent_admission() -
     )
 
     with pytest.raises(JobStoreUnavailableError):
-        await service.submit("https://youtu.be/AbCdEf12345", frozenset())
+        await service.submit("https://youtu.be/AbCdEf12345", frozenset(), uuid4())
     with pytest.raises(JobStoreUnavailableError):
-        await service.submit("https://youtu.be/AbCdEf12345", frozenset())
+        await service.submit("https://youtu.be/AbCdEf12345", frozenset(), uuid4())
 
     assert repository.admission_calls == 1
     assert unavailable_transitions == [None]
@@ -166,6 +166,7 @@ async def test_service_emits_committed_admission_and_cancellation_events(
         admission = await service.submit(
             "https://www.youtube.com/watch?v=AbCdEf12345",
             frozenset(),
+            uuid4(),
         )
         first_processing = await service.cancel(str(uuid4()))
         repeated_processing = await service.cancel(str(uuid4()))

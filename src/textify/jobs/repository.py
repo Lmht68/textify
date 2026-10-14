@@ -1,7 +1,5 @@
 """PostgreSQL persistence for durable Transcription Jobs."""
 
-from __future__ import annotations
-
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -45,6 +43,7 @@ from textify.errors import ErrorDetail
 from textify.jobs.contracts import (
     TranscriptionJobAlreadyFinishedError,
     TranscriptionJobCapacityError,
+    TranscriptionJobIdempotencyConflictError,
     TranscriptionJobStoreUnavailableError,
 )
 from textify.jobs.exceptions import QueueTimeoutError, WorkerInterruptedError
@@ -148,6 +147,28 @@ transcription_job = Table(
         "OR (started_at IS NOT NULL AND cancellation_requested = TRUE)"
         "))))",
         name="transcription_job_lifecycle_check",
+    ),
+)
+
+transcription_job_idempotency = Table(
+    "transcription_job_idempotency",
+    metadata,
+    Column(
+        "job_id",
+        BigInteger,
+        ForeignKey("transcription_job.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("idempotency_key", PostgreSQLUUID(as_uuid=True), nullable=False),
+    PrimaryKeyConstraint("job_id", name="transcription_job_idempotency_pkey"),
+    UniqueConstraint(
+        "idempotency_key",
+        name="transcription_job_idempotency_key_key",
+    ),
+    CheckConstraint(
+        "(get_byte(uuid_send(idempotency_key), 6) & 240) = 64 "
+        "AND (get_byte(uuid_send(idempotency_key), 8) & 192) = 128",
+        name="transcription_job_idempotency_key_uuid4_check",
     ),
 )
 
@@ -445,20 +466,65 @@ class PostgresTranscriptionJobRepository:
         self,
         job: NewQueuedTranscriptionJob,
     ) -> QueuedTranscriptionJob:
-        """Atomically admit and persist one queued Transcription Job.
+        """Atomically admit, persist, or replay one queued Transcription Job.
 
         Args:
-            job: Validated private source URL and sorted immutable exclusions.
+            job: Validated private source URL, exclusions, and submission identity.
 
         Returns:
-            Safe committed queued-job snapshot without private submission fields.
+            Safe committed queued-job acceptance snapshot. A replay keeps the
+            original capability and acceptance timestamp even after lifecycle
+            processing has advanced.
 
         Raises:
-            TranscriptionJobCapacityError: If outstanding jobs already meet capacity.
-            TranscriptionJobStoreUnavailableError: If PostgreSQL cannot commit the job.
+            TranscriptionJobCapacityError: If new admission meets capacity.
+            TranscriptionJobIdempotencyConflictError: If a key has another identity.
+            TranscriptionJobStoreUnavailableError: If PostgreSQL cannot commit.
         """
+        idempotency_key = job.idempotency_key
+        _require_uuid4(idempotency_key, "idempotency_key")
+        submitted_url = job.request_identity.submitted_url
+        exclusions = job.request_identity.exclusions
+
         try:
             async with self._serialized_lifecycle_transaction() as connection:
+                existing_row = (
+                    (
+                        await connection.execute(
+                            select(transcription_job)
+                            .join(
+                                transcription_job_idempotency,
+                                transcription_job.c.id
+                                == transcription_job_idempotency.c.job_id,
+                            )
+                            .where(
+                                transcription_job_idempotency.c.idempotency_key
+                                == idempotency_key
+                            )
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                if existing_row is not None:
+                    stored_exclusions = (
+                        (
+                            await connection.execute(
+                                select(transcription_job_exclusion.c.field_path).where(
+                                    transcription_job_exclusion.c.job_id
+                                    == existing_row["id"]
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    if existing_row["submitted_url"] != submitted_url or set(
+                        stored_exclusions
+                    ) != set(exclusions):
+                        raise TranscriptionJobIdempotencyConflictError()
+                    return _accepted_job_from_row(existing_row)
+
                 outstanding_jobs = await self._count_outstanding_jobs(connection)
                 if outstanding_jobs >= self._maximum_outstanding_jobs:
                     raise TranscriptionJobCapacityError()
@@ -471,7 +537,7 @@ class PostgresTranscriptionJobRepository:
                     insert(transcription_job)
                     .values(
                         public_id=public_id,
-                        submitted_url=job.submitted_url,
+                        submitted_url=submitted_url,
                         status="queued",
                         submitted_at=submitted_at,
                         queue_deadline_at=queue_deadline_at,
@@ -481,12 +547,12 @@ class PostgresTranscriptionJobRepository:
                 )
                 if not isinstance(internal_id, int):
                     raise TranscriptionJobStoreUnavailableError()
-                if job.exclusions:
+                if exclusions:
                     await connection.execute(
                         insert(transcription_job_exclusion),
                         [
                             {"job_id": internal_id, "field_path": field_path}
-                            for field_path in job.exclusions
+                            for field_path in exclusions
                         ],
                     )
                 await connection.execute(
@@ -497,7 +563,15 @@ class PostgresTranscriptionJobRepository:
                         dispatch_count=0,
                     )
                 )
+                await connection.execute(
+                    insert(transcription_job_idempotency).values(
+                        job_id=internal_id,
+                        idempotency_key=idempotency_key,
+                    )
+                )
         except TranscriptionJobCapacityError:
+            raise
+        except TranscriptionJobIdempotencyConflictError:
             raise
         except TranscriptionJobStoreUnavailableError:
             raise
@@ -1716,6 +1790,16 @@ def _claimed_job(
         claim=claim,
         submitted_url=submitted_url,
         exclusions=exclusions,
+    )
+
+
+def _accepted_job_from_row(row: RowMapping) -> QueuedTranscriptionJob:
+    """Build the original queued acceptance from any retained lifecycle row."""
+    return _queued_job(
+        internal_id=_internal_id_from_row(row),
+        public_id=_public_id_from_row(row),
+        submitted_at=_datetime_from_row(row, "submitted_at"),
+        queue_deadline_at=_datetime_from_row(row, "queue_deadline_at"),
     )
 
 

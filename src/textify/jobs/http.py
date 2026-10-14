@@ -43,6 +43,6 @@ class TranscriptionJobHeadersMiddleware:
 
 def _is_transcription_job_path(path: str) -> bool:
     """Return whether a path addresses the durable job API."""
-    return path == "/api/transcription-jobs" or path.startswith(
-        "/api/transcription-jobs/"
+    return path == "/api/v1/transcription-jobs" or path.startswith(
+        "/api/v1/transcription-jobs/"
     )

@@ -31,6 +31,10 @@ class TranscriptionJobAlreadyFinishedError(RuntimeError):
     """Indicate cancellation targeted a completed non-cancelled job."""
 
 
+class TranscriptionJobIdempotencyConflictError(RuntimeError):
+    """Indicate a key was reused for a different request identity."""
+
+
 class TranscriptionJobApiRepository(Protocol):
     """Provide durable operations required by the Transcription Job HTTP lifecycle."""
 

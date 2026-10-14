@@ -21,6 +21,7 @@ PublicErrorCode = Literal[
     "audio_download_failed",
     "transcription_failed",
     "transcription_capacity_exceeded",
+    "idempotency_conflict",
     "job_not_found",
     "job_already_finished",
     "job_store_unavailable",
@@ -122,9 +123,15 @@ async def textify_error_handler(
     """
     error = cast(TextifyError, exc)
     bind_request_log_fields(code=error.code)
+    headers = (
+        {"Retry-After": "2"}
+        if error.code == "transcription_capacity_exceeded"
+        else None
+    )
     return JSONResponse(
         status_code=error.status_code,
         content={"error": {"code": error.code, "message": error.message}},
+        headers=headers,
     )
 
 

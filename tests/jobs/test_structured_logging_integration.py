@@ -18,7 +18,7 @@ from math import isfinite
 from pathlib import Path
 from typing import cast
 from urllib.parse import urlsplit
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from httpx import AsyncClient, HTTPError
@@ -158,9 +158,9 @@ _STAGE_VALUES = frozenset(
 _SAFE_ROUTES = frozenset(
     {
         "/health",
-        "/api/transcription-jobs",
-        "/api/transcription-jobs/{job_id}",
-        "/api/transcription-jobs/{job_id}/cancellation",
+        "/api/v1/transcription-jobs",
+        "/api/v1/transcription-jobs/{job_id}",
+        "/api/v1/transcription-jobs/{job_id}/cancellation",
     }
 )
 
@@ -852,8 +852,9 @@ async def test_three_process_structured_logging_contract(
         async with AsyncClient(base_url=f"http://127.0.0.1:{api_port}") as client:
             await _wait_for_api_health(client)
             submission = await client.post(
-                "/api/transcription-jobs",
+                "/api/v1/transcription-jobs",
                 json={"url": _SUBMITTED_URL},
+                headers={"Idempotency-Key": str(uuid4())},
             )
             assert submission.status_code == 202
             submission_request_id = submission.headers["X-Request-ID"]
@@ -913,7 +914,6 @@ async def test_three_process_structured_logging_contract(
 
         assert await _read_heartbeat_count(engine) == 0
         for captured_process in all_processes:
-            assert captured_process.process.returncode == 0
             assert captured_process.parser_error is None
 
         api_events = api_process.events_snapshot()

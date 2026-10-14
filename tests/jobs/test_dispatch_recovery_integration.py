@@ -41,6 +41,7 @@ from textify.jobs.types import (
     JobDispatch,
     NewQueuedTranscriptionJob,
     TranscriptionJob,
+    TranscriptionJobRequestIdentity,
 )
 from textify.jobs.worker import (
     TranscriptionWorkerRuntime,
@@ -52,12 +53,26 @@ from textify.transcription import inspection
 from textify.transcription.config import TranscriptionConfig
 from textify.transcription.exceptions import NoUsableTranscriptError
 from textify.transcription.service import TranscriptionAdapters, TranscriptionExecutor
-from textify.transcription.types import TimedTranscript
+from textify.transcription.types import ResponseFieldPath, TimedTranscript
 
 _YOUTUBE_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 _QUEUE_TIMEOUT = timedelta(seconds=20)
 
 _TERMINAL_RETENTION = timedelta(days=1)
+
+
+def _new_queued_job(
+    submitted_url: str,
+    exclusions: tuple[ResponseFieldPath, ...] = (),
+) -> NewQueuedTranscriptionJob:
+    """Build one fully identified queued-job admission for recovery tests."""
+    return NewQueuedTranscriptionJob(
+        request_identity=TranscriptionJobRequestIdentity(
+            submitted_url=submitted_url,
+            exclusions=exclusions,
+        ),
+        idempotency_key=uuid4(),
+    )
 
 
 class _CaptionTrack:
@@ -550,8 +565,9 @@ async def test_broker_outage_expires_public_job_without_false_execution(
         await restartable_redis_broker.stop()
         async with _public_client(migrated_postgresql_database_url) as client:
             accepted = await client.post(
-                "/api/transcription-jobs",
+                "/api/v1/transcription-jobs",
                 json={"url": f"{_YOUTUBE_URL}&job=broker-outage"},
+                headers={"Idempotency-Key": str(uuid4())},
             )
             assert accepted.status_code == 202
             location = accepted.headers["Location"]
@@ -593,7 +609,7 @@ async def test_broker_restart_recovers_lost_delivery(
     provider = _CaptionProvider()
     try:
         lost_job = await first_repository.create_queued(
-            NewQueuedTranscriptionJob(f"{_YOUTUBE_URL}&job=lost", ())
+            _new_queued_job(f"{_YOUTUBE_URL}&job=lost", ())
         )
         await TranscriptionJobReconciler(
             first_repository,
@@ -657,7 +673,7 @@ async def test_pre_publication_crash_recovers_expired_lease(
     provider = _CaptionProvider()
     try:
         pre_crash_job = await first_repository.create_queued(
-            NewQueuedTranscriptionJob(f"{_YOUTUBE_URL}&job=pre-crash", ())
+            _new_queued_job(f"{_YOUTUBE_URL}&job=pre-crash", ())
         )
         with pytest.raises(_SyntheticProcessExit):
             await TranscriptionJobReconciler(
@@ -726,7 +742,7 @@ async def test_post_publication_crash_recovers_lost_delivery(
     provider = _CaptionProvider()
     try:
         post_crash_job = await first_repository.create_queued(
-            NewQueuedTranscriptionJob(f"{_YOUTUBE_URL}&job=post-crash", ())
+            _new_queued_job(f"{_YOUTUBE_URL}&job=post-crash", ())
         )
         with pytest.raises(_SyntheticProcessExit):
             await TranscriptionJobReconciler(
@@ -790,7 +806,7 @@ async def test_concurrent_reconcilers_lease_disjoint_real_broker_batches(
         queued_jobs = tuple(
             [
                 await submitting_repository.create_queued(
-                    NewQueuedTranscriptionJob(
+                    _new_queued_job(
                         f"{_YOUTUBE_URL}&job=concurrent-{index}",
                         (),
                     )
@@ -863,7 +879,7 @@ async def test_real_redis_payload_and_sql_interruptions_preserve_recovery(
 
     try:
         queued_job = await repository.create_queued(
-            NewQueuedTranscriptionJob(f"{_YOUTUBE_URL}&job=payload", ())
+            _new_queued_job(f"{_YOUTUBE_URL}&job=payload", ())
         )
         await TranscriptionJobReconciler(
             repository, publisher, policy=_policy()
@@ -887,7 +903,7 @@ async def test_real_redis_payload_and_sql_interruptions_preserve_recovery(
         )
 
         interrupted_job = await repository.create_queued(
-            NewQueuedTranscriptionJob(f"{_YOUTUBE_URL}&job=sql-interruption", ())
+            _new_queued_job(f"{_YOUTUBE_URL}&job=sql-interruption", ())
         )
         event.listen(engine.sync_engine, "before_cursor_execute", fail_once)
         try:
@@ -944,10 +960,10 @@ async def test_real_worker_rejects_reverse_fifo_delivery_before_private_executio
     metadata_extractor = _MetadataExtractor()
     try:
         older_job = await repository.create_queued(
-            NewQueuedTranscriptionJob(f"{_YOUTUBE_URL}&job=fifo-older", ())
+            _new_queued_job(f"{_YOUTUBE_URL}&job=fifo-older", ())
         )
         newer_job = await repository.create_queued(
-            NewQueuedTranscriptionJob(f"{_YOUTUBE_URL}&job=fifo-newer", ())
+            _new_queued_job(f"{_YOUTUBE_URL}&job=fifo-newer", ())
         )
         dispatches = await repository.lease_due_dispatches(
             uuid4(),
@@ -973,10 +989,10 @@ async def test_real_worker_rejects_reverse_fifo_delivery_before_private_executio
         ):
             await _wait_for_empty_queue(redis_client)
             assert (
-                await client.get(f"/api/transcription-jobs/{older_job.public_id}")
+                await client.get(f"/api/v1/transcription-jobs/{older_job.public_id}")
             ).json()["status"] == "queued"
             assert (
-                await client.get(f"/api/transcription-jobs/{newer_job.public_id}")
+                await client.get(f"/api/v1/transcription-jobs/{newer_job.public_id}")
             ).json()["status"] == "queued"
             assert provider.starts == []
 
@@ -1030,7 +1046,7 @@ async def test_duplicate_deliveries_start_attempts_once_across_terminal_outcomes
     metadata_extractor = _MetadataExtractor()
     try:
         before_claim_job = await repository.create_queued(
-            NewQueuedTranscriptionJob(f"{_YOUTUBE_URL}&job=before-claim", ())
+            _new_queued_job(f"{_YOUTUBE_URL}&job=before-claim", ())
         )
         before_claim_dispatch = await _lease_one(repository)
         await publisher.publish(before_claim_dispatch)
@@ -1066,7 +1082,7 @@ async def test_duplicate_deliveries_start_attempts_once_across_terminal_outcomes
         provider.started.clear()
         provider.release.clear()
         blocked_job = await repository.create_queued(
-            NewQueuedTranscriptionJob(f"{_YOUTUBE_URL}&job=blocked", ())
+            _new_queued_job(f"{_YOUTUBE_URL}&job=blocked", ())
         )
         blocked_dispatch = await _lease_one(repository)
         await publisher.publish(blocked_dispatch)
@@ -1088,7 +1104,7 @@ async def test_duplicate_deliveries_start_attempts_once_across_terminal_outcomes
         provider.mode = "failing"
         provider.started.clear()
         failed_job = await repository.create_queued(
-            NewQueuedTranscriptionJob(f"{_YOUTUBE_URL}&job=failed", ())
+            _new_queued_job(f"{_YOUTUBE_URL}&job=failed", ())
         )
         failed_dispatch = await _lease_one(repository)
         await publisher.publish(failed_dispatch)
@@ -1107,7 +1123,7 @@ async def test_duplicate_deliveries_start_attempts_once_across_terminal_outcomes
 
         provider.mode = "normal"
         cancelled_job = await repository.create_queued(
-            NewQueuedTranscriptionJob(f"{_YOUTUBE_URL}&job=cancelled", ())
+            _new_queued_job(f"{_YOUTUBE_URL}&job=cancelled", ())
         )
         cancelled_dispatch = await _lease_one(repository)
         await repository.request_cancellation(cancelled_job.public_id)
@@ -1125,7 +1141,7 @@ async def test_duplicate_deliveries_start_attempts_once_across_terminal_outcomes
             await _wait_for_task_completions(completion_tracker, 2)
 
         await repository.create_queued(
-            NewQueuedTranscriptionJob(f"{_YOUTUBE_URL}&job=timeout", ())
+            _new_queued_job(f"{_YOUTUBE_URL}&job=timeout", ())
         )
         timeout_dispatch = await _lease_one(repository)
         clock[0] += _QUEUE_TIMEOUT

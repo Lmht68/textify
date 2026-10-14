@@ -5,7 +5,7 @@ import math
 import os
 from datetime import UTC, datetime
 from urllib.parse import urlsplit
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from httpx import AsyncClient, Response, Timeout
@@ -73,7 +73,7 @@ def _assert_active_job(
     job_id = _assert_canonical_job_id(payload["id"])
     if expected_job_id is not None:
         assert job_id == expected_job_id
-    _assert_relative_capability_link(location, f"/api/transcription-jobs/{job_id}")
+    _assert_relative_capability_link(location, f"/api/v1/transcription-jobs/{job_id}")
     links = _mapping(payload["links"])
     assert set(links) == {"self", "cancel"}
     assert links["self"] == location
@@ -267,7 +267,11 @@ async def test_two_captionless_youtube_videos_complete_through_native_worker() -
 
         submissions = await asyncio.gather(
             *(
-                client.post("/api/transcription-jobs", json={"url": source_url})
+                client.post(
+                    "/api/v1/transcription-jobs",
+                    json={"url": source_url},
+                    headers={"Idempotency-Key": str(uuid4())},
+                )
                 for source_url in (LIVE_YOUTUBE_URL_A, LIVE_YOUTUBE_URL_B)
             )
         )
@@ -328,8 +332,9 @@ async def test_configured_public_videos_match_transcription_job_contract() -> No
 
         for expected_platform, source_url in LIVE_SOURCES:
             submission = await client.post(
-                "/api/transcription-jobs",
+                "/api/v1/transcription-jobs",
                 json={"url": source_url},
+                headers={"Idempotency-Key": str(uuid4())},
             )
             assert submission.status_code == 202
             assert submission.headers.get("X-Request-ID")

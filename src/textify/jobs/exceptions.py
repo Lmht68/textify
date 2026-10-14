@@ -11,6 +11,14 @@ class TranscriptionCapacityExceededError(TextifyError):
     message = "Transcription capacity is currently unavailable."
 
 
+class IdempotencyConflictError(TextifyError):
+    """Indicate that a key was reused for a different submission identity."""
+
+    status_code = 409
+    code = "idempotency_conflict"
+    message = "The idempotency key was already used for a different request."
+
+
 class JobNotFoundError(TextifyError):
     """Indicate that a Transcription Job bearer capability is unavailable."""
 

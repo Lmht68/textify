@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import event, text
@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from textify.jobs.contracts import (
     TranscriptionJobCapacityError,
+    TranscriptionJobIdempotencyConflictError,
     TranscriptionJobStoreUnavailableError,
 )
 from textify.jobs.database import create_application_engine
@@ -23,10 +24,12 @@ from textify.jobs.types import (
     ExecutionClaim,
     FailedTranscriptionJob,
     JobDispatch,
+    JobStatus,
     NewQueuedTranscriptionJob,
     ProcessingTranscriptionJob,
     QueuedTranscriptionJob,
     SucceededTranscriptionJob,
+    TranscriptionJobRequestIdentity,
 )
 from textify.transcription.schemas import TranscriptionResponse
 from textify.transcription.types import Platform, TranscriptMethod
@@ -84,11 +87,20 @@ async def _dispose_engines(*engines: AsyncEngine) -> None:
     await asyncio.gather(*(engine.dispose() for engine in engines))
 
 
-def _queued_job(source_suffix: str) -> NewQueuedTranscriptionJob:
+def _queued_job(
+    source_suffix: str,
+    *,
+    idempotency_key: UUID | None = None,
+) -> NewQueuedTranscriptionJob:
     """Create one valid private queued-job input with a distinct source URL."""
+    submitted_url = f"https://www.youtube.com/watch?v=AbCdEf12345&job={source_suffix}"
+    exclusions = ()
     return NewQueuedTranscriptionJob(
-        submitted_url=f"https://www.youtube.com/watch?v=AbCdEf12345&job={source_suffix}",
-        exclusions=(),
+        request_identity=TranscriptionJobRequestIdentity(
+            submitted_url=submitted_url,
+            exclusions=exclusions,
+        ),
+        idempotency_key=idempotency_key or uuid4(),
     )
 
 
@@ -171,6 +183,183 @@ async def test_postgres_repositories_enforce_capacity_across_sessions(
     assert len(capacity_errors) == 1
     assert job_count == 1
     assert attempt_count == 1
+
+
+async def test_postgres_idempotency_replays_and_conflicts(
+    migrated_postgresql_database_url: str,
+) -> None:
+    """Replay the original acceptance through processing and terminal completion."""
+    clock = [_INITIAL]
+    repository, engine = _repository(
+        migrated_postgresql_database_url,
+        maximum_outstanding_jobs=3,
+        clock=clock,
+    )
+    idempotency_key = uuid4()
+    try:
+        first = await repository.create_queued(
+            _queued_job("idempotent", idempotency_key=idempotency_key)
+        )
+        replay = await repository.create_queued(
+            _queued_job("idempotent", idempotency_key=idempotency_key)
+        )
+        publication_owner = uuid4()
+        dispatch = (
+            await repository.lease_due_dispatches(
+                publication_owner,
+                timedelta(seconds=5),
+                limit=100,
+            )
+        )[0]
+        assert await repository.record_dispatch_published(
+            dispatch,
+            publication_owner,
+            timedelta(seconds=5),
+        )
+        claimed = await _claim_dispatch(repository, dispatch)
+        assert claimed is not None
+        processing_replay = await repository.create_queued(
+            _queued_job("idempotent", idempotency_key=idempotency_key)
+        )
+        assert await repository.publish_success(claimed.claim, _projected_result())
+        finished_replay = await repository.create_queued(
+            _queued_job("idempotent", idempotency_key=idempotency_key)
+        )
+        with pytest.raises(TranscriptionJobIdempotencyConflictError):
+            await repository.create_queued(
+                _queued_job("different", idempotency_key=idempotency_key)
+            )
+        async with engine.connect() as connection:
+            counts = tuple(
+                await connection.scalars(
+                    text(
+                        "SELECT count(*) FROM transcription_job "
+                        "UNION ALL SELECT count(*) FROM "
+                        "transcription_job_execution_attempt "
+                        "UNION ALL SELECT count(*) FROM "
+                        "transcription_job_idempotency "
+                        "UNION ALL SELECT coalesce(sum(dispatch_count), 0) "
+                        "FROM transcription_job_execution_attempt"
+                    )
+                )
+            )
+    finally:
+        await engine.dispose()
+
+    assert replay == first
+    assert processing_replay == first
+    assert finished_replay == first
+    assert counts == (1, 1, 1, 1)
+
+
+async def test_postgres_concurrent_idempotent_admission_creates_one_job(
+    migrated_postgresql_database_url: str,
+) -> None:
+    """Serialize identical submissions from independent PostgreSQL sessions."""
+    clock = [_INITIAL]
+    first_repository, first_engine = _repository(
+        migrated_postgresql_database_url,
+        maximum_outstanding_jobs=2,
+        clock=clock,
+    )
+    second_repository, second_engine = _repository(
+        migrated_postgresql_database_url,
+        maximum_outstanding_jobs=2,
+        clock=clock,
+    )
+    idempotency_key = uuid4()
+    try:
+        admissions = await asyncio.gather(
+            first_repository.create_queued(
+                _queued_job("concurrent", idempotency_key=idempotency_key)
+            ),
+            second_repository.create_queued(
+                _queued_job("concurrent", idempotency_key=idempotency_key)
+            ),
+        )
+        async with first_engine.connect() as connection:
+            counts = tuple(
+                await connection.scalars(
+                    text(
+                        "SELECT count(*) FROM transcription_job "
+                        "UNION ALL SELECT count(*) FROM "
+                        "transcription_job_execution_attempt "
+                        "UNION ALL SELECT count(*) FROM "
+                        "transcription_job_idempotency"
+                    )
+                )
+            )
+    finally:
+        await _dispose_engines(first_engine, second_engine)
+
+    assert admissions[0] == admissions[1]
+    assert counts == (1, 1, 1)
+
+
+async def test_postgres_capacity_rejection_does_not_consume_key(
+    migrated_postgresql_database_url: str,
+) -> None:
+    """Allow a capacity-rejected key to succeed after capacity is released."""
+    clock = [_INITIAL]
+    repository, engine = _repository(
+        migrated_postgresql_database_url,
+        maximum_outstanding_jobs=1,
+        clock=clock,
+    )
+    accepted_key = uuid4()
+    rejected_key = uuid4()
+    try:
+        accepted = await repository.create_queued(
+            _queued_job("capacity-accepted", idempotency_key=accepted_key)
+        )
+        with pytest.raises(TranscriptionJobCapacityError):
+            await repository.create_queued(
+                _queued_job("capacity-rejected", idempotency_key=rejected_key)
+            )
+        cancellation = await repository.request_cancellation(accepted.public_id)
+        assert cancellation is not None
+        admitted = await repository.create_queued(
+            _queued_job("capacity-rejected", idempotency_key=rejected_key)
+        )
+    finally:
+        await engine.dispose()
+
+    assert admitted.status == JobStatus.QUEUED
+
+
+async def test_postgres_retention_cleanup_removes_key_for_reuse(
+    migrated_postgresql_database_url: str,
+) -> None:
+    """Delete the key with its expired job before allowing reuse."""
+    clock = [_INITIAL]
+    repository, engine = _repository(
+        migrated_postgresql_database_url,
+        maximum_outstanding_jobs=2,
+        clock=clock,
+    )
+    idempotency_key = uuid4()
+    try:
+        original = await repository.create_queued(
+            _queued_job("retention", idempotency_key=idempotency_key)
+        )
+        dispatch = (await _lease_due_dispatches(repository))[0]
+        claimed = await _claim_dispatch(repository, dispatch)
+        assert claimed is not None
+        assert await repository.publish_failure(
+            claimed.claim,
+            "internal_error",
+            "The retained test job failed.",
+        )
+        clock[0] += _TERMINAL_RETENTION + timedelta(seconds=1)
+        await repository.delete_expired_terminal_jobs()
+        assert await repository.get_job(original.public_id) is None
+        replacement = await repository.create_queued(
+            _queued_job("retention", idempotency_key=idempotency_key)
+        )
+    finally:
+        await engine.dispose()
+
+    assert replacement.public_id != original.public_id
 
 
 async def test_postgres_repositories_enforce_fifo_claims_after_reversed_delivery(
@@ -273,6 +462,15 @@ async def test_postgres_admission_rolls_back_job_exclusions_and_attempt(
         maximum_outstanding_jobs=1,
         clock=clock,
     )
+    submitted_url = "https://www.youtube.com/watch?v=AbCdEf12345&job=rollback"
+    idempotency_key = uuid4()
+    queued_input = NewQueuedTranscriptionJob(
+        request_identity=TranscriptionJobRequestIdentity(
+            submitted_url=submitted_url,
+            exclusions=("transcript.text",),
+        ),
+        idempotency_key=idempotency_key,
+    )
 
     def reject_attempt_insert(*args: object) -> None:
         """Fail only the attempt insert after the parent job was staged."""
@@ -286,16 +484,12 @@ async def test_postgres_admission_rolls_back_job_exclusions_and_attempt(
     event.listen(engine.sync_engine, "before_cursor_execute", reject_attempt_insert)
     try:
         with pytest.raises(TranscriptionJobStoreUnavailableError):
-            await repository.create_queued(
-                NewQueuedTranscriptionJob(
-                    submitted_url=(
-                        "https://www.youtube.com/watch?v=AbCdEf12345&job=rollback"
-                    ),
-                    exclusions=("transcript.text",),
-                )
-            )
+            await repository.create_queued(queued_input)
     finally:
         event.remove(engine.sync_engine, "before_cursor_execute", reject_attempt_insert)
+
+    admitted = await repository.create_queued(queued_input)
+    assert admitted.status.value == "queued"
 
     try:
         async with engine.connect() as connection:
@@ -306,13 +500,14 @@ async def test_postgres_admission_rolls_back_job_exclusions_and_attempt(
                         "transcription_job",
                         "transcription_job_exclusion",
                         "transcription_job_execution_attempt",
+                        "transcription_job_idempotency",
                     )
                 ]
             )
     finally:
         await engine.dispose()
 
-    assert relation_counts == (0, 0, 0)
+    assert relation_counts == (1, 1, 1, 1)
 
 
 async def test_postgres_dispatch_leases_are_private(

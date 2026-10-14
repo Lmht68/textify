@@ -31,6 +31,7 @@ EXPECTED_PUBLIC_ERROR_CODES = {
     "audio_download_failed",
     "transcription_failed",
     "transcription_capacity_exceeded",
+    "idempotency_conflict",
     "job_not_found",
     "job_already_finished",
     "job_store_unavailable",
@@ -53,24 +54,24 @@ async def test_openapi_describes_job_only_transcription_contract() -> None:
     document = response.json()
     assert set(document["paths"]) == {
         "/health",
-        "/api/transcription-jobs",
-        "/api/transcription-jobs/{job_id}",
-        "/api/transcription-jobs/{job_id}/cancellation",
+        "/api/v1/transcription-jobs",
+        "/api/v1/transcription-jobs/{job_id}",
+        "/api/v1/transcription-jobs/{job_id}/cancellation",
     }
     assert {path: set(path_item) for path, path_item in document["paths"].items()} == {
         "/health": {"get"},
-        "/api/transcription-jobs": {"post"},
-        "/api/transcription-jobs/{job_id}": {"get"},
-        "/api/transcription-jobs/{job_id}/cancellation": {"put"},
+        "/api/v1/transcription-jobs": {"post"},
+        "/api/v1/transcription-jobs/{job_id}": {"get"},
+        "/api/v1/transcription-jobs/{job_id}/cancellation": {"put"},
     }
     assert "synchronous" not in document["info"]["description"].casefold()
 
     components = document["components"]["schemas"]
     health_operation = document["paths"]["/health"]["get"]
-    submission_operation = document["paths"]["/api/transcription-jobs"]["post"]
-    status_operation = document["paths"]["/api/transcription-jobs/{job_id}"]["get"]
+    submission_operation = document["paths"]["/api/v1/transcription-jobs"]["post"]
+    status_operation = document["paths"]["/api/v1/transcription-jobs/{job_id}"]["get"]
     cancellation_operation = document["paths"][
-        "/api/transcription-jobs/{job_id}/cancellation"
+        "/api/v1/transcription-jobs/{job_id}/cancellation"
     ]["put"]
     operations = (
         health_operation,
@@ -89,7 +90,7 @@ async def test_openapi_describes_job_only_transcription_contract() -> None:
         }.items()
     } == {
         "health": {"200", "503"},
-        "submission": {"202", "400", "422", "500", "503"},
+        "submission": {"202", "400", "409", "422", "500", "503"},
         "status": {"200", "404", "422", "500", "503"},
         "cancellation": {"200", "202", "404", "409", "422", "500", "503"},
     }
@@ -112,6 +113,13 @@ async def test_openapi_describes_job_only_transcription_contract() -> None:
     status_schema = status_operation["responses"]["200"]["content"]["application/json"][
         "schema"
     ]
+    submission_parameters = submission_operation["parameters"]
+    assert len(submission_parameters) == 1
+    assert submission_parameters[0]["name"] == "Idempotency-Key"
+    assert submission_parameters[0]["in"] == "header"
+    assert submission_parameters[0]["required"] is True
+    assert submission_parameters[0]["schema"]["minLength"] == 36
+    assert submission_parameters[0]["schema"]["maxLength"] == 36
     assert request_schema == {"$ref": "#/components/schemas/TranscriptRequest"}
     assert submission_schema == {
         "$ref": "#/components/schemas/QueuedTranscriptionJobResponse"
@@ -308,7 +316,12 @@ async def test_openapi_describes_job_only_transcription_contract() -> None:
     for operation, immediate_codes in (
         (
             submission_operation,
-            ("invalid_url", "unsupported_platform", "invalid_request"),
+            (
+                "invalid_url",
+                "unsupported_platform",
+                "invalid_request",
+                "idempotency_conflict",
+            ),
         ),
         (status_operation, ("job_not_found", "invalid_request")),
         (
@@ -328,7 +341,7 @@ async def test_openapi_describes_job_only_transcription_contract() -> None:
     job_error_responses = (
         *(
             submission_operation["responses"][status_code]
-            for status_code in ("400", "422", "500", "503")
+            for status_code in ("400", "409", "422", "500")
         ),
         *(
             status_operation["responses"][status_code]
@@ -347,6 +360,12 @@ async def test_openapi_describes_job_only_transcription_contract() -> None:
         assert job_error_response["content"]["application/json"]["schema"] == {
             "$ref": "#/components/schemas/ErrorResponse"
         }
+    capacity_response = submission_operation["responses"]["503"]
+    assert set(capacity_response["headers"]) == {
+        "X-Request-ID",
+        "Cache-Control",
+        "Retry-After",
+    }
 
     assert set(submission_operation["responses"]["202"]["headers"]) == {
         "X-Request-ID",

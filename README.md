@@ -46,6 +46,11 @@ curl --fail http://127.0.0.1:8182/health
 Job status and cancellation URLs returned by the API are bearer capabilities.
 Keep them private.
 
+## Private API integration
+
+The implemented private server-to-server contract is documented in the [private API integration guide](docs/api-integration.md).
+Transcription Job operations use the versioned `/api/v1/transcription-jobs` paths and require a canonical lowercase UUIDv4 `Idempotency-Key` for every submission.
+
 ## Run from source
 
 Install dependencies and start PostgreSQL and Redis:

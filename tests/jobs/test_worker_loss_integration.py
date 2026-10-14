@@ -15,7 +15,7 @@ from multiprocessing.sharedctypes import Synchronized
 from multiprocessing.synchronize import Event as ProcessEvent
 from pathlib import Path
 from typing import Literal, Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from celery.signals import worker_ready, worker_shutting_down
@@ -761,8 +761,9 @@ async def _submit_job(client: AsyncClient, marker: str) -> str:
         Relative bearer-capability status location.
     """
     response = await client.post(
-        "/api/transcription-jobs",
+        "/api/v1/transcription-jobs",
         json={"url": f"{_YOUTUBE_URL}&scenario={marker}"},
+        headers={"Idempotency-Key": str(uuid4())},
     )
     assert response.status_code == 202
     return response.headers["Location"]

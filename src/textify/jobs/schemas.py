@@ -16,12 +16,12 @@ class ActiveTranscriptionJobLinks(BaseModel):
 
     self: str = Field(
         description="Same-origin relative status URL that acts as a bearer capability.",
-        examples=["/api/transcription-jobs/00000000-0000-4000-8000-000000000000"],
+        examples=["/api/v1/transcription-jobs/00000000-0000-4000-8000-000000000000"],
     )
     cancel: str = Field(
         description="Same-origin relative cancellation URL for this bearer capability.",
         examples=[
-            "/api/transcription-jobs/00000000-0000-4000-8000-000000000000/cancellation"
+            "/api/v1/transcription-jobs/00000000-0000-4000-8000-000000000000/cancellation"
         ],
     )
 
@@ -57,7 +57,7 @@ class FinishedTranscriptionJobLinks(BaseModel):
 
     self: str = Field(
         description="Same-origin relative status URL that remains a bearer capability.",
-        examples=["/api/transcription-jobs/00000000-0000-4000-8000-000000000000"],
+        examples=["/api/v1/transcription-jobs/00000000-0000-4000-8000-000000000000"],
     )
 
 

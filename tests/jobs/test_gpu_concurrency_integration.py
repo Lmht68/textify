@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
+from uuid import uuid4
 
 import pytest
 from celery.contrib.testing.worker import start_worker
@@ -319,8 +320,9 @@ async def _submit_and_reconcile(
 ) -> str:
     """Submit one public job and publish its durable Job Dispatch."""
     response = await harness.client.post(
-        "/api/transcription-jobs",
+        "/api/v1/transcription-jobs",
         json={"url": _youtube_url(video_id)},
+        headers={"Idempotency-Key": str(uuid4())},
     )
     assert response.status_code == 202
     location = response.headers["Location"]

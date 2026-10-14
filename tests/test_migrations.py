@@ -25,6 +25,7 @@ APPLICATION_TABLES = {
     "transcription_job",
     "transcription_job_execution_attempt",
     "transcription_job_exclusion",
+    "transcription_job_idempotency",
     "transcription_job_result",
     "transcription_job_segment",
 }
@@ -60,6 +61,7 @@ _CHECK_CONSTRAINT_NAMES = {
     "transcription_job_segment_values_check",
     "service_heartbeat_role_check",
     "service_heartbeat_instance_id_uuid4_check",
+    "transcription_job_idempotency_key_uuid4_check",
 }
 
 _NAMED_PRIMARY_KEY_AND_UNIQUE_CONSTRAINTS = {
@@ -68,6 +70,8 @@ _NAMED_PRIMARY_KEY_AND_UNIQUE_CONSTRAINTS = {
     "transcription_job_segment_pkey",
     "transcription_job_execution_attempt_token_key",
     "service_heartbeat_pkey",
+    "transcription_job_idempotency_pkey",
+    "transcription_job_idempotency_key_key",
 }
 
 
@@ -115,6 +119,68 @@ async def test_initial_migration_round_trip(
         await asyncio.to_thread(command.upgrade, alembic_config, "head")
         assert await _application_table_names(engine) == APPLICATION_TABLES
         assert await _revision_rows(engine) == [EXPECTED_DATABASE_REVISION]
+    finally:
+        await engine.dispose()
+
+
+async def test_idempotency_migration_enforces_key_constraints_and_cascade(
+    monkeypatch: pytest.MonkeyPatch,
+    postgresql_database_url: str,
+) -> None:
+    """Persist one key, reject invalid duplicates, and cascade with its job."""
+    monkeypatch.setenv("TEXTIFY_DATABASE_URL", postgresql_database_url)
+    alembic_config = Config(str(PROJECT_ROOT / "alembic.ini"))
+    engine = create_application_engine(postgresql_database_url)
+    now = datetime.now(UTC)
+    try:
+        await asyncio.to_thread(command.upgrade, alembic_config, "head")
+        async with engine.begin() as connection:
+            job_id = await _insert_job(connection, _queued_values(now))
+            idempotency_key = uuid4()
+            await connection.execute(
+                text(
+                    "INSERT INTO transcription_job_idempotency "
+                    "(job_id, idempotency_key) "
+                    "VALUES (:job_id, :idempotency_key)"
+                ),
+                {"job_id": job_id, "idempotency_key": idempotency_key},
+            )
+
+        with pytest.raises(IntegrityError):
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO transcription_job_idempotency "
+                        "(job_id, idempotency_key) "
+                        "VALUES (:job_id, :idempotency_key)"
+                    ),
+                    {"job_id": job_id, "idempotency_key": idempotency_key},
+                )
+
+        with pytest.raises(IntegrityError):
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO transcription_job_idempotency "
+                        "(job_id, idempotency_key) "
+                        "VALUES (:job_id, :idempotency_key)"
+                    ),
+                    {"job_id": job_id, "idempotency_key": uuid1()},
+                )
+
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("DELETE FROM transcription_job WHERE id = :job_id"),
+                {"job_id": job_id},
+            )
+            remaining = await connection.scalar(
+                text(
+                    "SELECT count(*) FROM transcription_job_idempotency "
+                    "WHERE job_id = :job_id"
+                ),
+                {"job_id": job_id},
+            )
+        assert remaining == 0
     finally:
         await engine.dispose()
 
@@ -179,7 +245,11 @@ async def test_execution_attempt_migration_backfills_and_round_trips_populated_j
         assert await _revision_rows(engine) == ["0001_postgresql_jobs"]
         assert await _application_table_names(engine) == (
             APPLICATION_TABLES
-            - {"service_heartbeat", "transcription_job_execution_attempt"}
+            - {
+                "service_heartbeat",
+                "transcription_job_execution_attempt",
+                "transcription_job_idempotency",
+            }
         )
 
         await asyncio.to_thread(command.upgrade, alembic_config, "head")
@@ -567,7 +637,7 @@ async def test_service_heartbeat_migration_round_trips_without_backfill(
             "0004_execution_claims",
         )
         assert await _application_table_names(engine) == (
-            APPLICATION_TABLES - {"service_heartbeat"}
+            APPLICATION_TABLES - {"service_heartbeat", "transcription_job_idempotency"}
         )
 
         await asyncio.to_thread(command.upgrade, alembic_config, "head")
@@ -658,7 +728,7 @@ async def test_service_heartbeat_migration_round_trips_without_backfill(
             "0004_execution_claims",
         )
         assert await _application_table_names(engine) == (
-            APPLICATION_TABLES - {"service_heartbeat"}
+            APPLICATION_TABLES - {"service_heartbeat", "transcription_job_idempotency"}
         )
         await asyncio.to_thread(command.upgrade, alembic_config, "head")
         assert await _application_table_names(engine) == APPLICATION_TABLES
@@ -867,6 +937,7 @@ async def test_postgresql_baseline_uses_required_native_schema(
     assert foreign_keys == {
         ("transcription_job_execution_attempt", "transcription_job", "c"),
         ("transcription_job_exclusion", "transcription_job", "c"),
+        ("transcription_job_idempotency", "transcription_job", "c"),
         ("transcription_job_result", "transcription_job", "c"),
         ("transcription_job_segment", "transcription_job_result", "c"),
     }

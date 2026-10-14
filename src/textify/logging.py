@@ -12,7 +12,9 @@ from enum import StrEnum
 from math import isfinite
 from types import MappingProxyType
 from typing import TextIO, TypedDict, Unpack
-from uuid import UUID, uuid4
+from uuid import uuid4
+
+from textify.identifiers import parse_canonical_uuid4
 
 _ALLOWED_STRUCTURED_FIELDS = frozenset(
     {
@@ -428,13 +430,11 @@ _REQUIRED_EVENT_FIELDS: Mapping[LogEvent, frozenset[str]] = MappingProxyType(
 
 
 def _is_canonical_uuid4(value: object) -> bool:
-    if type(value) is not str:
-        return False
     try:
-        parsed_value = UUID(value)
+        parse_canonical_uuid4(value)
     except ValueError:
         return False
-    return parsed_value.version == 4 and str(parsed_value) == value
+    return True
 
 
 def _is_supported_field_value(field_name: str, value: object) -> bool:

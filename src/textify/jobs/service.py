@@ -8,13 +8,16 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from uuid import UUID
 
+from textify.identifiers import parse_canonical_uuid4
 from textify.jobs.contracts import (
     TranscriptionJobAlreadyFinishedError,
     TranscriptionJobApiRepository,
     TranscriptionJobCapacityError,
+    TranscriptionJobIdempotencyConflictError,
     TranscriptionJobStoreUnavailableError,
 )
 from textify.jobs.exceptions import (
+    IdempotencyConflictError,
     JobAlreadyFinishedError,
     JobNotFoundError,
     JobStoreUnavailableError,
@@ -26,6 +29,7 @@ from textify.jobs.types import (
     QueuedTranscriptionJob,
     TranscriptionJob,
     TranscriptionJobCancellationResult,
+    TranscriptionJobRequestIdentity,
 )
 from textify.logging import LogEvent, bind_request_log_fields, emit_event
 from textify.transcription import inspection
@@ -74,27 +78,34 @@ class TranscriptionJobService:
         self,
         submitted_url: str,
         exclusions: frozenset[ResponseFieldPath],
+        idempotency_key: UUID,
     ) -> QueuedTranscriptionJob:
         """Validate and durably queue one Supported Platform transcription.
 
         Args:
             submitted_url: Source URL supplied by the client.
             exclusions: Validated immutable response projection exclusions.
+            idempotency_key: Canonical UUIDv4 for this intentional submission.
 
         Returns:
-            Safe committed queued-job snapshot.
+            Safe committed queued-job acceptance snapshot.
 
         Raises:
             InvalidUrlError: If the submitted URL is malformed.
             UnsupportedPlatformError: If the submitted URL platform is unsupported.
             TranscriptionCapacityExceededError: If durable admission is full.
+            IdempotencyConflictError: If the key identifies another request.
             JobStoreUnavailableError: If the durable job store cannot commit safely.
         """
         submitted = inspection.classify_submitted_url(submitted_url)
         bind_request_log_fields(platform=submitted.platform.value)
+        sorted_exclusions = tuple(sorted(exclusions))
         new_job = NewQueuedTranscriptionJob(
-            submitted_url=submitted_url,
-            exclusions=tuple(sorted(exclusions)),
+            request_identity=TranscriptionJobRequestIdentity(
+                submitted_url=submitted_url,
+                exclusions=sorted_exclusions,
+            ),
+            idempotency_key=idempotency_key,
         )
         try:
             async with self._lock:
@@ -102,6 +113,8 @@ class TranscriptionJobService:
                 queued_job = await self._repository.create_queued(new_job)
         except TranscriptionJobCapacityError as exc:
             raise TranscriptionCapacityExceededError() from exc
+        except TranscriptionJobIdempotencyConflictError as exc:
+            raise IdempotencyConflictError() from exc
         except TranscriptionJobStoreUnavailableError as exc:
             await self._mark_store_unavailable()
             raise JobStoreUnavailableError() from exc
@@ -198,9 +211,6 @@ class TranscriptionJobService:
 def _parse_capability(capability: str) -> UUID:
     """Parse only canonical lowercase UUIDv4 bearer capabilities."""
     try:
-        public_id = UUID(capability)
-    except (AttributeError, TypeError, ValueError) as exc:
+        return parse_canonical_uuid4(capability)
+    except ValueError as exc:
         raise JobNotFoundError() from exc
-    if public_id.version != 4 or str(public_id) != capability:
-        raise JobNotFoundError()
-    return public_id
