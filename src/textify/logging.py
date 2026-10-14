@@ -57,26 +57,6 @@ _transcription_job_log_context: ContextVar[int | None] = ContextVar(
 )
 
 
-class _KeyValueFormatter(logging.Formatter):
-    """Append approved structured fields as sorted key=value pairs."""
-
-    def format(self, record: logging.LogRecord) -> str:
-        """Format a record with its approved structured fields.
-
-        Args:
-            record: Log record to format.
-
-        Returns:
-            The rendered log message and approved structured fields.
-        """
-        fields = [
-            f"{key}={record.__dict__[key]}"
-            for key in sorted(_ALLOWED_STRUCTURED_FIELDS)
-            if record.__dict__.get(key) is not None
-        ]
-        return " ".join((super().format(record), *fields))
-
-
 @contextmanager
 def request_log_context(request_id: str) -> Iterator[None]:
     """Bind one correlation ID to the current request context.
@@ -177,79 +157,6 @@ def _inherited_log_fields() -> dict[str, object]:
     return fields
 
 
-class _SafeContextFilter(logging.Filter):
-    """Restrict structured output to Textify records and safe request context."""
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        """Enrich an application record without replacing explicit safe fields."""
-        if record.name != "textify" and not record.name.startswith("textify."):
-            return False
-        context = _request_log_context.get()
-        if context is None:
-            return True
-        for field_name, field_value in (
-            ("request_id", context.request_id),
-            ("platform", context.platform),
-            ("source_id", context.source_id),
-            ("method", context.method),
-            ("duration_seconds", context.duration_seconds),
-            ("code", context.code),
-        ):
-            if field_value is not None and field_name not in record.__dict__:
-                record.__dict__[field_name] = field_value
-        return True
-
-
-def configure_logging(level: str) -> None:
-    """Configure the Textify logger namespace and third-party log levels.
-
-    Args:
-        level: A standard logging level name such as ``INFO`` or ``DEBUG``.
-
-    Returns:
-        None: The logging configuration is applied globally.
-
-    Raises:
-        ValueError: If ``level`` is not recognized by the logging subsystem.
-    """
-    logging.config.dictConfig(
-        {
-            "version": 1,
-            "disable_existing_loggers": False,
-            "formatters": {
-                "key_value": {
-                    "()": "textify.logging._KeyValueFormatter",
-                    "format": "%(levelname)s:   [%(name)s] %(message)s",
-                }
-            },
-            "filters": {
-                "safe_context": {
-                    "()": "textify.logging._SafeContextFilter",
-                }
-            },
-            "handlers": {
-                "stderr": {
-                    "class": "logging.StreamHandler",
-                    "formatter": "key_value",
-                    "filters": ["safe_context"],
-                    "stream": "ext://sys.stderr",
-                }
-            },
-            "loggers": {
-                "textify": {
-                    "handlers": ["stderr"],
-                    "level": level.upper(),
-                    "propagate": False,
-                },
-                "httpx": {"level": "WARNING"},
-                "yt_dlp": {"level": "WARNING"},
-                "faster_whisper": {"level": "WARNING"},
-            },
-            "root": {"handlers": ["stderr"], "level": "WARNING"},
-        }
-    )
-
-
 class LogServiceRole(StrEnum):
     """Identify a Textify process that emits registered events."""
 
@@ -270,11 +177,9 @@ class LogEvent(StrEnum):
     REQUEST_FAILED = "request_failed"
     TRANSCRIPTION_JOB_ADMITTED = "transcription_job_admitted"
     TRANSCRIPTION_JOB_CANCELLATION_ACCEPTED = "transcription_job_cancellation_accepted"
-    JOB_DISPATCH_PUBLISHED = "job_dispatch_published"
     EXECUTION_ATTEMPT_CLAIMED = "execution_attempt_claimed"
     EXECUTION_ATTEMPT_OWNERSHIP_LOST = "execution_attempt_ownership_lost"
     TRANSCRIPTION_JOB_FINISHED = "transcription_job_finished"
-    TRANSCRIPTION_JOB_RETENTION_EXPIRED = "transcription_job_retention_expired"
     SOURCE_INSPECTION_FAILED = "source_inspection_failed"
     CAPTION_TRACK_UNAVAILABLE = "caption_track_unavailable"
     CAPTION_ACQUISITION_FAILED = "caption_acquisition_failed"
@@ -383,9 +288,6 @@ _EVENT_REGISTRY: Mapping[LogEvent, _EventDefinition] = MappingProxyType(
         LogEvent.TRANSCRIPTION_JOB_CANCELLATION_ACCEPTED: _EventDefinition(
             "transcription job cancellation accepted", logging.INFO
         ),
-        LogEvent.JOB_DISPATCH_PUBLISHED: _EventDefinition(
-            "job dispatch published", logging.INFO
-        ),
         LogEvent.EXECUTION_ATTEMPT_CLAIMED: _EventDefinition(
             "execution attempt claimed", logging.INFO
         ),
@@ -394,9 +296,6 @@ _EVENT_REGISTRY: Mapping[LogEvent, _EventDefinition] = MappingProxyType(
         ),
         LogEvent.TRANSCRIPTION_JOB_FINISHED: _EventDefinition(
             "transcription job finished", logging.INFO
-        ),
-        LogEvent.TRANSCRIPTION_JOB_RETENTION_EXPIRED: _EventDefinition(
-            "transcription job retention expired", logging.INFO
         ),
         LogEvent.SOURCE_INSPECTION_FAILED: _EventDefinition(
             "source inspection failed", logging.DEBUG
@@ -501,16 +400,12 @@ _REQUIRED_EVENT_FIELDS: Mapping[LogEvent, frozenset[str]] = MappingProxyType(
         LogEvent.TRANSCRIPTION_JOB_CANCELLATION_ACCEPTED: frozenset(
             {"request_id", "internal_job_id", "job_status"}
         ),
-        LogEvent.JOB_DISPATCH_PUBLISHED: frozenset({"internal_job_id"}),
         LogEvent.EXECUTION_ATTEMPT_CLAIMED: frozenset(
             {"internal_job_id", "job_status"}
         ),
         LogEvent.EXECUTION_ATTEMPT_OWNERSHIP_LOST: frozenset({"internal_job_id"}),
         LogEvent.TRANSCRIPTION_JOB_FINISHED: frozenset(
             {"internal_job_id", "job_status", "job_outcome"}
-        ),
-        LogEvent.TRANSCRIPTION_JOB_RETENTION_EXPIRED: frozenset(
-            {"internal_job_id", "job_outcome"}
         ),
         LogEvent.SOURCE_INSPECTION_FAILED: frozenset({"stage", "code"}),
         LogEvent.CAPTION_TRACK_UNAVAILABLE: frozenset({"stage", "code"}),

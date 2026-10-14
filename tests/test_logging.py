@@ -12,146 +12,15 @@ from uuid import UUID
 import pytest
 
 from textify.logging import (
-    LogCode,
     LogEvent,
     LogServiceRole,
     StructuredLogFields,
-    bind_request_log_fields,
-    configure_logging,
     configure_structured_logging,
     emit_event,
     request_log_context,
     transcription_job_log_context,
     worker_log_context,
 )
-from textify.transcription.exceptions import InvalidUrlError
-from textify.transcription.inspection import classify_submitted_url
-
-
-def test_configured_logging_renders_only_safe_request_fields(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Configured output retains only approved request fields and Textify records.
-
-    Args:
-        capsys: Captures formatted standard-error log output.
-    """
-    sensitive_values = {
-        "submitted_url": "url-sentinel",
-        "transcript_text": "text-sentinel",
-        "output": "output-sentinel",
-        "command": "command-sentinel",
-        "headers": "header-sentinel",
-        "credential": "credential-sentinel",
-        "cookie": "cookie-sentinel",
-        "media_path": "path-sentinel",
-        "reason": "reason-sentinel",
-        "postgresql_url": "postgresql-url-sentinel",
-        "postgresql_password": "postgresql-password-sentinel",
-        "redis_url": "redis-url-sentinel",
-        "redis_password": "redis-password-sentinel",
-        "public_capability": "capability-sentinel",
-        "cancellation_link": "cancellation-link-sentinel",
-        "execution_attempt_token": "execution-attempt-token-sentinel",
-        "hugging_face_credential": "hugging-face-credential-sentinel",
-        "provider_detail": "provider-detail-sentinel",
-        "segment_count": "segment-count-sentinel",
-    }
-    configure_logging("INFO")
-
-    with request_log_context("request-id-sentinel"):
-        bind_request_log_fields(
-            platform="tiktok",
-            source_id="source-id-sentinel",
-            method="faster_whisper",
-            duration_seconds=12,
-            code="safe-code",
-        )
-        logging.getLogger("textify.test_logging").info(
-            "safe event",
-            extra={
-                "stage": "request",
-                "elapsed_seconds": 0.25,
-                "internal_job_id": 73,
-                **sensitive_values,
-            },
-        )
-    logging.getLogger("dependency.test_logging").warning("dependency-sentinel")
-
-    rendered_output = capsys.readouterr().err
-    rendered_fields = rendered_output.split("] safe event ", maxsplit=1)[1].split()
-    rendered_field_names = {field.partition("=")[0] for field in rendered_fields}
-    assert rendered_field_names == {
-        "code",
-        "duration_seconds",
-        "elapsed_seconds",
-        "method",
-        "platform",
-        "request_id",
-        "internal_job_id",
-        "source_id",
-        "stage",
-    }
-    for field in (
-        "code=safe-code",
-        "duration_seconds=12",
-        "elapsed_seconds=0.25",
-        "method=faster_whisper",
-        "internal_job_id=73",
-        "platform=tiktok",
-        "request_id=request-id-sentinel",
-        "source_id=source-id-sentinel",
-        "stage=request",
-    ):
-        assert field in rendered_output
-    assert "dependency-sentinel" not in rendered_output
-    for sensitive_value in sensitive_values.values():
-        assert sensitive_value not in rendered_output
-
-
-def test_legacy_logging_formats_migrated_inspection_event(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Retain the safe key-value envelope for a registered inspection event."""
-    submitted_url = "https://www.tiktok.com/@creator?submitted_url=legacy-url-sentinel"
-    configure_logging("DEBUG")
-
-    with pytest.raises(InvalidUrlError):
-        classify_submitted_url(submitted_url)
-
-    rendered_output = capsys.readouterr().err
-    rendered_fields = rendered_output.split("] source inspection failed ", maxsplit=1)[
-        1
-    ].split()
-    assert set(rendered_fields) == {
-        "code=unsupported_tiktok_path",
-        "stage=metadata",
-    }
-    assert "legacy-url-sentinel" not in rendered_output
-
-
-def test_legacy_logging_formats_migrated_job_diagnostic(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Retain the safe key-value envelope for a registered job diagnostic."""
-    configure_logging("INFO")
-
-    emit_event(
-        logging.getLogger("textify.test_logging"),
-        LogEvent.JOB_STORE_UNAVAILABLE,
-        internal_job_id=73,
-        code=LogCode.TRANSCRIPTION_JOB_STORAGE_IS_UNAVAILABLE_TO_WORKER.value,
-    )
-
-    rendered_output = capsys.readouterr().err
-    rendered_fields = rendered_output.split(
-        "] transcription job storage is unavailable ", maxsplit=1
-    )[1].split()
-    assert set(rendered_fields) == {
-        "code=transcription_job_storage_is_unavailable_to_worker",
-        "internal_job_id=73",
-    }
-    assert "execution-attempt-token-sentinel" not in rendered_output
 
 
 def test_celery_setup_preserves_safe_textify_logging() -> None:
@@ -293,15 +162,15 @@ def test_structured_logging_restores_nested_transcription_job_correlation(
     logger = logging.getLogger("textify.test_logging")
 
     with transcription_job_log_context(47):
-        emit_event(logger, LogEvent.JOB_DISPATCH_PUBLISHED)
+        emit_event(logger, LogEvent.EXECUTION_ATTEMPT_OWNERSHIP_LOST)
         with transcription_job_log_context(53):
-            emit_event(logger, LogEvent.JOB_DISPATCH_PUBLISHED)
+            emit_event(logger, LogEvent.EXECUTION_ATTEMPT_OWNERSHIP_LOST)
             emit_event(
                 logger,
-                LogEvent.JOB_DISPATCH_PUBLISHED,
+                LogEvent.EXECUTION_ATTEMPT_OWNERSHIP_LOST,
                 internal_job_id=59,
             )
-        emit_event(logger, LogEvent.JOB_DISPATCH_PUBLISHED)
+        emit_event(logger, LogEvent.EXECUTION_ATTEMPT_OWNERSHIP_LOST)
 
     rendered_events = [
         json.loads(line) for line in capsys.readouterr().err.splitlines()
@@ -323,7 +192,7 @@ def test_worker_log_context_isolates_request_correlation_and_restores_outer_cont
 
     with request_log_context(request_identifier):
         with worker_log_context(), transcription_job_log_context(41):
-            emit_event(logger, LogEvent.JOB_DISPATCH_PUBLISHED)
+            emit_event(logger, LogEvent.EXECUTION_ATTEMPT_OWNERSHIP_LOST)
         emit_event(
             logger,
             LogEvent.REQUEST_COMPLETED,
@@ -430,13 +299,6 @@ def test_worker_log_context_isolates_request_correlation_and_restores_outer_cont
             id="transcription-job-cancellation-accepted",
         ),
         pytest.param(
-            LogEvent.JOB_DISPATCH_PUBLISHED,
-            {"internal_job_id": 41},
-            "job dispatch published",
-            "INFO",
-            id="job-dispatch-published",
-        ),
-        pytest.param(
             LogEvent.EXECUTION_ATTEMPT_CLAIMED,
             {"internal_job_id": 41, "job_status": "processing"},
             "execution attempt claimed",
@@ -460,13 +322,6 @@ def test_worker_log_context_isolates_request_correlation_and_restores_outer_cont
             "transcription job finished",
             "INFO",
             id="transcription-job-finished",
-        ),
-        pytest.param(
-            LogEvent.TRANSCRIPTION_JOB_RETENTION_EXPIRED,
-            {"internal_job_id": 41, "job_outcome": "succeeded"},
-            "transcription job retention expired",
-            "INFO",
-            id="transcription-job-retention-expired",
         ),
         pytest.param(
             LogEvent.SOURCE_INSPECTION_FAILED,
@@ -659,6 +514,58 @@ def test_structured_logging_reuses_identity_for_one_service_role(
     assert second_instance_id == first_instance_id
     with pytest.raises(ValueError, match="another role"):
         configure_structured_logging(LogServiceRole.RECONCILER)
+
+
+def test_structured_logging_process_identity_differs_across_independent_processes() -> (
+    None
+):
+    """Keep one UUIDv4 identity per process and distinct IDs between processes."""
+    child_program = textwrap.dedent(
+        """
+        import logging
+
+        from textify.logging import (
+            LogEvent,
+            LogServiceRole,
+            configure_structured_logging,
+            emit_event,
+        )
+
+        logger = logging.getLogger("textify.test_logging")
+        configure_structured_logging(LogServiceRole.API)
+        emit_event(logger, LogEvent.SERVICE_READY)
+        configure_structured_logging(LogServiceRole.API, "DEBUG")
+        emit_event(logger, LogEvent.SERVICE_READY)
+        """
+    )
+
+    completed_processes = [
+        subprocess.run(
+            [sys.executable, "-c", child_program],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        for _ in range(2)
+    ]
+    process_instance_ids: list[str] = []
+    for completed_process in completed_processes:
+        assert completed_process.returncode == 0
+        rendered_events = [
+            json.loads(line) for line in completed_process.stderr.splitlines()
+        ]
+        assert [event["event"] for event in rendered_events] == [
+            "service_ready",
+            "service_ready",
+        ]
+        instance_ids = [event["instance_id"] for event in rendered_events]
+        assert instance_ids[0] == instance_ids[1]
+        parsed_instance_id = UUID(instance_ids[0])
+        assert parsed_instance_id.version == 4
+        assert str(parsed_instance_id) == instance_ids[0]
+        process_instance_ids.append(instance_ids[0])
+
+    assert process_instance_ids[0] != process_instance_ids[1]
 
 
 def test_structured_logging_drops_unsafe_calls_without_stringifying_them(

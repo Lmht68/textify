@@ -12,6 +12,9 @@ x-dispatch-environment: &dispatch-environment
   TEXTIFY_ATTEMPT_LEASE_SECONDS: "${TEXTIFY_ATTEMPT_LEASE_SECONDS:-30.0}"
   TEXTIFY_SERVICE_HEARTBEAT_TTL_SECONDS: "${TEXTIFY_SERVICE_HEARTBEAT_TTL_SECONDS:-30.0}"
 
+
+x-observability-environment: &observability-environment
+  TEXTIFY_LOG_LEVEL: "${TEXTIFY_LOG_LEVEL:-INFO}"
 x-transcription-environment: &transcription-environment
   TEXTIFY_GPU_IDENTITY: "${TEXTIFY_GPU_IDENTITY:-}"
   TEXTIFY_GPU_LOCK_DIRECTORY: /var/lib/textify/gpu-locks
@@ -83,7 +86,7 @@ services:
     command: ["textify-reconciler"]
     restart: unless-stopped
     environment:
-      <<: [*job-environment, *dispatch-environment]
+      <<: [*job-environment, *dispatch-environment, *observability-environment]
     depends_on:
       postgres:
         condition: service_healthy
@@ -97,9 +100,8 @@ services:
     command: ["textify"]
     restart: unless-stopped
     environment:
-      <<: [*job-environment, *dispatch-environment]
+      <<: [*job-environment, *dispatch-environment, *observability-environment]
       TEXTIFY_ENVIRONMENT: "${TEXTIFY_ENVIRONMENT:-local}"
-      TEXTIFY_LOG_LEVEL: "${TEXTIFY_LOG_LEVEL:-INFO}"
       TEXTIFY_HOST: 0.0.0.0
       TEXTIFY_PORT: "8182"
     ports:
@@ -132,7 +134,7 @@ services:
     restart: unless-stopped
     stop_grace_period: "${TEXTIFY_WORKER_STOP_GRACE_PERIOD:-30m}"
     environment:
-      <<: [*job-environment, *dispatch-environment, *transcription-environment]
+      <<: [*job-environment, *dispatch-environment, *transcription-environment, *observability-environment]
       TEXTIFY_HF_TOKEN:
     volumes:
       - model-cache:/var/cache/textify/huggingface
