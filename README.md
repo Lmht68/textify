@@ -3,6 +3,8 @@
 Textify is an asynchronous API for transcribing public YouTube, Facebook, Instagram, TikTok, and X videos.
 It uses available YouTube captions and falls back to Faster-Whisper on an NVIDIA CUDA GPU.
 
+[Web UI](https://github.com/Lmht68/textify-web)
+
 ## Requirements
 
 For the recommended Compose setup:
