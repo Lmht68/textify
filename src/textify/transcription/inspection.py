@@ -13,7 +13,14 @@ from math import ceil, isfinite
 from numbers import Real
 from pathlib import Path
 from typing import Any, Final, Literal, Protocol, cast
-from urllib.parse import SplitResult, parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import (
+    SplitResult,
+    parse_qsl,
+    unquote_plus,
+    urlencode,
+    urlsplit,
+    urlunsplit,
+)
 
 import av
 from langcodes import Language
@@ -570,7 +577,12 @@ def classify_submitted_url(submitted_url: str) -> SubmittedSource:
         _facebook_identity(host, facebook_path_segments, query_pairs)
         return SubmittedSource(
             Platform.FACEBOOK,
-            _provider_url(parsed_url._replace(path=normalized_path)),
+            _provider_url(
+                parsed_url._replace(
+                    path=normalized_path,
+                    query=_strip_facebook_share_tracking(parsed_url.query),
+                )
+            ),
         )
 
     path_segments = _path_segments(parsed_url.path)
@@ -584,7 +596,12 @@ def classify_submitted_url(submitted_url: str) -> SubmittedSource:
 
     if host in _FACEBOOK_HOSTS or host in _FACEBOOK_SHORT_HOSTS:
         _facebook_identity(host, path_segments, query_pairs)
-        return SubmittedSource(Platform.FACEBOOK, _provider_url(parsed_url))
+        provider_url = parsed_url
+        if host in _FACEBOOK_HOSTS and path_segments[0] == "share":
+            provider_url = parsed_url._replace(
+                query=_strip_facebook_share_tracking(parsed_url.query)
+            )
+        return SubmittedSource(Platform.FACEBOOK, _provider_url(provider_url))
 
     if host in _TIKTOK_HOSTS or host in _TIKTOK_SHORT_HOSTS:
         _tiktok_identity(host, path_segments)
@@ -747,6 +764,15 @@ def _provider_url(parsed_url: SplitResult) -> str:
             parsed_url.query,
             "",
         )
+    )
+
+
+def _strip_facebook_share_tracking(query: str) -> str:
+    """Remove ``mibextid`` without re-encoding unrelated query fields."""
+    return "&".join(
+        query_field
+        for query_field in query.split("&")
+        if unquote_plus(query_field.partition("=")[0]) != "mibextid"
     )
 
 

@@ -277,6 +277,27 @@ _ACCEPTED_SUBMITTED_URL_CASES = (
         ),
         (
             Platform.FACEBOOK,
+            "https://www.facebook.com/share/v/1E1TZv16h8/?mibextid=wwXIfr",
+            "https://www.facebook.com/share/v/1E1TZv16h8",
+        ),
+        (
+            Platform.FACEBOOK,
+            (
+                "https://m.facebook.com/share/owner/kind/short_1"
+                "?utm_source=a%2Fb&mibextid=first&ref=two+words&mibextid="
+            ),
+            (
+                "https://m.facebook.com/share/owner/kind/short_1"
+                "?utm_source=a%2Fb&ref=two+words"
+            ),
+        ),
+        (
+            Platform.FACEBOOK,
+            "https://www.facebook.com/share/v/short_1?MIBEXTID=preserved",
+            "https://www.facebook.com/share/v/short_1?MIBEXTID=preserved",
+        ),
+        (
+            Platform.FACEBOOK,
             f"https://www.facebook.com/watch?v={_FACEBOOK_VIDEO_ID}&utm_source=test#fragment",
             f"https://www.facebook.com/watch?v={_FACEBOOK_VIDEO_ID}&utm_source=test",
         ),
