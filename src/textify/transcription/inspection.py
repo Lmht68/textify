@@ -563,6 +563,9 @@ def classify_submitted_url(submitted_url: str) -> SubmittedSource:
         if _looks_like_supported_host_trick(host):
             raise _invalid_source_error("deceptive_supported_host")
         raise _unsupported_platform_error("unsupported_host")
+    if host in _FACEBOOK_HOSTS and parsed_url.path == "/watch/":
+        parsed_url = parsed_url._replace(path="/watch")
+
     if host in _INSTAGRAM_HOSTS:
         normalized_path = parsed_url.path.removesuffix("/")
         _instagram_shortcode(_path_segments(normalized_path))

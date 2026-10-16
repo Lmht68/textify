@@ -303,6 +303,11 @@ _ACCEPTED_SUBMITTED_URL_CASES = (
         ),
         (
             Platform.FACEBOOK,
+            "https://www.facebook.com/watch/?v=903291031413216&rdid=VEX0AjzFa8TnlBy5",
+            "https://www.facebook.com/watch?v=903291031413216&rdid=VEX0AjzFa8TnlBy5",
+        ),
+        (
+            Platform.FACEBOOK,
             f"https://www.facebook.com/reel/{_FACEBOOK_VIDEO_ID}?v=1",
             f"https://www.facebook.com/reel/{_FACEBOOK_VIDEO_ID}?v=1",
         ),
