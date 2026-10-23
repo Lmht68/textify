@@ -70,6 +70,8 @@ _LIFECYCLE_ADVISORY_LOCK_KEY = -255_152_064_224_511_608
 
 metadata = MetaData()
 
+# Database constraints enforce the lifecycle state machine even if a future writer
+# bypasses this repository's guarded transitions.
 transcription_job = Table(
     "transcription_job",
     metadata,
@@ -455,6 +457,8 @@ class PostgresTranscriptionJobRepository:
         Yields:
             Open transaction holding the Transcription Job lifecycle advisory lock.
         """
+        # Admission, claim ordering, and terminal publication need one process-wide
+        # decision point rather than per-row locking alone.
         async with self._engine.begin() as connection:
             await connection.execute(
                 text("SELECT pg_advisory_xact_lock(:lock_key)"),
@@ -488,6 +492,8 @@ class PostgresTranscriptionJobRepository:
 
         try:
             async with self._serialized_lifecycle_transaction() as connection:
+                # Resolve a replay before capacity so a saturated queue still honors
+                # an already accepted idempotent request.
                 existing_row = (
                     (
                         await connection.execute(
@@ -533,6 +539,8 @@ class PostgresTranscriptionJobRepository:
                 queue_deadline_at = submitted_at + self._queue_timeout
                 public_id = uuid4()
                 execution_attempt_token = uuid4()
+                # Create the queued job and every private lifecycle record in one
+                # transaction, so workers never observe a partially admitted job.
                 internal_id = await connection.scalar(
                     insert(transcription_job)
                     .values(
@@ -722,6 +730,8 @@ class PostgresTranscriptionJobRepository:
                     .mappings()
                     .all()
                 )
+                # Lock a bounded candidate set, then recheck the parent row during
+                # update so concurrent cancellation cannot lease obsolete work.
                 candidates = tuple(_dispatch_from_row(row) for row in due_rows)
                 if not candidates:
                     return ()
@@ -905,6 +915,8 @@ class PostgresTranscriptionJobRepository:
             async with self._serialized_lifecycle_transaction() as connection:
                 now = _as_utc(self._clock())
                 claim_lease_expires_at = now + lease_duration
+                # A delayed broker message must terminalize an expired job instead
+                # of moving it into processing after its absolute queue deadline.
                 timeout_transition = await connection.execute(
                     update(transcription_job)
                     .where(
@@ -927,6 +939,8 @@ class PostgresTranscriptionJobRepository:
                 if timeout_transition.rowcount == 1:
                     return None
 
+                # The global lifecycle lock makes FIFO a claim-time rule even when
+                # the broker redelivers messages out of order.
                 oldest_eligible_job_id = await connection.scalar(
                     select(transcription_job.c.id)
                     .where(
@@ -1313,6 +1327,8 @@ class PostgresTranscriptionJobRepository:
 
                 internal_id = _internal_id_from_row(job_row)
                 status = job_row["status"]
+                # Queued work has no provider side effects and can finish now.
+                # Processing work must expose a cancellation flag to its worker.
                 if status == "queued":
                     transition = await connection.execute(
                         update(transcription_job)
@@ -1419,6 +1435,8 @@ class PostgresTranscriptionJobRepository:
         try:
             async with self._serialized_lifecycle_transaction() as connection:
                 finished_at = _as_utc(self._clock())
+                # Each terminal transition proves the exact worker still holds a
+                # live lease, preventing a stale worker from winning after recovery.
                 active_claim = exists(
                     select(transcription_job_execution_attempt.c.job_id).where(
                         transcription_job_execution_attempt.c.job_id

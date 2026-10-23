@@ -313,6 +313,8 @@ class TranscriptionWorkerRuntime:
         Raises:
             RuntimeError: If this runtime has already started.
         """
+        # Celery invokes tasks on pool threads. A dedicated loop keeps all async
+        # resources on one owner while those threads submit and wait for work.
         with self._state_lock:
             if self._started:
                 raise RuntimeError("Transcription worker runtime has already started.")
@@ -365,6 +367,8 @@ class TranscriptionWorkerRuntime:
                         code=LogCode.TRANSCRIPTION_WORKER_RUNTIME_IS_UNAVAILABLE.value,
                     )
                     return
+                # The Celery thread waits here, but processing remains on the loop
+                # that owns the database, heartbeat monitor, and native resources.
                 try:
                     future = asyncio.run_coroutine_threadsafe(
                         processor.process(dispatch),
@@ -420,6 +424,8 @@ class TranscriptionWorkerRuntime:
         """Acquire ownership, load the model, and report readiness before work."""
         startup_complete = False
         try:
+            # Acquire exclusive GPU ownership before model allocation so competing
+            # workers cannot load the same device concurrently.
             if self._verify_database:
                 await verify_application_database(cast(AsyncEngine, self._engine))
             await self._gpu_ownership.acquire()
@@ -427,6 +433,8 @@ class TranscriptionWorkerRuntime:
             self._processor = resources.processor
             self._executor = resources.executor
             self._heartbeat = resources.heartbeat
+            # Start claim monitoring and readiness reporting before exposing this
+            # runtime to Celery task threads.
             self._gpu_ownership.mark_model_ready()
             await self._claim_manager.start()
             self._claim_monitoring_started = True
@@ -498,6 +506,8 @@ class TranscriptionWorkerRuntime:
 
     async def _shutdown_resources(self) -> None:
         """Drain owned resources on the same loop that used them."""
+        # Close external admission and readiness first. The claim manager retains
+        # claim leases internally until in-flight work reaches a terminal state.
         self._claim_manager.stop_accepting()
         await self._stop_service_heartbeat()
         self._gpu_ownership.mark_model_not_ready()
@@ -600,6 +610,7 @@ def _run_worker_loop(
     try:
         loop.run_forever()
     finally:
+        # A stopped loop cannot safely close while it still owns submitted coroutines.
         pending_tasks = asyncio.all_tasks(loop)
         for task in pending_tasks:
             task.cancel()
@@ -662,6 +673,8 @@ def _validate_temporary_media_capacity(
     Raises:
         RuntimeError: If disk capacity cannot be determined or is insufficient.
     """
+    # Reserve space for every Celery download, every native inference input, and one
+    # concurrent duration-probe download used when source metadata lacks duration.
     required_bytes = (
         worker_concurrency + transcription_config.transcription_concurrency + 1
     ) * transcription_config.max_media_bytes

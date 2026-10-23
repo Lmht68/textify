@@ -19,6 +19,8 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     """Add due scheduling, publication lease, and publication history state."""
+    # Add nullable scheduling fields first so preexisting rows can be backfilled
+    # before the due-time column becomes required.
     op.add_column(
         "transcription_job_execution_attempt",
         sa.Column("next_dispatch_at", sa.DateTime(timezone=True), nullable=True),
@@ -52,18 +54,24 @@ def upgrade() -> None:
             server_default=sa.text("0"),
         ),
     )
+    # Existing attempts become immediately eligible from their original submission
+    # time instead of receiving a new queue position during this schema change.
     op.execute(
         "UPDATE transcription_job_execution_attempt AS attempt "
         "SET next_dispatch_at = job.submitted_at "
         "FROM transcription_job AS job "
         "WHERE job.id = attempt.job_id"
     )
+    # Run deferred storage checks after backfill, before tightening nullability, to
+    # fail the migration transaction if historical rows violate prior invariants.
     op.execute("SET CONSTRAINTS ALL IMMEDIATE")
     op.alter_column(
         "transcription_job_execution_attempt",
         "next_dispatch_at",
         nullable=False,
     )
+    # A publication lease is meaningful only when both owner and expiry exist.
+    # Dispatch history likewise distinguishes never-published from published work.
     op.create_check_constraint(
         "transcription_job_attempt_publication_lease_pair_check",
         "transcription_job_execution_attempt",
@@ -83,6 +91,8 @@ def upgrade() -> None:
         "((dispatch_count = 0 AND last_dispatched_at IS NULL) OR "
         "(dispatch_count > 0 AND last_dispatched_at IS NOT NULL))",
     )
+    # Reconciliation scans due attempts in schedule order and uses job ID as a
+    # deterministic tie-breaker.
     op.create_index(
         "transcription_job_attempt_next_dispatch_at_job_id_idx",
         "transcription_job_execution_attempt",

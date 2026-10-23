@@ -69,6 +69,8 @@ def request_log_context(request_id: str) -> Iterator[None]:
     Yields:
         None: The active request scope.
     """
+    # Resetting the token restores a parent or nested request context without
+    # leaking fields into unrelated asynchronous work.
     token = _request_log_context.set(_RequestLogContext(request_id=request_id))
     try:
         yield
@@ -467,6 +469,7 @@ def _validate_event_fields(
     event: LogEvent,
     candidate_fields: Mapping[str, object],
 ) -> dict[str, object] | None:
+    # Reject unregistered fields before checking event-specific lifecycle relations.
     if set(candidate_fields) - _ALLOWED_STRUCTURED_FIELDS:
         return None
     fields = {
@@ -481,6 +484,7 @@ def _validate_event_fields(
         return None
     if not _REQUIRED_EVENT_FIELDS.get(event, frozenset()).issubset(fields):
         return None
+    # These registered events encode state transitions beyond generic field typing.
     if event in {LogEvent.SERVICE_FAILED, LogEvent.REQUEST_FAILED}:
         return fields if fields["code"] == "internal_error" else None
     if event is LogEvent.TRANSCRIPTION_JOB_ADMITTED:
@@ -622,6 +626,7 @@ def configure_structured_logging(
     normalized_level = level.upper() if isinstance(level, str) else ""
     if normalized_level not in _ALLOWED_LOG_LEVELS:
         raise ValueError("level must be a standard Textify logging level")
+    # A process must not relabel already-initialized log records with another role.
     if (
         _structured_service_role is not None
         and _structured_service_role is not service_role
@@ -690,6 +695,8 @@ def emit_event(
     definition = _EVENT_REGISTRY.get(event)
     if definition is None:
         return
+    # Event-local fields override inherited request context when they describe the
+    # terminal outcome more precisely.
     merged_fields = _inherited_log_fields()
     merged_fields.update(fields)
     validated_fields = _validate_event_fields(event, merged_fields)

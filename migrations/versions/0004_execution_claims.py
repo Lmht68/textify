@@ -19,6 +19,8 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     """Add reclaimable worker ownership to processing Execution Attempts."""
+    # Nullable claim fields preserve the valid unclaimed state for queued and
+    # terminal attempts while still allowing processing rows to be backfilled.
     op.add_column(
         "transcription_job_execution_attempt",
         sa.Column("worker_owner", postgresql.UUID(as_uuid=True), nullable=True),
@@ -35,6 +37,8 @@ def upgrade() -> None:
             nullable=True,
         ),
     )
+    # Claim ownership, heartbeat, and lease expiry form one all-or-nothing state.
+    # Partial claims would make reclamation and cancellation decisions ambiguous.
     op.create_check_constraint(
         "transcription_job_attempt_claim_state_check",
         "transcription_job_execution_attempt",
@@ -55,12 +59,15 @@ def upgrade() -> None:
         "transcription_job_execution_attempt",
         "last_heartbeat_at <= claim_lease_expires_at",
     )
+    # Only claimed attempts participate in lease-expiry recovery scans.
     op.create_index(
         "transcription_job_attempt_claim_lease_expires_at_job_id_idx",
         "transcription_job_execution_attempt",
         ["claim_lease_expires_at", "job_id"],
         postgresql_where=sa.text("claim_lease_expires_at IS NOT NULL"),
     )
+    # Historic processing jobs cannot be attributed to a live worker. Give each one
+    # an already-expired synthetic claim so the reconciler can recover it safely.
     op.execute(
         "UPDATE transcription_job_execution_attempt AS attempt "
         "SET worker_owner = gen_random_uuid(), "

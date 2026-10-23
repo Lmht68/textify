@@ -404,6 +404,8 @@ class YtDlpMetadataExtractor:
             failure_event=LogEvent.SOURCE_INSPECTION_FAILED,
             failure_stage="metadata",
         )
+        # When metadata omits duration, download once to measure it and transfer the
+        # prepared audio to native transcription if captions are unavailable.
         if metadata.get("duration") is not None:
             return ExtractedMetadata(metadata)
         return self._download_audio_for_duration(
@@ -423,6 +425,8 @@ class YtDlpMetadataExtractor:
             deadline=deadline,
             cancellation_event=cancellation_event,
         )
+        # Keep fallback media in its own directory so cleanup can transfer ownership
+        # without affecting another request's temporary files.
         self._temp_media_dir.mkdir(parents=True, exist_ok=True)
         request_directory = Path(
             tempfile.mkdtemp(
@@ -558,6 +562,8 @@ def classify_submitted_url(submitted_url: str) -> SubmittedSource:
         InvalidUrlError: If the URL is malformed or has an unsupported shape.
         UnsupportedPlatformError: If the URL uses another host.
     """
+    # Validate the submitted platform and URL shape before a provider can resolve
+    # redirects or inspect external media.
     parsed_url, host, query_pairs = _parse_url(submitted_url)
     if host not in _SUPPORTED_HOSTS:
         if _looks_like_supported_host_trick(host):
@@ -638,6 +644,8 @@ def normalize_processed_metadata(
         raise _metadata_provider_error("non_mapping_metadata")
     _reject_collections_and_live(metadata)
 
+    # A matching extractor is required before accepting provider metadata, preventing
+    # a redirect or generic extractor from substituting another platform's source.
     expected_extractor_keys = _EXPECTED_EXTRACTOR_KEYS[submitted.platform]
     extractor_key = metadata.get("extractor_key", _MISSING)
     if extractor_key is _MISSING:
@@ -1072,6 +1080,8 @@ def _canonical_social_url(metadata: Mapping[str, object], platform: Platform) ->
     if host not in expected_hosts:
         raise _invalid_source_error("cross_platform_redirect")
 
+    # Reclassify provider output instead of trusting its host: accepted platforms
+    # still have strict path and identity requirements.
     try:
         canonical_source = classify_submitted_url(webpage_url)
     except UnsupportedPlatformError as exc:
@@ -1238,6 +1248,8 @@ def _authority_has_port(netloc: str) -> bool:
 
 def _is_timeout_exception(error: BaseException) -> bool:
     """Return whether a provider exception contains a typed timeout."""
+    # yt-dlp can wrap a typed timeout in several exception links. Traverse each
+    # supported link once so malformed cycles cannot loop indefinitely.
     pending: list[BaseException] = [error]
     visited: set[int] = set()
     while pending:

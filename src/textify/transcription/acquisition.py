@@ -741,6 +741,8 @@ def _rank_caption_tracks(
     if declared_primary_language is None:
         return ()
 
+    # Preserve provider order within preference buckets: exact language before its
+    # primary language, and creator captions before generated captions in each.
     buckets: list[list[CaptionTrack]] = [[], [], [], []]
     for track in tracks:
         track_language = normalize_language_tag(track.language_code)
@@ -947,6 +949,8 @@ class WhisperAcquirer:
             if cancellation_requested.is_set():
                 raise TranscriptionCancellationRequestedError()
 
+            # Race permit acquisition against durable cancellation so queued native
+            # work never starts after Cancellation has already won.
             permit_acquisition = asyncio.create_task(
                 self._inference_semaphore.acquire(),
                 name="native-inference-permit",
@@ -992,6 +996,8 @@ class WhisperAcquirer:
                 completion_event = asyncio.Event()
                 worker.add_done_callback(lambda _worker: completion_event.set())
                 try:
+                    # A Python timeout cannot stop native inference in its worker
+                    # thread. Retain its permit and media until it actually finishes.
                     async with asyncio.timeout(self._transcription_timeout_seconds):
                         return await asyncio.shield(worker)
                 except TimeoutError as exc:
@@ -1068,6 +1074,8 @@ class WhisperAcquirer:
     ) -> None:
         """Release abandoned native work after its worker actually completes."""
         try:
+            # The finalizer must outlive caller cancellation because it owns the
+            # native permit, request directory, and transferred media cleanup.
             while not completion_event.is_set():
                 try:
                     await asyncio.shield(completion_event.wait())

@@ -50,6 +50,8 @@ class GpuModelOwnership:
             gpu_identity: Stable identifier for one physical GPU.
             lock_directory: Shared host-local directory for deterministic lock files.
         """
+        # Hash the external GPU identity into fixed opaque lock values so the raw
+        # identity never appears in a lock filename, SQL parameter, or log record.
         digest = hashlib.sha256(_LOCK_NAMESPACE + gpu_identity.encode()).digest()
         self._engine = engine
         self._lock_directory = lock_directory
@@ -93,6 +95,8 @@ class GpuModelOwnership:
             ) from exc
 
         try:
+            # Host locking rejects a competing local worker before it consumes a
+            # PostgreSQL connection or loads a GPU model.
             descriptor = os.open(
                 lock_path,
                 os.O_NOFOLLOW | os.O_CLOEXEC | os.O_CREAT | os.O_RDWR,
@@ -112,6 +116,8 @@ class GpuModelOwnership:
                 ) from exc
             raise RuntimeError("GPU ownership could not be established.") from exc
 
+        # The retained advisory-lock session extends ownership across hosts.
+        # Closing that session releases the distributed lock automatically.
         try:
             connection = await self._engine.connect()
             self._connection = connection
@@ -167,6 +173,8 @@ class GpuModelOwnership:
             connection = self._connection
             assert connection is not None
             try:
+                # Probe the same session that owns the advisory lock. Reconnecting
+                # would not demonstrate that this worker still owns the GPU.
                 await connection.execute(text("SELECT 1"))
                 await connection.commit()
             except (OSError, SQLAlchemyError):
@@ -179,6 +187,7 @@ class GpuModelOwnership:
         """Release PostgreSQL ownership before closing the host lock descriptor."""
         async with self._connection_lock:
             self._model_ready = False
+            # Retain the host lock until PostgreSQL ownership is relinquished.
             connection = self._connection
             self._connection = None
             if connection is not None:

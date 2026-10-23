@@ -19,6 +19,8 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     """Create the durable idempotency-key association table."""
+    # Associate one retry key with one durable job so accepted requests can be
+    # replayed without creating another public capability or execution attempt.
     op.create_table(
         "transcription_job_idempotency",
         sa.Column(
@@ -32,6 +34,8 @@ def upgrade() -> None:
             postgresql.UUID(as_uuid=True),
             nullable=False,
         ),
+        # The primary key allows one stored key per job, while uniqueness prevents
+        # the same caller-provided key from selecting two different jobs.
         sa.PrimaryKeyConstraint("job_id", name="transcription_job_idempotency_pkey"),
         sa.UniqueConstraint(
             "idempotency_key",

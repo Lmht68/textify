@@ -124,6 +124,8 @@ class TranscriptionJobReconciler:
             TranscriptionJobStoreUnavailableError: If PostgreSQL recovery cannot
                 complete an operation.
         """
+        # Repair terminal states before issuing more broker messages so abandoned
+        # claims cannot remain eligible while their workers are already gone.
         await self._recover_expired_claims()
         await self._expire_queued_jobs()
         while True:
@@ -151,6 +153,8 @@ class TranscriptionJobReconciler:
                         self._lease_owner,
                     )
                     return False
+                # Persist publication only after the broker accepts it. A failure in
+                # between is intentionally retried; claim tokens make delivery safe.
                 await self._repository.record_dispatch_published(
                     dispatch,
                     self._lease_owner,

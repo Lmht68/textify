@@ -97,6 +97,8 @@ class _RequestObservabilityMiddleware:
         async def send_with_request_id(message: Message) -> None:
             """Add the generated correlation ID to an HTTP response start."""
             nonlocal response_started, response_status_code
+            # Headers become mutable exactly once at response start, which is also
+            # the first reliable point to capture the response status.
             if message["type"] == "http.response.start":
                 MutableHeaders(scope=message)["X-Request-ID"] = request_id
                 response_started = True
@@ -118,6 +120,8 @@ class _RequestObservabilityMiddleware:
             fields["code"] = code
             emit_event(logger, event, **fields)
 
+        # Keep the correlation context active while handling downstream exceptions
+        # so fallback responses and terminal events receive the same request ID.
         with request_log_context(request_id):
             try:
                 await self._app(scope, receive, send_with_request_id)
@@ -130,6 +134,8 @@ class _RequestObservabilityMiddleware:
                         LogEvent.REQUEST_FAILED, code=InternalError.code
                     )
                     raise
+                # No headers were sent, so emit the safe fallback response through
+                # this wrapper to preserve its correlation header and status record.
                 response = await unhandled_error_handler(
                     Request(scope, receive=receive),
                     exc,
@@ -165,6 +171,8 @@ def create_app(
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
         """Create durable admission and aggregate readiness state before traffic."""
+        # Health remains unavailable until every durable dependency has passed
+        # startup and application state has been assembled.
         application.state.ready = False
         application.state.readiness = None
         application.state.observability_stage = "startup"
@@ -172,6 +180,8 @@ def create_app(
         broker_readiness: RedisBrokerReadiness | None = None
         engine = None
 
+        # This runs for both partial startup failures and normal shutdown, so
+        # every resource is optional until its construction succeeds.
         async def close_resources() -> None:
             """Close readiness resources and the application database engine."""
             application.state.ready = False
@@ -236,10 +246,13 @@ def create_app(
             await close_resources()
             raise
 
+        # Expose readiness only after the repository and all dependency probes exist.
         application.state.ready = True
         emit_event(logger, LogEvent.SERVICE_READY)
         application.state.observability_stage = "runtime"
         try:
+            # Track the active lifecycle phase so process-level failures can be reported
+            # without retaining the original exception details.
             try:
                 yield
             except Exception:

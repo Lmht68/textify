@@ -218,6 +218,8 @@ class TranscriptionExecutor:
             if source.duration_seconds > self._settings.max_duration_seconds:
                 raise VideoTooLongError()
 
+            # Prefer matching provider captions because they avoid native media
+            # download and inference. Fall back only when no usable track exists.
             if source.platform is Platform.YOUTUBE:
                 video_id = submitted.youtube_video_id
                 if video_id is not None:
@@ -235,6 +237,8 @@ class TranscriptionExecutor:
                         return TranscriptionResult(source, caption_transcript)
 
             _raise_if_cancellation_requested(control)
+            # Native inference can outlive this coroutine, so transfer prepared-media
+            # cleanup to ownership shared with its eventual finalizer.
             ownership = acquisition.TranscriptionOwnership(
                 prepared_audio,
                 control.provider_cancellation,
@@ -258,6 +262,8 @@ class TranscriptionExecutor:
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
             raise MetadataRetrievalFailedError() from exc
         finally:
+            # Ownership releases prepared media after the caller finishes, or waits
+            # for a retained native finalizer when work outlives this coroutine.
             if ownership is None:
                 control.provider_cancellation.set()
                 try:
@@ -330,6 +336,8 @@ class TranscriptionExecutor:
         Raises:
             TranscriptionError: If the metadata stage cannot succeed safely.
         """
+        # Thread work can continue after the async timeout and may still own prepared
+        # media, so timeout handling waits for it instead of cancelling it outright.
         deadline = time.monotonic() + self._settings.metadata_timeout_seconds
         worker = asyncio.create_task(
             asyncio.to_thread(

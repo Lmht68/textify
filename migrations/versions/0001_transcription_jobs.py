@@ -19,6 +19,8 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     """Create normalized durable PostgreSQL Transcription Job tables."""
+    # Keep mutable lifecycle state separate from optional successful-result payloads
+    # so queued, processing, failed, and cancelled jobs never need placeholder data.
     op.create_table(
         "transcription_job",
         sa.Column(
@@ -82,6 +84,8 @@ def upgrade() -> None:
             ") AND error_message IS NOT NULL AND length(error_message) > 0)",
             name="transcription_job_error_pair_check",
         ),
+        # Model every permitted lifecycle combination in the database so independent
+        # API, reconciler, and worker writers cannot persist an invalid state.
         sa.CheckConstraint(
             "(status = 'queued' AND outcome IS NULL AND started_at IS NULL "
             "AND finished_at IS NULL AND cancellation_requested = FALSE "
@@ -105,6 +109,8 @@ def upgrade() -> None:
             name="transcription_job_lifecycle_check",
         ),
     )
+    # These indexes match the lifecycle scans for FIFO admission, queue expiry, and
+    # terminal retention cleanup.
     op.create_index(
         "transcription_job_status_submitted_at_id_idx",
         "transcription_job",
@@ -120,6 +126,8 @@ def upgrade() -> None:
         "transcription_job",
         ["status", "finished_at"],
     )
+    # Persist response-field exclusions as normalized rows rather than duplicating
+    # nullable projection flags across every stored result.
     op.create_table(
         "transcription_job_exclusion",
         sa.Column(
@@ -142,6 +150,8 @@ def upgrade() -> None:
             name="transcription_job_exclusion_field_path_check",
         ),
     )
+    # A successful result has one row per job. Excluded fields remain NULL and are
+    # validated against the normalized exclusions relation by the deferred trigger.
     op.create_table(
         "transcription_job_result",
         sa.Column(
@@ -188,6 +198,8 @@ def upgrade() -> None:
             name="transcription_job_result_language_length_check",
         ),
     )
+    # Segments represent an ordered one-to-many transcript without repeating the
+    # result metadata, while the ordinal constraint preserves provider order.
     op.create_table(
         "transcription_job_segment",
         sa.Column(
@@ -219,6 +231,8 @@ def upgrade() -> None:
             name="transcription_job_segment_values_check",
         ),
     )
+    # Cross-table result and exclusion rules cannot be expressed as table checks.
+    # A deferred trigger permits atomic multi-table terminal publication first.
     op.execute(
         """
         CREATE FUNCTION enforce_transcription_job_storage_invariants()
@@ -330,6 +344,8 @@ def upgrade() -> None:
         $$;
         """
     )
+    # Revalidate after changes to every participating relation at transaction commit,
+    # regardless of the order in which the publisher writes its rows.
     op.execute(
         """
         CREATE CONSTRAINT TRIGGER transcription_job_storage_job_check

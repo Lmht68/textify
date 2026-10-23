@@ -19,6 +19,8 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     """Create and backfill the required private Execution Attempt relation."""
+    # Each job owns one opaque private token, which lets broker consumers reject
+    # stale or fabricated delivery messages without exposing job capabilities.
     op.create_table(
         "transcription_job_execution_attempt",
         sa.Column(
@@ -42,11 +44,15 @@ def upgrade() -> None:
             name="transcription_job_execution_attempt_token_uuid4_check",
         ),
     )
+    # Backfill every existing job before enabling the invariant that requires this
+    # new relation, so the migration remains valid against populated databases.
     op.execute(
         "INSERT INTO transcription_job_execution_attempt "
         "(job_id, execution_attempt_token) "
         "SELECT id, gen_random_uuid() FROM transcription_job"
     )
+    # Recreate the deferred function because PostgreSQL stores trigger invariants in
+    # its function body rather than as an alterable declarative constraint.
     _replace_storage_invariant(require_execution_attempt=True)
     op.execute(
         """
@@ -75,6 +81,8 @@ def _replace_storage_invariant(*, require_execution_attempt: bool) -> None:
     Args:
         require_execution_attempt: Whether every persisted job must own one attempt.
     """
+    # Upgrade and downgrade differ only in this declaration and validation block.
+    # Keeping the shared function body identical prevents invariant drift.
     execution_attempt_declaration = (
         "            execution_attempt_count bigint;\n"
         if require_execution_attempt

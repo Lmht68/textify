@@ -55,6 +55,8 @@ def create_yt_dlp(
             else:
                 options[option_name] = option
 
+    # Copy only caller-specific operation settings, then overwrite them with the
+    # immutable extraction policy that protects every provider request.
     options.update(
         {
             "allowed_extractors": list(_ALLOWED_EXTRACTORS),

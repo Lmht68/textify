@@ -19,11 +19,15 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     """Create current ready-service heartbeats without altering job state."""
+    # Operational readiness is independent of durable job state. Keep it in a
+    # small table that processes can update and remove without touching jobs.
     op.create_table(
         "service_heartbeat",
         sa.Column("service_role", sa.String(length=32), nullable=False),
         sa.Column("instance_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("last_ready_at", sa.DateTime(timezone=True), nullable=False),
+        # Multiple ready instances of one role are valid, but each process records
+        # at most one current heartbeat for that role.
         sa.PrimaryKeyConstraint(
             "service_role",
             "instance_id",
