@@ -1009,8 +1009,6 @@ async def test_three_process_structured_logging_contract(
             captured_process.raw_stderr()
             for captured_process in (api_process, reconciler_process, worker_process)
         )
-        database_parts = urlsplit(migrated_postgresql_database_url)
-        broker_parts = urlsplit(redis_broker_url)
         _assert_absent(
             raw_stderr,
             {
@@ -1023,11 +1021,7 @@ async def test_three_process_structured_logging_contract(
                 "cancellation capability": cancellation_link,
                 "transcript content": _TRANSCRIPT_CONTENT_SENTINEL,
                 "database URL": migrated_postgresql_database_url,
-                "database username": database_parts.username or "",
-                "database password": database_parts.password or "",
                 "broker URL": redis_broker_url,
-                "broker username": broker_parts.username or "",
-                "broker password": broker_parts.password or "",
                 "provider detail": _PROVIDER_DETAIL_SENTINEL,
                 "execution attempt token": str(execution_attempt_token),
                 "publication lease owner": str(publication_lease_owner),
@@ -1036,6 +1030,29 @@ async def test_three_process_structured_logging_contract(
                 "worker readiness identity": str(readiness_ids["gpu_worker"]),
                 "provider exception class": "_CaptionProviderFailure",
                 "traceback": "Traceback",
+            },
+        )
+        credential_search_text = "\n".join(
+            json.dumps(
+                {
+                    field_name: value
+                    for field_name, value in event.items()
+                    if field_name not in {"logger", "service"}
+                },
+                sort_keys=True,
+            )
+            for stream_events in all_streams.values()
+            for event in stream_events
+        )
+        database_parts = urlsplit(migrated_postgresql_database_url)
+        broker_parts = urlsplit(redis_broker_url)
+        _assert_absent(
+            credential_search_text,
+            {
+                "database username": database_parts.username or "",
+                "database password": database_parts.password or "",
+                "broker username": broker_parts.username or "",
+                "broker password": broker_parts.password or "",
             },
         )
     finally:

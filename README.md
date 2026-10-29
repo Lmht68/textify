@@ -84,11 +84,35 @@ Add the `gpu` profile to process transcription jobs.
 
 ## Development
 
+The non-live suite uses isolated PostgreSQL databases and Redis database 15.
+The PostgreSQL role must have `CREATEDB`, and `redis-server` must be available on `PATH` for broker-restart tests.
+
+Start dedicated test services on ports that do not conflict with the application stack:
+
 ```shell
-uv run pytest
+POSTGRES_DB=postgres \
+POSTGRES_USER=textify \
+POSTGRES_PASSWORD=textify \
+TEXTIFY_POSTGRES_HOST_PORT=55432 \
+TEXTIFY_BROKER_HOST_PORT=56379 \
+docker compose -p textify-tests up -d --wait postgres broker
+```
+
+Configure the test process and run the checks:
+
+```shell
+export TEXTIFY_TEST_DATABASE_URL=postgresql+asyncpg://textify:textify@127.0.0.1:55432/postgres
+export TEXTIFY_TEST_BROKER_URL=redis://127.0.0.1:56379/15
+uv run pytest -m "not live"
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy src tests
+```
+
+Stop the dedicated services when they are no longer needed:
+
+```shell
+docker compose -p textify-tests stop postgres broker
 ```
 
 ## Shutdown
